@@ -109,24 +109,27 @@ of a most-recently used algorithm.
 # Message Sending Helper Functions
 
 In addition to the bare QueueMessage function previously described, the
-PushAddrMsg, PushGetBlocksMsg, PushGetHeadersMsg, and PushRejectMsg functions
-are provided as a convenience.  While it is of course possible to create and
-send these message manually via QueueMessage, these helper functions provided
-additional useful functionality that is typically desired.
+PushAddrMsg, PushAddrV2Msg, PushGetBlocksMsg, PushGetHeadersMsg, and
+PushRejectMsg functions are provided as a convenience.  While it is of course
+possible to create and send these message manually via QueueMessage, these
+helper functions provided additional useful functionality that is typically
+desired.
 
 For example, the PushAddrMsg function automatically limits the addresses to the
 maximum number allowed by the message and randomizes the chosen addresses when
 there are too many.  This allows the caller to simply provide a slice of known
 addresses, such as that returned by the addrmgr package, without having to worry
-about the details.
+about the details.  PushAddrV2Msg does the same for peers that asked for addrv2
+messages (BIP0155) with sendaddrv2, see WantsAddrV2.  The peer only asks for
+addrv2 messages itself when the OnAddrV2 listener is set.
 
 Next, the PushGetBlocksMsg and PushGetHeadersMsg functions will construct proper
 messages using a block locator and ignore back to back duplicate requests.
 
 Finally, the PushRejectMsg function can be used to easily create and send an
-appropriate reject message based on the provided parameters as well as
-optionally provides a flag to cause it to block until the message is actually
-sent.
+appropriate reject message based on the provided parameters, with the reason
+cut to the 111 bytes Bitcoin Cash Node reads, as well as optionally provides a
+flag to cause it to block until the message is actually sent.
 
 # Peer Statistics
 

@@ -9,6 +9,8 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/netip"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/gcash/bchd/bchrpc/pb"
 	"github.com/gcash/bchd/blockchain"
 	"github.com/gcash/bchd/blockchain/indexers"
+	"github.com/gcash/bchd/blockchain/slpgraphsearch"
 	"github.com/gcash/bchd/chaincfg"
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/database"
@@ -26,10 +29,11 @@ import (
 	"github.com/gcash/bchd/wire"
 	"github.com/gcash/bchutil"
 	"github.com/gcash/bchutil/merkleblock"
-	"github.com/simpleledgerinc/goslp"
-	"github.com/simpleledgerinc/goslp/v1parser"
+	"github.com/gcash/goslp"
+	"github.com/gcash/goslp/v1parser"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
@@ -102,6 +106,25 @@ type GrpcServerConfig struct {
 	AddrIndex *indexers.AddrIndex
 	CfIndex   *indexers.CfIndex
 	SlpIndex  *indexers.SlpIndex
+	BcmrIndex *indexers.BcmrIndex
+
+	// MaxSubscriptions is the most subscriptions clients may hold at once,
+	// over all the subscription calls.
+	MaxSubscriptions int
+
+	// AuthRequired is whether clients need the auth token to call.  When
+	// they do not, any client may subscribe, so each client may hold at
+	// most a quarter of MaxSubscriptions.
+	AuthRequired bool
+
+	// MaxFilterEntries is the most a subscription's transaction filter may
+	// hold of what its requests add: each outpoint, address and token ID
+	// counts once, and each data element once for each 20 bytes.  A
+	// SubscribeTransactionStream call can add to its filter with any
+	// number of requests, so without a limit its memory would have no
+	// bound.  The filter also keeps at most as many outpoints of the
+	// outputs it matched, dropping the oldest.
+	MaxFilterEntries int
 }
 
 // GrpcServer is the gRPC server implementation. It holds all the objects
@@ -118,11 +141,27 @@ type GrpcServer struct {
 	addrIndex *indexers.AddrIndex
 	cfIndex   *indexers.CfIndex
 	slpIndex  *indexers.SlpIndex
+	bcmrIndex *indexers.BcmrIndex
 
-	httpServer *http.Server
-	subscribe  chan *rpcEventSubscription
-	events     chan interface{}
-	quit       chan struct{}
+	httpServer  *http.Server
+	subscribe   chan *rpcEventSubscription
+	unsubscribe chan *rpcEventSubscription
+	events      chan interface{}
+	quit        chan struct{}
+
+	subscriptions atomic.Int32 // number held by the dispatcher
+
+	maxSubscriptions    int
+	clientSubscriptions atomic.Int64 // number held by client calls
+
+	// maxClientShare is the most subscriptions one client may hold, or not
+	// above 0 when clients have no share of their own, and clientShares
+	// holds the number each client holds, by subscriptionClient's key.
+	maxClientShare int
+	clientSharesMu sync.Mutex
+	clientShares   map[netip.Prefix]int
+
+	maxFilterEntries int
 
 	wg       sync.WaitGroup
 	ready    atomic.Uint32 // atomic
@@ -143,11 +182,19 @@ func NewGrpcServer(cfg *GrpcServerConfig) *GrpcServer {
 		addrIndex:   cfg.AddrIndex,
 		cfIndex:     cfg.CfIndex,
 		slpIndex:    cfg.SlpIndex,
+		bcmrIndex:   cfg.BcmrIndex,
 		httpServer:  cfg.HTTPServer,
 		subscribe:   make(chan *rpcEventSubscription),
+		unsubscribe: make(chan *rpcEventSubscription),
 		events:      make(chan interface{}),
 		quit:        make(chan struct{}),
 		wg:          sync.WaitGroup{},
+
+		maxSubscriptions: cfg.MaxSubscriptions,
+		maxFilterEntries: cfg.MaxFilterEntries,
+	}
+	if !cfg.AuthRequired {
+		s.maxClientShare = (cfg.MaxSubscriptions + 3) / 4
 	}
 	reflection.Register(cfg.Server)
 	pb.RegisterBchrpcServer(cfg.Server, s)
@@ -162,12 +209,44 @@ func NewGrpcServer(cfg *GrpcServerConfig) *GrpcServer {
 // rpcEventTxAccepted indicates a new tx was accepted into the mempool.
 type rpcEventTxAccepted struct {
 	*mempool.TxDesc
+	spent spentScripts
 }
 
 // rpcEventBlockConnected indicates a new block connected to the current best
 // chain.
 type rpcEventBlockConnected struct {
 	*bchutil.Block
+	spent   spentScripts
+	journal spendJournal
+}
+
+// spendJournal holds the outputs that a connected block's transactions spend,
+// in the order of their inputs, and the index of the first that each
+// transaction spends.  They are read from the block's spend journal when the
+// first subscription needs them and shared by all.
+type spendJournal struct {
+	once   sync.Once
+	stxos  []blockchain.SpentTxOut
+	starts []int
+	err    error
+}
+
+// spentScripts holds the scripts of the outputs that the transactions of an
+// event spend.  A subscription with an address filter matches an input on
+// the address of the output it spends, so they are looked up when the first
+// subscription needs them and shared by all, instead of once for each.
+type spentScripts struct {
+	once    sync.Once
+	scripts map[wire.OutPoint][]byte
+}
+
+// lookup returns the function MatchAndUpdate looks up spent outputs with.
+// The first call of any lookup loads the scripts with load.
+func (p *spentScripts) lookup(load func() map[wire.OutPoint][]byte) prevOutScriptFunc {
+	return func(op wire.OutPoint) []byte {
+		p.once.Do(func() { p.scripts = load() })
+		return p.scripts[op]
+	}
 }
 
 // rpcEventBlockDisconnected indicates a block that was disconnected from the
@@ -176,36 +255,142 @@ type rpcEventBlockDisconnected struct {
 	*bchutil.Block
 }
 
-// rpcEventSubscription represents a subscription to events from the RPC server.
-type rpcEventSubscription struct {
-	in          chan interface{} // rpc events to be put by the dispatcher
-	out         chan interface{} // rpc events to be read by the client
-	unsubscribe chan struct{}    // close to unsubscribe
+// maxSubscriptionQueue is the number of events a subscription may have
+// waiting to be sent before the subscriber is considered too slow and the
+// subscription is ended.
+const maxSubscriptionQueue = 50000
+
+// rpcEventKinds is a set of kinds of event, those a subscription takes.
+type rpcEventKinds uint32
+
+const (
+	rpcEventsTxAccepted rpcEventKinds = 1 << iota
+	rpcEventsBlockConnected
+	rpcEventsBlockDisconnected
+	rpcEventsDSProof
+
+	// rpcEventsOther is the kind of any other event.
+	rpcEventsOther
+
+	// rpcEventsAll is every kind.
+	rpcEventsAll = ^rpcEventKinds(0)
+)
+
+// rpcEventKind returns the kind of an event.
+func rpcEventKind(event interface{}) rpcEventKinds {
+	switch event.(type) {
+	case *rpcEventTxAccepted:
+		return rpcEventsTxAccepted
+	case *rpcEventBlockConnected:
+		return rpcEventsBlockConnected
+	case *rpcEventBlockDisconnected:
+		return rpcEventsBlockDisconnected
+	case *rpcEventDSProof:
+		return rpcEventsDSProof
+	}
+	return rpcEventsOther
 }
 
-// Events returns the channel clients listen to to get new events.
+// txEventKinds returns the kinds of event a transaction subscription takes:
+// accepted transactions with includeMempool, and connected blocks with
+// includeBlocks.
+func txEventKinds(includeMempool, includeBlocks bool) rpcEventKinds {
+	var kinds rpcEventKinds
+	if includeMempool {
+		kinds |= rpcEventsTxAccepted
+	}
+	if includeBlocks {
+		kinds |= rpcEventsBlockConnected
+	}
+	return kinds
+}
+
+// rpcEventSubscription represents a subscription to events from the RPC server.
+type rpcEventSubscription struct {
+	server      *GrpcServer
+	in          chan interface{} // rpc events to be put by the dispatcher
+	out         chan interface{} // rpc events to be read by the client
+	unsubscribe chan struct{}    // closed on unsubscribe
+	done        chan struct{}    // closed when the queue handler stops
+	overflowed  atomic.Bool      // set when the queue limit was hit
+
+	// kinds holds the kinds of event the subscription takes, an
+	// rpcEventKinds.  The dispatcher hands it only those, so that only
+	// they wait in its queue and count toward its limit.
+	kinds atomic.Uint32
+
+	// client is the client whose share of the subscriptions a client's
+	// subscription counts in, when it is valid.
+	client netip.Prefix
+}
+
+// setKinds sets the kinds of event the subscription takes from now on.
+func (s *rpcEventSubscription) setKinds(kinds rpcEventKinds) {
+	s.kinds.Store(uint32(kinds))
+}
+
+// takes returns whether the subscription takes events of kind.
+func (s *rpcEventSubscription) takes(kind rpcEventKinds) bool {
+	return rpcEventKinds(s.kinds.Load())&kind != 0
+}
+
+// Events returns the channel clients listen to for new events.  It is closed
+// when the server shuts down or the subscriber falls too far behind.
 func (s *rpcEventSubscription) Events() <-chan interface{} {
 	return s.out
 }
 
-// Unsubscribe is to be called by the client to stop the subscription.
-func (s *rpcEventSubscription) Unsubscribe() {
-	close(s.unsubscribe)
+// Overflowed returns whether the subscription ended because the subscriber
+// fell too far behind.
+func (s *rpcEventSubscription) Overflowed() bool {
+	return s.overflowed.Load()
 }
 
-// subscribeEvents returns a new subscription to all the events the RPC server
-// receives.
-func (s *GrpcServer) subscribeEvents() *rpcEventSubscription {
+// Unsubscribe is to be called by the client to stop the subscription.  It
+// must be called exactly once.
+func (s *rpcEventSubscription) Unsubscribe() {
+	close(s.unsubscribe)
+	select {
+	case s.server.unsubscribe <- s:
+	case <-s.server.quit:
+	}
+}
+
+// closedErr returns the error a stream returns once the events channel of the
+// subscription is closed.
+func (s *rpcEventSubscription) closedErr() error {
+	// The queue handler closes the events channel before it records an
+	// overflow, and closes done after.
+	<-s.done
+	if s.Overflowed() {
+		return status.Error(codes.ResourceExhausted,
+			"subscriber too slow, too many events queued")
+	}
+	return status.Error(codes.Unavailable, "server shutting down")
+}
+
+// subscribeEvents returns a new subscription to the events of the given kinds
+// the RPC server receives.  The subscription ends once more than maxQueue
+// events are waiting to be read, or never when maxQueue is 0.
+func (s *GrpcServer) subscribeEvents(maxQueue int, kinds rpcEventKinds) *rpcEventSubscription {
 	sub := &rpcEventSubscription{
+		server:      s,
 		in:          make(chan interface{}),
 		out:         make(chan interface{}),
 		unsubscribe: make(chan struct{}),
+		done:        make(chan struct{}),
 	}
+	sub.setKinds(kinds)
 
 	// Start a queue handler for the subscription so that slow connections don't
 	// hold up faster ones.
 	s.wg.Go(func() {
-		queueHandler(sub.in, sub.out, s.quit)
+		defer close(sub.done)
+		if !queueHandler(sub.in, sub.out, s.quit, sub.unsubscribe,
+			maxQueue) {
+
+			sub.overflowed.Store(true)
+		}
 	})
 
 	select {
@@ -213,6 +398,101 @@ func (s *GrpcServer) subscribeEvents() *rpcEventSubscription {
 	case <-s.quit:
 	}
 	return sub
+}
+
+// subscribeClient returns a new subscription to the events of the given kinds
+// for the call of a client whose call has the context ctx, or a
+// ResourceExhausted error when clients hold maxSubscriptions already or this
+// client holds its share of them.  Every subscription is handed the events of
+// its kinds and holds goroutines and a queue, and without an auth token any
+// client may subscribe, so the limit bounds that work, and the shares keep one
+// client from taking every place.  The subscription must be ended with
+// unsubscribeClient.
+func (s *GrpcServer) subscribeClient(ctx context.Context, kinds rpcEventKinds) (*rpcEventSubscription, error) {
+	var client netip.Prefix
+	if s.maxClientShare > 0 {
+		client = subscriptionClient(ctx)
+	}
+	if client.IsValid() {
+		s.clientSharesMu.Lock()
+		if s.clientShares[client] >= s.maxClientShare {
+			s.clientSharesMu.Unlock()
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"too many subscriptions from one client, the limit is %d",
+				s.maxClientShare)
+		}
+		if s.clientShares == nil {
+			s.clientShares = make(map[netip.Prefix]int)
+		}
+		s.clientShares[client]++
+		s.clientSharesMu.Unlock()
+	}
+	if s.clientSubscriptions.Add(1) > int64(s.maxSubscriptions) {
+		s.clientSubscriptions.Add(-1)
+		s.releaseClientShare(client)
+		return nil, status.Errorf(codes.ResourceExhausted,
+			"too many subscriptions, the limit is %d", s.maxSubscriptions)
+	}
+	sub := s.subscribeEvents(maxSubscriptionQueue, kinds)
+	sub.client = client
+	return sub, nil
+}
+
+// unsubscribeClient ends a subscription subscribeClient returned and frees its
+// place, and its place in its client's share.
+func (s *GrpcServer) unsubscribeClient(sub *rpcEventSubscription) {
+	sub.Unsubscribe()
+	s.clientSubscriptions.Add(-1)
+	s.releaseClientShare(sub.client)
+}
+
+// releaseClientShare frees a place in the share of client, when it is valid.
+func (s *GrpcServer) releaseClientShare(client netip.Prefix) {
+	if !client.IsValid() {
+		return
+	}
+	s.clientSharesMu.Lock()
+	s.clientShares[client]--
+	if s.clientShares[client] <= 0 {
+		delete(s.clientShares, client)
+	}
+	s.clientSharesMu.Unlock()
+}
+
+// subscriptionClient returns the client whose call has the context ctx, as
+// the shares of the subscriptions count clients: its IPv4 address, or the /56
+// of its IPv6 address, as a site is commonly given a whole /56; a client with
+// more addresses can still hold more.  A client at a loopback, private or
+// link-local address, usually a proxy in front of the server carrying many
+// clients, has no share of its own, nor has one whose address cannot be read;
+// for them it returns an invalid prefix.
+func subscriptionClient(ctx context.Context) netip.Prefix {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return netip.Prefix{}
+	}
+	addrPort, err := netip.ParseAddrPort(p.Addr.String())
+	if err != nil {
+		return netip.Prefix{}
+	}
+	addr := addrPort.Addr().Unmap()
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return netip.Prefix{}
+	}
+	bits := 56
+	if addr.Is4() {
+		bits = 32
+	}
+	client, err := addr.Prefix(bits)
+	if err != nil {
+		return netip.Prefix{}
+	}
+	return client
+}
+
+// numSubscriptions returns the number of subscriptions the dispatcher holds.
+func (s *GrpcServer) numSubscriptions() int {
+	return int(s.subscriptions.Load())
 }
 
 // runEventDispatcher runs a process that will forward new incoming events to
@@ -227,18 +507,30 @@ func (s *GrpcServer) runEventDispatcher() {
 		select {
 		case newSub := <-s.subscribe:
 			subscriptions[newSub] = struct{}{}
+			s.subscriptions.Store(int32(len(subscriptions)))
+
+		case sub := <-s.unsubscribe:
+			delete(subscriptions, sub)
+			s.subscriptions.Store(int32(len(subscriptions)))
 
 		case event := <-s.events:
-			// Dispatch to all clients.
+			// Dispatch to all clients that take its kind.  The queue
+			// handlers never block for long while they run.
+			kind := rpcEventKind(event)
 			for sub := range subscriptions {
+				if !sub.takes(kind) {
+					continue
+				}
 				select {
 				case sub.in <- event:
 
-				case <-sub.unsubscribe:
-					// If client unsubscribed, just delete it.
+				case <-sub.done:
+					// The client unsubscribed or fell too far
+					// behind, so just delete it.
 					delete(subscriptions, sub)
 				}
 			}
+			s.subscriptions.Store(int32(len(subscriptions)))
 
 		case <-s.quit:
 			for sub := range subscriptions {
@@ -262,7 +554,7 @@ func (s *GrpcServer) dispatchEvent(event interface{}) {
 // are accepted in the mempool.
 func (s *GrpcServer) NotifyNewTransactions(txs []*mempool.TxDesc) {
 	for _, txDesc := range txs {
-		s.dispatchEvent(&rpcEventTxAccepted{txDesc})
+		s.dispatchEvent(&rpcEventTxAccepted{TxDesc: txDesc})
 	}
 }
 
@@ -277,7 +569,7 @@ func (s *GrpcServer) handleBlockchainNotification(notification *blockchain.Notif
 			log.Warnf("Chain connected notification is not a block.")
 			break
 		}
-		s.dispatchEvent(&rpcEventBlockConnected{block})
+		s.dispatchEvent(&rpcEventBlockConnected{Block: block})
 
 	case blockchain.NTBlockDisconnected:
 		block, ok := notification.Data.(*bchutil.Block)
@@ -344,7 +636,10 @@ func (s *GrpcServer) GetMempool(ctx context.Context, req *pb.GetMempoolRequest) 
 	resp := &pb.GetMempoolResponse{}
 	for _, txDesc := range rawMempool {
 		if req.FullTransactions {
-			respTx := marshalTransaction(txDesc.Tx, 0, nil, 0, s)
+			respTx, err := marshalTransactionChecked(txDesc.Tx, 0, nil, 0, s)
+			if err != nil {
+				return nil, status.Error(codes.Internal, "failed to load slp index entry")
+			}
 			stxos, err := s.txMemPool.FetchInputUtxos(txDesc.Tx)
 			if err != nil {
 				continue
@@ -383,25 +678,35 @@ func (s *GrpcServer) GetMempool(ctx context.Context, req *pb.GetMempoolRequest) 
 	return resp, nil
 }
 
+// bitcoinNet returns the GetBlockchainInfo network type for the given
+// chain parameters.  It compares the params themselves because testnet4 and
+// chipnet share the same network magic.
+func bitcoinNet(params *chaincfg.Params) (pb.GetBlockchainInfoResponse_BitcoinNet, error) {
+	switch params {
+	case &chaincfg.MainNetParams:
+		return pb.GetBlockchainInfoResponse_MAINNET, nil
+	case &chaincfg.TestNet3Params:
+		return pb.GetBlockchainInfoResponse_TESTNET3, nil
+	case &chaincfg.TestNet4Params:
+		return pb.GetBlockchainInfoResponse_TESTNET4, nil
+	case &chaincfg.ChipNetParams:
+		return pb.GetBlockchainInfoResponse_CHIPNET, nil
+	case &chaincfg.RegressionNetParams:
+		return pb.GetBlockchainInfoResponse_REGTEST, nil
+	case &chaincfg.SimNetParams:
+		return pb.GetBlockchainInfoResponse_SIMNET, nil
+	}
+	return 0, status.Error(codes.Internal, "unknown network parameters")
+}
+
 // GetBlockchainInfo returns info about the blockchain including the most recent
 // block hash and height.
 func (s *GrpcServer) GetBlockchainInfo(ctx context.Context, req *pb.GetBlockchainInfoRequest) (*pb.GetBlockchainInfoResponse, error) {
 	bestSnapShot := s.chain.BestSnapshot()
 
-	var net pb.GetBlockchainInfoResponse_BitcoinNet
-	switch s.chainParams {
-	case &chaincfg.MainNetParams:
-		net = pb.GetBlockchainInfoResponse_MAINNET
-	case &chaincfg.TestNet3Params:
-		net = pb.GetBlockchainInfoResponse_TESTNET3
-	case &chaincfg.TestNet4Params:
-		net = pb.GetBlockchainInfoResponse_TESTNET4
-	case &chaincfg.RegressionNetParams:
-		net = pb.GetBlockchainInfoResponse_REGTEST
-	case &chaincfg.SimNetParams:
-		net = pb.GetBlockchainInfoResponse_SIMNET
-	default:
-		return nil, status.Error(codes.Internal, "unknown network parameters")
+	net, err := bitcoinNet(s.chainParams)
+	if err != nil {
+		return nil, err
 	}
 
 	gsEnabled := false
@@ -414,6 +719,7 @@ func (s *GrpcServer) GetBlockchainInfo(ctx context.Context, req *pb.GetBlockchai
 		TxIndex:        s.txIndex != nil,
 		SlpIndex:       s.slpIndex != nil,
 		SlpGraphsearch: gsEnabled,
+		BcmrIndex:      s.bcmrIndex != nil,
 		BestHeight:     bestSnapShot.Height,
 		BestBlockHash:  bestSnapShot.Hash[:],
 		BitcoinNet:     net,
@@ -509,7 +815,10 @@ func (s *GrpcServer) GetBlock(ctx context.Context, req *pb.GetBlockRequest) (*pb
 	for idx, tx := range block.Transactions() {
 		if req.FullTransactions {
 			header := block.MsgBlock().Header
-			respTx := marshalTransaction(tx, confirmations, &header, block.Height(), s)
+			respTx, err := marshalTransactionChecked(tx, confirmations, &header, block.Height(), s)
+			if err != nil {
+				return nil, status.Error(codes.Internal, "failed to load slp index entry")
+			}
 			for i := range tx.MsgTx().TxIn {
 				if idx > 0 {
 					stxo := spentTxos[spendIdx]
@@ -694,7 +1003,10 @@ func (s *GrpcServer) GetTransaction(ctx context.Context, req *pb.GetTransactionR
 	}
 
 	if txDesc, err := s.txMemPool.FetchTxDesc(txHash); err == nil {
-		tx := marshalTransaction(txDesc.Tx, 0, nil, 0, s)
+		tx, err := marshalTransactionChecked(txDesc.Tx, 0, nil, 0, s)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to load slp index entry")
+		}
 		tx.Timestamp = txDesc.Added.Unix()
 
 		view, err := s.txMemPool.FetchInputUtxos(txDesc.Tx)
@@ -725,11 +1037,9 @@ func (s *GrpcServer) GetTransaction(ctx context.Context, req *pb.GetTransactionR
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "an unknown problem occurred when parsing token id: %s: %v", hex.EncodeToString(tx.SlpTransactionInfo.TokenId), err)
 			}
-			tokenMetadata, err = s.marshalTokenMetadata(*tokenID)
+			tokenMetadata, err = s.tokenMetadataOrNil(*tokenID)
 			if err != nil {
-				msg := fmt.Sprintf("an unknown problem occurred when building token metadata for token id %s: %v", hex.EncodeToString(tx.SlpTransactionInfo.TokenId), err)
-				log.Criticalf("%s", msg)
-				return nil, status.Error(codes.Internal, msg)
+				return nil, status.Error(codes.Internal, "failed to load slp token metadata")
 			}
 		}
 
@@ -757,7 +1067,10 @@ func (s *GrpcServer) GetTransaction(ctx context.Context, req *pb.GetTransactionR
 		return nil, status.Errorf(codes.Internal, "failed to load block header %v", err)
 	}
 
-	respTx := marshalTransaction(bchutil.NewTx(&msgTx), s.chain.BestSnapshot().Height-blockHeight+1, &header, blockHeight, s)
+	respTx, err := marshalTransactionChecked(bchutil.NewTx(&msgTx), s.chain.BestSnapshot().Height-blockHeight+1, &header, blockHeight, s)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to load slp index entry")
+	}
 	if s.txIndex != nil {
 		if err := s.setInputMetadata(respTx); err != nil {
 			return nil, err
@@ -770,11 +1083,9 @@ func (s *GrpcServer) GetTransaction(ctx context.Context, req *pb.GetTransactionR
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "an unknown problem occurred when parsing token id %s: %v", hex.EncodeToString(respTx.SlpTransactionInfo.TokenId), err)
 		}
-		tokenMetadata, err = s.marshalTokenMetadata(*tokenID)
+		tokenMetadata, err = s.tokenMetadataOrNil(*tokenID)
 		if err != nil {
-			msg := fmt.Sprintf("an unknown problem occurred when building token metadata for token id %s: %v", hex.EncodeToString(respTx.SlpTransactionInfo.TokenId), err)
-			log.Criticalf("%s", msg)
-			return nil, status.Error(codes.Internal, msg)
+			return nil, status.Error(codes.Internal, "failed to load slp token metadata")
 		}
 	}
 
@@ -842,9 +1153,9 @@ func (s *GrpcServer) GetAddressTransactions(ctx context.Context, req *pb.GetAddr
 	}
 
 	// use cash address format
-	addr, err = bchutil.ConvertSlpToCashAddress(addr, s.chainParams)
+	addr, err = toCashAddress(addr, s.chainParams)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "couldn't convert address to cash address format")
+		return nil, status.Errorf(codes.InvalidArgument, "invalid address: %v", err)
 	}
 
 	startHeight := int32(0)
@@ -859,27 +1170,38 @@ func (s *GrpcServer) GetAddressTransactions(ctx context.Context, req *pb.GetAddr
 		startHeight, _ = s.chain.BlockHeightByHash(h)
 	}
 
-	confirmedTxs, err := s.fetchTransactionsByAddress(addr, startHeight, int(req.NbFetch), int(req.NbSkip))
+	// The address's memory pool transactions are listed before its history
+	// is read, and those confirmed in the history read, by a block whose
+	// transactions the memory pool has yet to remove, are left out.
+	unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
+	confirmedTxs, confirmedCount, unconfirmedTxs, err := s.fetchTransactionsByAddress(addr, startHeight, req.NbFetch, req.NbSkip, true, unconfirmedTxs)
 	if err != nil {
 		return nil, err
 	}
 
-	resp := &pb.GetAddressTransactionsResponse{}
+	resp := &pb.GetAddressTransactionsResponse{ConfirmedCount: confirmedCount}
 
 	tip := s.chain.BestSnapshot().Height
 	for _, cTx := range confirmedTxs {
-		tx := marshalTransaction(bchutil.NewTx(&cTx.tx), tip-cTx.blockHeight+1, cTx.blockHeader, cTx.blockHeight, s)
-		if s.txIndex != nil {
-			if err := s.setInputMetadata(tx); err != nil {
-				return nil, err
-			}
+		tx, err := marshalTransactionChecked(bchutil.NewTx(&cTx.tx), tip-cTx.blockHeight+1, cTx.blockHeader, cTx.blockHeight, s)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to load slp index entry")
 		}
 		resp.ConfirmedTransactions = append(resp.ConfirmedTransactions, tx)
 	}
+	// The inputs of all the transactions are done at once, so a transaction
+	// that many of them spend from is read once.
+	if s.txIndex != nil {
+		if err := s.setInputMetadata(resp.ConfirmedTransactions...); err != nil {
+			return nil, err
+		}
+	}
 
-	unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
 	for _, uTx := range unconfirmedTxs {
-		tx := marshalTransaction(uTx, 0, nil, 0, s)
+		tx, err := marshalTransactionChecked(uTx, 0, nil, 0, s)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to load slp index entry")
+		}
 		txDesc, err := s.txMemPool.FetchTxDesc(uTx.Hash())
 		if err != nil {
 			continue
@@ -910,8 +1232,8 @@ func (s *GrpcServer) GetAddressTransactions(ctx context.Context, req *pb.GetAddr
 			Fee:              txDesc.Fee,
 			AddedTime:        txDesc.Added.Unix(),
 			AddedHeight:      txDesc.Height,
-			FeePerKb:         txDesc.Fee / int64(uTx.MsgTx().SerializeSize()),
-			StartingPriority: txDesc.StartingPriority,
+			FeePerKb:         txDesc.FeePerKB,
+			StartingPriority: 0, // deprecated
 		}
 		resp.UnconfirmedTransactions = append(resp.UnconfirmedTransactions, mempoolTx)
 	}
@@ -938,6 +1260,12 @@ func (s *GrpcServer) GetRawAddressTransactions(ctx context.Context, req *pb.GetR
 		return nil, status.Error(codes.InvalidArgument, "invalid address")
 	}
 
+	// use cash address format
+	addr, err = toCashAddress(addr, s.chainParams)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid address: %v", err)
+	}
+
 	startHeight := int32(0)
 	if len(req.GetHash()) == 0 {
 		startHeight = req.GetHeight()
@@ -950,18 +1278,20 @@ func (s *GrpcServer) GetRawAddressTransactions(ctx context.Context, req *pb.GetR
 		startHeight, _ = s.chain.BlockHeightByHash(h)
 	}
 
-	confirmedTxs, err := s.fetchTransactionsByAddress(addr, startHeight, int(req.NbFetch), int(req.NbSkip))
+	// The memory pool transactions confirmed in the history read are left
+	// out, as in GetAddressTransactions.
+	unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
+	confirmedTxs, confirmedCount, unconfirmedTxs, err := s.fetchTransactionsByAddress(addr, startHeight, req.NbFetch, req.NbSkip, true, unconfirmedTxs)
 	if err != nil {
 		return nil, err
 	}
 
-	resp := &pb.GetRawAddressTransactionsResponse{}
+	resp := &pb.GetRawAddressTransactionsResponse{ConfirmedCount: confirmedCount}
 
 	for _, cTx := range confirmedTxs {
 		resp.ConfirmedTransactions = append(resp.ConfirmedTransactions, cTx.txBytes)
 	}
 
-	unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
 	for _, uTx := range unconfirmedTxs {
 		var buf bytes.Buffer
 		if err := uTx.MsgTx().BchEncode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
@@ -972,6 +1302,22 @@ func (s *GrpcServer) GetRawAddressTransactions(ctx context.Context, req *pb.GetR
 
 	return resp, nil
 }
+
+// addressUnspentPageSize is how many transactions of an address's history
+// GetAddressUnspentOutputs loads at a time.  It is a variable for tests.
+var addressUnspentPageSize = 10000
+
+// errChainReorganized is the error of a GetAddressUnspentOutputs call during
+// which a block was disconnected from the main chain, so that its answer could
+// mix outputs of both branches.  The client can call again.
+var errChainReorganized = status.Error(codes.Aborted,
+	"the chain reorganized during the call")
+
+// addressUnspentListHook and addressUnspentScanHook, when set, are called by
+// GetAddressUnspentOutputs once it has listed the address's memory pool
+// transactions, and once it has read the address's confirmed history.  They
+// are for tests.
+var addressUnspentListHook, addressUnspentScanHook func()
 
 // GetAddressUnspentOutputs returns all the unspent transaction outputs
 // for the given address.
@@ -993,33 +1339,103 @@ func (s *GrpcServer) GetAddressUnspentOutputs(ctx context.Context, req *pb.GetAd
 	}
 
 	// use cash address format
-	addr, err = bchutil.ConvertSlpToCashAddress(addr, s.chainParams)
+	addr, err = toCashAddress(addr, s.chainParams)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "couldn't convert address to cash address format")
+		return nil, status.Errorf(codes.InvalidArgument, "invalid address: %v", err)
 	}
 
-	tokenMetadataSet := make(map[chainhash.Hash]struct{})
-	checkTxOutputs := func(tx *wire.MsgTx) ([]*pb.UnspentOutput, error) {
-		txHash := tx.TxHash()
-		var (
-			utxoView *blockchain.UtxoViewpoint
-			utxos    []*pb.UnspentOutput
-		)
-		if req.IncludeMempool {
-			utxoView, err = s.txMemPool.FetchUtxoView(bchutil.NewTx(tx))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			utxoView, err = s.chain.FetchUtxoView(bchutil.NewTx(tx))
-			if err != nil {
-				return nil, err
-			}
+	encodedAddr := addr.EncodeAddress()
+
+	// An output address with the queried hash matches by type alone, so
+	// it is encoded once per type.
+	var addrHash []byte
+	switch addr.(type) {
+	case *bchutil.AddressPubKeyHash, *bchutil.AddressScriptHash, *bchutil.AddressScriptHash32:
+		addrHash = addr.ScriptAddress()
+	}
+	typeMatches := make(map[reflect.Type]bool)
+	matches := func(a bchutil.Address) bool {
+		if addrHash == nil {
+			return a.EncodeAddress() == encodedAddr
 		}
-		entries := utxoView.Entries()
-		for i, out := range tx.TxOut {
+		if !bytes.Equal(a.ScriptAddress(), addrHash) {
+			return false
+		}
+		t := reflect.TypeOf(a)
+		match, ok := typeMatches[t]
+		if !ok {
+			match = a.EncodeAddress() == encodedAddr
+			typeMatches[t] = match
+		}
+		return match
+	}
+	tokenMetadataSet := make(map[chainhash.Hash]struct{})
+
+	// Each output is returned once, even when its transaction is checked
+	// twice: a block connected after the call starts is read with the
+	// history and again with the blocks connected during the call, and a
+	// repeated coinbase has two entries.  checkTxOutputs also tells whether
+	// it found an output of the transaction in the utxo set, which only a
+	// confirmed transaction's outputs are in.
+	found := make(map[wire.OutPoint]struct{})
+	checkTxOutputs := func(tx *bchutil.Tx) ([]*pb.UnspentOutput, bool, error) {
+		txHash := *tx.Hash()
+		var utxos []*pb.UnspentOutput
+		confirmed := false
+
+		// Outputs of a mempool transaction are unconfirmed.
+		var poolView *blockchain.UtxoViewpoint
+		for i, out := range tx.MsgTx().TxOut {
+			class, addrs, _, err := txscript.ExtractPkScriptAddrs(out.PkScript, s.chainParams)
+			if err != nil || len(addrs) == 0 {
+				continue
+			}
+
+			isMatch := false
+
+			switch typedAddr := addrs[0].(type) {
+			case *bchutil.AddressPubKeyHash, *bchutil.AddressScriptHash, *bchutil.AddressScriptHash32:
+				isMatch = matches(addrs[0])
+
+			case *bchutil.AddressPubKey:
+				// A bare multisig output names its keys too, but no
+				// one key's address can spend it alone.
+				isMatch = class == txscript.PubKeyTy &&
+					matches(typedAddr.AddressPubKeyHash())
+			}
+
+			// Outputs paying to other addresses are only looked up for
+			// their token metadata.
+			if !isMatch && (s.slpIndex == nil || !req.IncludeTokenMetadata) {
+				continue
+			}
+
 			op := wire.NewOutPoint(&txHash, uint32(i))
-			entry := entries[*op]
+			// The mempool is checked first, as a spend leaves it only
+			// after its block is connected.
+			if req.IncludeMempool && s.txMemPool.CheckSpend(*op) != nil {
+				continue
+			}
+			// The transaction is checked after the spend.  A block's
+			// transactions leave the mempool one at a time in block
+			// order, which is canonical order, so a child can leave
+			// before its parent.  For that moment an output the block
+			// spends is reported unspent at UnminedHeight.
+			var entry *blockchain.UtxoEntry
+			if req.IncludeMempool && s.txMemPool.IsTransactionInPool(&txHash) {
+				if poolView == nil {
+					poolView = blockchain.NewUtxoViewpoint()
+					poolView.AddTxOuts(tx, mining.UnminedHeight)
+				}
+				entry = poolView.LookupEntry(*op)
+			}
+			if entry == nil {
+				entry, err = s.chain.FetchUtxoEntryUncached(*op)
+				if err != nil {
+					return nil, false, err
+				}
+				confirmed = confirmed || entry != nil
+			}
 			if entry == nil || entry.IsSpent() {
 				continue
 			}
@@ -1032,34 +1448,24 @@ func (s *GrpcServer) GetAddressUnspentOutputs(ctx context.Context, req *pb.GetAd
 				cashToken = getPbCashTokenDataFromTokenData(tokenData)
 			}
 
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(pkScript, s.chainParams)
-			if err != nil || len(addrs) == 0 {
-				continue
-			}
-
 			var slpToken *pb.SlpToken
 			if s.slpIndex != nil {
-				slpToken, _ = s.getSlpToken(&txHash, uint32(i), out.PkScript)
+				slpToken, err = s.getSlpToken(&txHash, uint32(i), out.PkScript)
+				if _, ok := err.(errSlpIndexFailure); ok {
+					log.Errorf("Failed to load the slp token of output %v: %v", op, err)
+					return nil, false, status.Error(codes.Internal, "failed to load slp index entry")
+				}
 				if req.IncludeTokenMetadata && slpToken != nil {
 					hash, err := chainhash.NewHash(slpToken.TokenId)
 					if err != nil {
-						return nil, status.Errorf(codes.Internal, "failed to parse token id: %s: %v", hex.EncodeToString(slpToken.TokenId), err)
+						return nil, false, status.Errorf(codes.Internal, "failed to parse token id: %s: %v", hex.EncodeToString(slpToken.TokenId), err)
 					}
 					tokenMetadataSet[*hash] = struct{}{}
 				}
 			}
 
-			matchAddr := ""
-
-			switch typedAddr := addrs[0].(type) {
-			case *bchutil.AddressPubKeyHash, *bchutil.AddressScriptHash, *bchutil.AddressScriptHash32:
-				matchAddr = addrs[0].EncodeAddress()
-
-			case *bchutil.AddressPubKey:
-				matchAddr = typedAddr.AddressPubKeyHash().EncodeAddress()
-			}
-
-			if matchAddr == addr.EncodeAddress() {
+			if _, dup := found[*op]; isMatch && !dup {
+				found[*op] = struct{}{}
 				utxo := &pb.UnspentOutput{
 					Outpoint: &pb.Transaction_Input_Outpoint{
 						Hash:  txHash.CloneBytes(),
@@ -1075,58 +1481,188 @@ func (s *GrpcServer) GetAddressUnspentOutputs(ctx context.Context, req *pb.GetAd
 				utxos = append(utxos, utxo)
 			}
 		}
-		return utxos, nil
+		return utxos, confirmed, nil
 	}
 
+	// A block disconnected from the main chain during the call may have
+	// spent or created outputs the call read, and the call reads the blocks
+	// connected meanwhile only from above the height it started at, so it
+	// fails once the count of disconnections has changed, or once the block
+	// it started at has left the main chain, as it does when a
+	// disconnection under way as the call starts ends.
+	//
+	// The memory pool transactions are listed before the confirmed history
+	// is read, as a block connected meanwhile takes its transactions out of
+	// the memory pool and its entries land in front of the pages already
+	// read, newest first.  They are checked afterwards, so one confirmed in
+	// between is found in the utxo set, whether or not the memory pool is
+	// included.
+	disconnects := s.chain.DisconnectCount()
+	best := s.chain.BestSnapshot()
+	startHeight, startHash := best.Height, best.Hash
+	reorganized := func() bool {
+		return s.chain.DisconnectCount() != disconnects ||
+			!s.chain.MainChainHasBlock(&startHash)
+	}
+	unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
+	if addressUnspentListHook != nil {
+		addressUnspentListHook()
+	}
+
+	// The address's history is read once, newest first, and its
+	// transactions loaded and checked a page at a time.
 	var (
-		utxos []*pb.UnspentOutput
-		skip  = 0
-		fetch = 10000
+		utxos   []*pb.UnspentOutput
+		fetch   = addressUnspentPageSize
+		scanErr error
 	)
-	for {
-		if atomic.LoadInt32(&s.shutdown) > 0 {
-			return nil, status.Error(codes.Canceled, "canceled by server")
+	err = s.addrIndex.TxRegionPagesForAddress(addr, uint32(fetch),
+		func(regions []database.BlockRegion) error {
+			if atomic.LoadInt32(&s.shutdown) > 0 {
+				scanErr = status.Error(codes.Canceled, "canceled by server")
+				return scanErr
+			}
+			// The scan reads the address's whole history, so it stops
+			// once the client is gone or its deadline has passed.
+			if err := ctx.Err(); err != nil {
+				scanErr = status.FromContextError(err).Err()
+				return scanErr
+			}
+			var confirmedTxs []retrievedTx
+			err := s.db.View(func(dbTx database.Tx) error {
+				var err error
+				confirmedTxs, err = s.appendRegionTxs(nil, dbTx,
+					regions, 0)
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			for _, ret := range confirmedTxs {
+				u, _, err := checkTxOutputs(bchutil.NewTx(&ret.tx))
+				if err != nil {
+					scanErr = err
+					return err
+				}
+				if len(u) > 0 {
+					utxos = append(utxos, u...)
+				}
+			}
+			return nil
+		})
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	// A disconnection can also fail the read of a page whose blocks leave
+	// the main chain meanwhile.
+	if errors.Is(err, indexers.ErrAddrHistoryChanged) ||
+		err != nil && reorganized() {
+
+		return nil, errChainReorganized
+	}
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "failed to load address index entries")
+	}
+	if addressUnspentScanHook != nil {
+		addressUnspentScanHook()
+	}
+
+	// An output checked during the scan may have been spent since by a
+	// transaction that appeared during the call: one listed in the memory
+	// pool now and not before, or one confirmed meanwhile, in a block
+	// connected during the call or, for a listed one, found confirmed when
+	// it is checked below.  Those transactions are checked too, and the
+	// outputs they spend are left out, those of the memory pool only when
+	// it is included.
+	var lateSpends []*bchutil.Tx
+	listed := make(map[chainhash.Hash]struct{}, len(unconfirmedTxs))
+	for _, tx := range unconfirmedTxs {
+		listed[*tx.Hash()] = struct{}{}
+	}
+	for _, tx := range s.addrIndex.UnconfirmedTxnsForAddress(addr) {
+		if _, ok := listed[*tx.Hash()]; ok {
+			continue
 		}
-		confirmedTxs, err := s.fetchTransactionsByAddress(addr, 0, fetch, skip)
+		unconfirmedTxs = append(unconfirmedTxs, tx)
+		if req.IncludeMempool {
+			lateSpends = append(lateSpends, tx)
+		}
+	}
+	if s.chain.BestSnapshot().Height > startHeight {
+		for skip := uint32(0); ; {
+			if err := ctx.Err(); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
+			newTxs, _, _, err := s.fetchTransactionsByAddress(addr,
+				startHeight+1, uint32(fetch), skip, false, nil)
+			if err != nil && reorganized() {
+				return nil, errChainReorganized
+			}
+			if err != nil {
+				return nil, err
+			}
+			for _, ret := range newTxs {
+				tx := bchutil.NewTx(&ret.tx)
+				u, _, err := checkTxOutputs(tx)
+				if err != nil {
+					return nil, err
+				}
+				utxos = append(utxos, u...)
+				lateSpends = append(lateSpends, tx)
+			}
+			if len(newTxs) < fetch {
+				break
+			}
+			skip += uint32(fetch)
+		}
+	}
+	// A listed transaction whose outputs are in the utxo set was confirmed
+	// during the call, maybe after the blocks connected meanwhile were read,
+	// so the outputs it spends are left out too.
+	for _, tx := range unconfirmedTxs {
+		u, confirmed, err := checkTxOutputs(tx)
 		if err != nil {
 			return nil, err
 		}
-		if len(confirmedTxs) == 0 {
-			break
+		if len(u) > 0 {
+			utxos = append(utxos, u...)
 		}
-		for _, ret := range confirmedTxs {
-			u, err := checkTxOutputs(&ret.tx)
-			if err != nil {
-				return nil, err
-			}
-			if len(u) > 0 {
-				utxos = append(utxos, u...)
-			}
+		if confirmed {
+			lateSpends = append(lateSpends, tx)
 		}
-		skip += len(confirmedTxs)
 	}
-	if req.IncludeMempool {
-		unconfirmedTxs := s.addrIndex.UnconfirmedTxnsForAddress(addr)
-		for _, tx := range unconfirmedTxs {
-			u, err := checkTxOutputs(tx.MsgTx())
-			if err != nil {
-				return nil, err
-			}
-			if len(u) > 0 {
-				utxos = append(utxos, u...)
+	// Everything the answer holds has been read.
+	if reorganized() {
+		return nil, errChainReorganized
+	}
+	if len(lateSpends) > 0 {
+		spent := make(map[wire.OutPoint]struct{})
+		for _, tx := range lateSpends {
+			for _, in := range tx.MsgTx().TxIn {
+				spent[in.PreviousOutPoint] = struct{}{}
 			}
 		}
+		kept := utxos[:0]
+		for _, u := range utxos {
+			var op wire.OutPoint
+			copy(op.Hash[:], u.Outpoint.Hash)
+			op.Index = u.Outpoint.Index
+			if _, ok := spent[op]; !ok {
+				kept = append(kept, u)
+			}
+		}
+		utxos = kept
 	}
 
 	var tokenMetadata []*pb.SlpTokenMetadata
 	if req.IncludeTokenMetadata && s.slpIndex != nil {
 		tokenMetadata = make([]*pb.SlpTokenMetadata, 0)
 		for hash := range tokenMetadataSet {
-			tm, err := s.marshalTokenMetadata(hash)
+			tm, err := s.tokenMetadataOrNil(hash)
 			if err != nil {
-				log.Debugf("Could not build slp token metadata for %v", hash)
+				return nil, status.Error(codes.Internal, "failed to load slp token metadata")
 			}
-			if tm != nil && err == nil {
+			if tm != nil {
 				tokenMetadata = append(tokenMetadata, tm)
 			}
 		}
@@ -1160,13 +1696,14 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 		cashToken      *pb.CashToken
 		coinbase       bool
 		isSlpInMempool = false
+		confirmed      = false
 	)
 	if req.IncludeMempool && s.txMemPool.HaveTransaction(txnHash) {
 		tx, err := s.txMemPool.FetchTransaction(txnHash)
 		if err != nil {
 			return nil, status.Error(codes.NotFound, "utxo not found")
 		}
-		if req.Index > uint32(len(tx.MsgTx().TxOut)) {
+		if req.Index >= uint32(len(tx.MsgTx().TxOut)) {
 			return nil, status.Error(codes.InvalidArgument, "prev index greater than len outputs")
 		}
 		spendingTx := s.txMemPool.CheckSpend(*op)
@@ -1212,24 +1749,39 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 			cashToken = getPbCashTokenDataFromTokenData(entry.TokenData())
 		}
 		coinbase = entry.IsCoinBase()
+		confirmed = true
 	}
 
 	var (
 		slpToken *pb.SlpToken
 		tm       *pb.SlpTokenMetadata
 	)
-	if s.slpIndex != nil && req.Index > 0 && isSlpInMempool && req.IncludeMempool {
+	// The utxo set does not hold the transaction of a confirmed output, to
+	// tell whether its first output reads as SLP, so the token of a
+	// confirmed output is always looked up, as GetAddressUnspentOutputs
+	// does.
+	if s.slpIndex != nil && req.Index > 0 && (isSlpInMempool || confirmed) {
+		// An output that holds no tokens, such as the change of a GENESIS
+		// or an output of a transaction that is not valid SLP, is returned
+		// without a token, as the outputs of a transaction are.
 		slpToken, err = s.getSlpToken(txnHash, req.Index, scriptPubkey)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "cannot get slp token for txid: %v", txnHash)
+		if _, ok := err.(errSlpIndexFailure); ok {
+			log.Errorf("Failed to load the slp token of output %v: %v", op, err)
+			return nil, status.Error(codes.Internal, "failed to load slp index entry")
 		}
-		tokenID, err := chainhash.NewHash(slpToken.TokenId)
+		// The token's metadata is read only when the call asks for it, as
+		// GetAddressUnspentOutputs does.
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "cannot create hash for token id: %s", hex.EncodeToString(slpToken.TokenId))
-		}
-		tm, err = s.marshalTokenMetadata(*tokenID)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "cannot build token metadata for token id: %s", hex.EncodeToString(slpToken.TokenId))
+			log.Debugf("No slp token for output %v: %v", op, err)
+		} else if req.IncludeTokenMetadata {
+			tokenID, err := chainhash.NewHash(slpToken.TokenId)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "cannot create hash for token id: %s", hex.EncodeToString(slpToken.TokenId))
+			}
+			tm, err = s.tokenMetadataOrNil(*tokenID)
+			if err != nil {
+				return nil, status.Error(codes.Internal, "failed to load slp token metadata")
+			}
 		}
 	}
 
@@ -1308,6 +1860,127 @@ func (s *GrpcServer) GetMerkleProof(ctx context.Context, req *pb.GetMerkleProofR
 	return resp, nil
 }
 
+// GetBcmrIdentity returns what the BCMR index knows of an identity, a token's
+// or that of any transaction of an authchain the index tracks, with the links
+// of its authchain in the mempool, and on request the authchain itself, in
+// pages, with a merkle proof of the newest confirmed link.
+//
+// **Requires BcmrIndex**
+func (s *GrpcServer) GetBcmrIdentity(ctx context.Context, req *pb.GetBcmrIdentityRequest) (*pb.GetBcmrIdentityResponse, error) {
+	if s.bcmrIndex == nil {
+		return nil, status.Error(codes.Unavailable, "bcmrindex required")
+	}
+	authbase, err := chainhash.NewHash(req.Authbase)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid authbase: %v", err)
+	}
+	if (len(req.After) > 0 || req.Limit > 0) && !req.IncludeAuthchain {
+		return nil, status.Error(codes.InvalidArgument,
+			"after and limit only apply with include_authchain")
+	}
+	query := &indexers.BcmrQuery{
+		Authbase:  *authbase,
+		Authchain: req.IncludeAuthchain,
+		Limit:     int(min(req.Limit, indexers.BcmrMaxAuthchainEntries)),
+	}
+	if len(req.After) > 0 {
+		query.After, err = chainhash.NewHash(req.After)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid after: %v", err)
+		}
+	}
+
+	info, err := s.bcmrIndex.Identity(query, s.txMemPool)
+	switch {
+	case errors.Is(err, indexers.ErrBcmrIdentityNotFound):
+		return nil, status.Error(codes.NotFound, "no identity with that authbase")
+	case errors.Is(err, indexers.ErrBcmrNotALink):
+		return nil, status.Error(codes.NotFound,
+			"after is not a link of the identity's authchain")
+	case err != nil:
+		log.Errorf("Failed to read the BCMR identity %v: %v", query.Authbase, err)
+		return nil, status.Error(codes.Internal, "failed to read the BCMR index")
+	}
+	return s.marshalBcmrIdentity(info)
+}
+
+// marshalBcmrIdentity returns what the BCMR index knows of an identity, for
+// GetBcmrIdentity.
+func (s *GrpcServer) marshalBcmrIdentity(info *indexers.BcmrIdentityInfo) (*pb.GetBcmrIdentityResponse, error) {
+	resp := &pb.GetBcmrIdentityResponse{
+		Authbase:   info.Authbase.CloneBytes(),
+		Status:     pb.GetBcmrIdentityResponse_ACTIVE,
+		Head:       marshalBcmrLink(&info.Head),
+		FirstIndex: info.FirstIndex,
+		More:       info.More,
+	}
+	if info.Burned {
+		resp.Status = pb.GetBcmrIdentityResponse_BURNED
+	}
+	if info.Publication != nil {
+		resp.Publication = marshalBcmrLink(info.Publication)
+		resp.PublicationCurrent = info.Current
+	}
+	if info.HasGenesisSupply {
+		resp.HasGenesisSupply = true
+		resp.GenesisSupply = info.GenesisSupply
+	}
+	if info.IdentityOutput != nil {
+		resp.IdentityOutput = getPbCashTokenDataFromTokenData(*info.IdentityOutput)
+	}
+	for i := range info.Authchain {
+		resp.Authchain = append(resp.Authchain, marshalBcmrLink(&info.Authchain[i]))
+	}
+	if info.Proof != nil {
+		block := info.ProofBlock
+		medianTime, err := s.chain.MedianTimeByHash(block.Hash())
+		if err != nil {
+			return nil, status.Error(codes.Internal, "error calculating median time for block")
+		}
+		hashes := make([][]byte, 0, len(info.Proof.Hashes))
+		for _, h := range info.Proof.Hashes {
+			hashes = append(hashes, h.CloneBytes())
+		}
+		resp.Proof = &pb.GetBcmrIdentityResponse_Proof{
+			Index: info.ProofIndex,
+			Block: marshalBlockInfo(block, s.chain.BestSnapshot().Height-block.Height()+1,
+				medianTime, s.chainParams),
+			Hashes:       hashes,
+			Flags:        info.Proof.Flags,
+			Transactions: info.Proof.Transactions,
+		}
+		if nextHeader, err := s.chain.HeaderByHeight(block.Height() + 1); err == nil {
+			nextHash := nextHeader.BlockHash()
+			resp.Proof.Block.NextBlockHash = nextHash.CloneBytes()
+		}
+	}
+	return resp, nil
+}
+
+// marshalBcmrLink returns a link of an authchain for GetBcmrIdentity.  The
+// hash of a publication stays in the byte order it was pushed in.
+func marshalBcmrLink(link *indexers.BcmrLinkInfo) *pb.GetBcmrIdentityResponse_Link {
+	result := &pb.GetBcmrIdentityResponse_Link{
+		Hash:        link.Hash.CloneBytes(),
+		Height:      link.Height,
+		Transaction: link.Tx,
+	}
+	if link.BlockHash != nil {
+		result.BlockHash = link.BlockHash.CloneBytes()
+	}
+	if pub := link.Publication; pub != nil {
+		result.Publication = &pb.GetBcmrIdentityResponse_Publication{
+			Output:    pub.Output,
+			Malformed: pub.Malformed,
+		}
+		if !pub.Malformed {
+			result.Publication.Hash = append([]byte(nil), pub.Hash[:]...)
+			result.Publication.Uris = pub.URIs
+		}
+	}
+	return result
+}
+
 // GetSlpTokenMetadata returns metadata associated with a Token ID
 func (s *GrpcServer) GetSlpTokenMetadata(ctx context.Context, req *pb.GetSlpTokenMetadataRequest) (*pb.GetSlpTokenMetadataResponse, error) {
 	if s.slpIndex == nil {
@@ -1318,12 +1991,21 @@ func (s *GrpcServer) GetSlpTokenMetadata(ctx context.Context, req *pb.GetSlpToke
 	for _, hash := range req.GetTokenIds() {
 		tokenID, err := chainhash.NewHash(hash)
 		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "token ID hash %s is invalid: %s", hex.EncodeToString(hash), err)
+			return nil, status.Errorf(codes.InvalidArgument, "invalid token ID: %v", err)
 		}
 
+		// A failure of the index is logged, and answered without the
+		// database's own error, which can name the node's files.
 		tm, err := s.marshalTokenMetadata(*tokenID)
+		if indexers.IsSlpEntryNotFound(err) || errors.Is(err, errTokenNotGenesis) {
+			return nil, status.Errorf(codes.NotFound, "token ID %x has no GENESIS in the slp index", hash)
+		}
+		if indexers.IsTokenNotIndexed(err) {
+			return nil, status.Errorf(codes.NotFound, "token ID %x has no metadata in the slp index", hash)
+		}
 		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "token ID %v does not exist", hex.EncodeToString(hash))
+			log.Errorf("Failed to load slp token metadata of token ID %x: %v", hash, err)
+			return nil, status.Error(codes.Internal, "failed to load slp token metadata")
 		}
 
 		tokenMetadata = append(tokenMetadata, tm)
@@ -1416,6 +2098,12 @@ func (s *GrpcServer) GetSlpTrustedValidation(ctx context.Context, req *pb.GetSlp
 
 	resp := &pb.GetSlpTrustedValidationResponse{}
 	results := make([]*pb.GetSlpTrustedValidationResponse_ValidityResult, len(req.Queries))
+
+	// The graph search counts of the request, by the transaction searched
+	// from and the valid hashes as the query lists them, so that queries for
+	// outputs of one transaction with the same valid hashes count its search
+	// once.
+	counts := make(map[string]uint32)
 	for i, query := range req.Queries {
 		result := &pb.GetSlpTrustedValidationResponse_ValidityResult{}
 		result.PrevOutHash = query.PrevOutHash
@@ -1423,12 +2111,12 @@ func (s *GrpcServer) GetSlpTrustedValidation(ctx context.Context, req *pb.GetSlp
 
 		txid, err := chainhash.NewHash(query.PrevOutHash)
 		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "invalid txn hash for txo %s: %v", query.GetPrevOutHash(), err)
+			return nil, status.Errorf(codes.InvalidArgument, "invalid trusted validation hash: %v", err)
 		}
 
 		entry, err := s.getSlpIndexEntry(txid)
 		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "txid is missing from slp validity set for txo: %v:%s: %v", txid, fmt.Sprint(query.GetPrevOutVout()), err)
+			return nil, slpEntryStatus(txid, err)
 		}
 
 		if query.PrevOutVout == 0 || query.PrevOutVout > 19 {
@@ -1525,7 +2213,7 @@ func (s *GrpcServer) GetSlpTrustedValidation(ctx context.Context, req *pb.GetSlp
 				for _, validTxid := range query.GraphsearchValidHashes {
 					hash, err := chainhash.NewHash(validTxid)
 					if err != nil {
-						return nil, status.Errorf(codes.Internal, "graph search validity txid %v, error: %v", hex.EncodeToString(validTxid), err)
+						return nil, status.Errorf(codes.InvalidArgument, "invalid graph search valid hash: %v", err)
 					}
 					validityCache[*hash] = struct{}{}
 				}
@@ -1535,12 +2223,18 @@ func (s *GrpcServer) GetSlpTrustedValidation(ctx context.Context, req *pb.GetSlp
 			if err != nil {
 				return nil, status.Error(codes.Unavailable, err.Error())
 			}
-			txData, err := gsDb.Find(hash, &entry.TokenIDHash, &validityCache)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "%v", err)
+			key := string(hash[:]) + string(bytes.Join(query.GraphsearchValidHashes, nil))
+			count, ok := counts[key]
+			if !ok {
+				n, err := gsDb.Count(ctx, hash, &entry.TokenIDHash, &validityCache)
+				if err != nil {
+					return nil, graphSearchStatus(ctx, err)
+				}
+				count = uint32(n)
+				counts[key] = count
 			}
-			log.Infof("SLP graph search count is %s transactions for txid %v", fmt.Sprint(len(txData)), hash)
-			result.GraphsearchTxnCount = uint32(len(txData[:]))
+			log.Debugf("SLP graph search count is %s transactions for txid %v", fmt.Sprint(count), hash)
+			result.GraphsearchTxnCount = count
 		}
 
 		results[i] = result
@@ -1552,11 +2246,11 @@ func (s *GrpcServer) GetSlpTrustedValidation(ctx context.Context, req *pb.GetSlp
 // GetSlpGraphSearch returns all transactions required for a client to validate locally
 func (s *GrpcServer) GetSlpGraphSearch(ctx context.Context, req *pb.GetSlpGraphSearchRequest) (*pb.GetSlpGraphSearchResponse, error) {
 
-	if !s.slpIndex.GraphSearchEnabled() {
+	if s.slpIndex == nil || !s.slpIndex.GraphSearchEnabled() {
 		return nil, status.Error(codes.Unavailable, "slpgraphsearch must be enabled")
 	}
 
-	if s.slpIndex == nil || s.txIndex == nil {
+	if s.txIndex == nil {
 		return nil, status.Error(codes.Unavailable, "slpindex and txindex must be enabled")
 	}
 
@@ -1567,13 +2261,13 @@ func (s *GrpcServer) GetSlpGraphSearch(ctx context.Context, req *pb.GetSlpGraphS
 	// check slp validity, get graph tokenId
 	hash, err := chainhash.NewHash(req.GetHash())
 	if err != nil {
-		return nil, status.Errorf(codes.Aborted, "graph search hash %s: %v", hex.EncodeToString(req.GetHash()), err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid graph search hash: %v", err)
 	}
 	log.Debugf("received graph search for txid: %v", hash)
 
 	entry, err := s.getSlpIndexEntry(hash)
 	if err != nil {
-		return nil, status.Errorf(codes.Aborted, "txid is missing from slp validity set for txn: %s: %v", hash, err)
+		return nil, slpEntryStatus(hash, err)
 	}
 
 	// get map for token and do graph search
@@ -1587,22 +2281,47 @@ func (s *GrpcServer) GetSlpGraphSearch(ctx context.Context, req *pb.GetSlpGraphS
 	for _, txHash := range req.GetValidHashes() {
 		hash, err := chainhash.NewHash(txHash)
 		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "graph search validity cache invalid hash %v", txHash)
+			return nil, status.Errorf(codes.InvalidArgument, "invalid graph search valid hash: %v", err)
 		}
 		validityCache[*hash] = struct{}{}
 	}
 
-	// perform the graph search
-	txData, err := gsDb.Find(hash, &entry.TokenIDHash, &validityCache)
+	// perform the graph search, which stops once the client is gone or its
+	// deadline has passed
+	txData, err := gsDb.Find(ctx, hash, &entry.TokenIDHash, &validityCache)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, graphSearchStatus(ctx, err)
 	}
 
 	res := &pb.GetSlpGraphSearchResponse{}
 	res.Txdata = txData
-	log.Infof("SLP graph search returned %s transactions for txid %v", fmt.Sprint(len(txData)), hash)
+	log.Debugf("SLP graph search returned %s transactions for txid %v", fmt.Sprint(len(txData)), hash)
 
 	return res, nil
+}
+
+// graphSearchStatus returns the status a graph search of the call whose
+// context is ctx answers err with: that of the context once it has ended,
+// NotFound for a transaction of the search that the node does not have and
+// InvalidArgument for a valid hash the client gave that is not in the token's
+// graph, which the client asked for, and Internal for the node's own failures.
+func graphSearchStatus(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return status.FromContextError(ctxErr).Err()
+	}
+	var notFound errGraphSearchTxnNotFound
+	if errors.As(err, &notFound) {
+		return status.Error(codes.NotFound, notFound.Error())
+	}
+	var notInGraph slpgraphsearch.TxnNotInGraphError
+	if errors.As(err, &notInGraph) {
+		return status.Error(codes.NotFound, notInGraph.Error())
+	}
+	var validHash slpgraphsearch.ValidHashNotInGraphError
+	if errors.As(err, &validHash) {
+		return status.Error(codes.InvalidArgument, validHash.Error())
+	}
+	return status.Errorf(codes.Internal, "%v", err)
 }
 
 func isMaybeSlpTransaction(txn *wire.MsgTx) bool {
@@ -1693,6 +2412,9 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 			// check to see if the input is a burn
 			slpEntry, err := s.getSlpIndexEntryAndCheckBurnOtherToken(txIn.PreviousOutPoint, requiredBurns, nil, i)
 			if slpEntry == nil {
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if err != nil {
@@ -1717,6 +2439,9 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 		for i, txIn := range msgTx.TxIn {
 			slpEntry, err := s.getSlpIndexEntryAndCheckBurnOtherToken(txIn.PreviousOutPoint, requiredBurns, md, i)
 			if slpEntry == nil {
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if err != nil && useSafeValidityJudgement {
@@ -1738,7 +2463,7 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 			}
 		}
 
-		// check inputs != outputs (use check for explict burn requests i.e., 'req.AllowedSlpBurns')
+		// check inputs != outputs (use check for explicit burn requests i.e., 'req.AllowedSlpBurns')
 		outputVal, err := slpMd.TotalSlpMsgOutputValue()
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "an error occurred when getting total slp amount in txn: %v, with error: %v", msgTx.TxHash(), err)
@@ -1800,6 +2525,9 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 		for i, txIn := range msgTx.TxIn {
 			slpEntry, err := s.getSlpIndexEntryAndCheckBurnOtherToken(txIn.PreviousOutPoint, requiredBurns, slpMd, i)
 			if slpEntry == nil {
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if err != nil && useSafeValidityJudgement {
@@ -1866,6 +2594,9 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 		for i, txIn := range msgTx.TxIn {
 			slpEntry, err := s.getSlpIndexEntryAndCheckBurnOtherToken(txIn.PreviousOutPoint, requiredBurns, slpMd, i)
 			if slpEntry == nil {
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if err != nil && useSafeValidityJudgement {
@@ -1942,16 +2673,26 @@ func (s *GrpcServer) checkTransactionSlpValidity(msgTx *wire.MsgTx, requiredBurn
 // NOTE: nft1 child genesis is allowed without error as long as the burned outpoint is a
 //
 //	nft1 Group type and the quantity is 1.
+//
+// An outpoint of a transaction the slp index does not hold is not an slp
+// outpoint.  An entry the index cannot read, or read but not parse, fails the
+// check with an Internal error, as taking its outpoint for one that is not slp
+// could find a transaction that burns tokens valid.
 func (s *GrpcServer) getSlpIndexEntryAndCheckBurnOtherToken(outpoint wire.OutPoint, requiredBurns []*pb.SlpRequiredBurn, txnSlpMsg v1parser.ParseResult, inputIdx int) (*indexers.SlpTxEntry, error) {
 
 	slpEntry, err := s.getSlpIndexEntry(&outpoint.Hash)
+	if indexers.IsSlpEntryNotFound(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, err
+		log.Errorf("Failed to load the slp entry of the output %v an input spends: %v", outpoint, err)
+		return nil, status.Error(codes.Internal, "failed to load slp index entry")
 	}
 
 	inputSlpMsg, err := v1parser.ParseSLP(slpEntry.SlpOpReturn)
 	if err != nil {
-		return nil, errors.New("could not parse slpMsg from and existing db entry, this should never happen")
+		log.Errorf("Failed to parse the slp entry of the output %v an input spends: %v", outpoint, err)
+		return nil, status.Error(codes.Internal, "could not parse slpMsg from and existing db entry, this should never happen")
 	}
 
 	// exit early if the outpoint is not an slp outpoint, or is a zero output slp
@@ -2103,7 +2844,7 @@ func (s *GrpcServer) SubmitTransaction(ctx context.Context, req *pb.SubmitTransa
 
 	// Use 0 for the tag to represent local node.
 	tx := bchutil.NewTx(msgTx)
-	acceptedTxs, err := s.txMemPool.ProcessTransaction(tx, false, false, 0)
+	acceptedTxs, err := s.txMemPool.ProcessTransaction(tx, false, 0)
 	if err != nil {
 		// When the error is a rule error, it means the transaction was
 		// simply rejected as opposed to something actually going wrong,
@@ -2161,10 +2902,14 @@ func (s *GrpcServer) SubmitTransaction(ctx context.Context, req *pb.SubmitTransa
 //
 // **Requires TxIndex to receive input metadata**
 func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest, stream pb.Bchrpc_SubscribeTransactionsServer) error {
-	subscription := s.subscribeEvents()
-	defer subscription.Unsubscribe()
+	subscription, err := s.subscribeClient(stream.Context(),
+		txEventKinds(req.IncludeMempool, req.IncludeInBlock))
+	if err != nil {
+		return err
+	}
+	defer s.unsubscribeClient(subscription)
 
-	filter := newTxFilter()
+	filter := newTxFilter(s.maxFilterEntries)
 	if err := filter.AddRPCFilter(req.GetSubscribe(), s.chainParams); err != nil {
 		return err
 	}
@@ -2173,7 +2918,10 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 	serializeTx := req.SerializeTx
 	for {
 		select {
-		case event := <-subscription.Events():
+		case event, ok := <-subscription.Events():
+			if !ok {
+				return subscription.closedErr()
+			}
 
 			switch event := event.(type) {
 			case *rpcEventTxAccepted:
@@ -2184,10 +2932,12 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 				txDesc := event
 
 				if s.slpIndex != nil {
-					s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "SubscribeTransactions rpcEventTxAccepted")
+					// A failure is logged, and the slp event handler checks
+					// the transaction again at the next block.
+					_, _ = s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "SubscribeTransactions rpcEventTxAccepted")
 				}
 
-				if !filter.MatchAndUpdate(txDesc.Tx, s.chainParams) {
+				if !filter.MatchAndUpdate(txDesc.Tx, s.chainParams, s.txSpentScripts(txDesc)) {
 					continue
 				}
 
@@ -2218,7 +2968,7 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 							Fee:              txDesc.Fee,
 							FeePerKb:         txDesc.FeePerKB,
 							AddedHeight:      txDesc.Height,
-							StartingPriority: txDesc.StartingPriority,
+							StartingPriority: 0, // deprecated
 						},
 					}
 				}
@@ -2233,14 +2983,17 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 				}
 				// Search for all transactions.
 				block := event
+				spent := s.blockSpentScripts(block)
 
-				for _, tx := range block.Transactions() {
-					if !filter.MatchAndUpdate(tx, s.chainParams) {
+				for idx, tx := range block.Transactions() {
+					if !filter.MatchAndUpdate(tx, s.chainParams, spent) {
 						continue
 					}
 
 					if s.slpIndex != nil {
-						s.checkSlpTxOnEvent(tx.MsgTx(), "SubscribeTransactions rpcEventBlockConnected")
+						// A failure is logged; the index judged the block's
+						// transactions when it connected it.
+						_, _ = s.checkSlpTxOnEvent(tx.MsgTx(), "SubscribeTransactions rpcEventBlockConnected")
 					}
 
 					toSend := &pb.TransactionNotification{}
@@ -2260,7 +3013,7 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 
 						respTx := marshalTransaction(tx, s.chain.BestSnapshot().Height-block.Height()+1, &header, block.Height(), s)
 						if s.txIndex != nil {
-							if err := s.setInputMetadata(respTx); err != nil {
+							if err := s.setBlockInputMetadata(respTx, block, idx); err != nil {
 								return err
 							}
 						}
@@ -2290,7 +3043,17 @@ func (s *GrpcServer) SubscribeTransactions(req *pb.SubscribeTransactionsRequest,
 //
 // **Requires TxIndex to receive input metadata**
 func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransactionStreamServer) error {
-	// Put the incoming messages on a channel.
+	// The call takes no events until a request says which.
+	subscription, err := s.subscribeClient(stream.Context(), 0)
+	if err != nil {
+		return err
+	}
+	defer s.unsubscribeClient(subscription)
+
+	// Put the incoming messages on a channel.  The handler can return with a
+	// request still to be handed over, as on a bad filter, so the reader
+	// stops once the stream's context ends, which it does as the handler
+	// returns.
 	requests := make(chan *pb.SubscribeTransactionsRequest)
 	go func() {
 		for {
@@ -2302,14 +3065,15 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 				close(requests)
 				return
 			}
-			requests <- req
+			select {
+			case requests <- req:
+			case <-stream.Context().Done():
+				return
+			}
 		}
 	}()
 
-	subscription := s.subscribeEvents()
-	defer subscription.Unsubscribe()
-
-	filter := newTxFilter()
+	filter := newTxFilter(s.maxFilterEntries)
 	var includeMempool, includeBlocks, serializeTx bool
 	for {
 		select {
@@ -2320,6 +3084,8 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 			includeMempool = req.IncludeMempool
 			includeBlocks = req.IncludeInBlock
 			serializeTx = req.SerializeTx
+			subscription.setKinds(txEventKinds(includeMempool,
+				includeBlocks))
 
 			// Update filter.
 			if err := filter.AddRPCFilter(req.GetSubscribe(), s.chainParams); err != nil {
@@ -2329,7 +3095,10 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 				return err
 			}
 
-		case event := <-subscription.Events():
+		case event, ok := <-subscription.Events():
+			if !ok {
+				return subscription.closedErr()
+			}
 
 			switch event := event.(type) {
 			case *rpcEventTxAccepted:
@@ -2340,10 +3109,12 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 				txDesc := event
 
 				if s.slpIndex != nil {
-					s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "SubscribeTransactionStream rpcEventTxAccepted")
+					// A failure is logged, and the slp event handler checks
+					// the transaction again at the next block.
+					_, _ = s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "SubscribeTransactionStream rpcEventTxAccepted")
 				}
 
-				if !filter.MatchAndUpdate(txDesc.Tx, s.chainParams) {
+				if !filter.MatchAndUpdate(txDesc.Tx, s.chainParams, s.txSpentScripts(txDesc)) {
 					continue
 				}
 
@@ -2374,7 +3145,7 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 							Fee:              txDesc.Fee,
 							FeePerKb:         txDesc.FeePerKB,
 							AddedHeight:      txDesc.Height,
-							StartingPriority: txDesc.StartingPriority,
+							StartingPriority: 0, // deprecated
 						},
 					}
 				}
@@ -2389,14 +3160,17 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 				}
 				// Search for all transactions.
 				block := event
+				spent := s.blockSpentScripts(block)
 
-				for _, tx := range block.Transactions() {
-					if !filter.MatchAndUpdate(tx, s.chainParams) {
+				for idx, tx := range block.Transactions() {
+					if !filter.MatchAndUpdate(tx, s.chainParams, spent) {
 						continue
 					}
 
 					if s.slpIndex != nil {
-						s.checkSlpTxOnEvent(tx.MsgTx(), "SubscribeTransactionStream rpcEventBlockConnected")
+						// A failure is logged; the index judged the block's
+						// transactions when it connected it.
+						_, _ = s.checkSlpTxOnEvent(tx.MsgTx(), "SubscribeTransactionStream rpcEventBlockConnected")
 					}
 
 					toSend := &pb.TransactionNotification{}
@@ -2416,7 +3190,7 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 
 						respTx := marshalTransaction(tx, s.chain.BestSnapshot().Height-block.Height()+1, &header, block.Height(), s)
 						if s.txIndex != nil {
-							if err := s.setInputMetadata(respTx); err != nil {
+							if err := s.setBlockInputMetadata(respTx, block, idx); err != nil {
 								return err
 							}
 						}
@@ -2440,12 +3214,19 @@ func (s *GrpcServer) SubscribeTransactionStream(stream pb.Bchrpc_SubscribeTransa
 // SubscribeBlocks creates a subscription for notifications of new blocks being
 // connected to the blockchain or blocks being disconnected.
 func (s *GrpcServer) SubscribeBlocks(req *pb.SubscribeBlocksRequest, stream pb.Bchrpc_SubscribeBlocksServer) error {
-	subscription := s.subscribeEvents()
-	defer subscription.Unsubscribe()
+	subscription, err := s.subscribeClient(stream.Context(),
+		rpcEventsBlockConnected|rpcEventsBlockDisconnected)
+	if err != nil {
+		return err
+	}
+	defer s.unsubscribeClient(subscription)
 
 	for {
 		select {
-		case event := <-subscription.Events():
+		case event, ok := <-subscription.Events():
+			if !ok {
+				return subscription.closedErr()
+			}
 
 			switch event := event.(type) {
 			case *rpcEventBlockConnected:
@@ -2646,6 +3427,86 @@ func (s *GrpcServer) SubscribeBlocks(req *pb.SubscribeBlocksRequest, stream pb.B
 	}
 }
 
+// errGraphSearchTxnNotFound is the error for a transaction of slp graph search
+// that is in neither the memory pool nor the transaction index.  The graph
+// holds a transaction a block confirms before the block is committed, and
+// keeps one a reorg disconnects or that leaves the memory pool unconfirmed.
+type errGraphSearchTxnNotFound chainhash.Hash
+
+// Error implements the error interface.
+func (e errGraphSearchTxnNotFound) Error() string {
+	return fmt.Sprintf("transaction %v of the graph search is in neither "+
+		"the memory pool nor the transaction index", chainhash.Hash(e))
+}
+
+// errGraphSearchTxnLoad is the error for transactions of slp graph search that
+// the database failed to load.  It leaves out the database's own error, which
+// can name the node's files, as a search answers the client with it; the
+// server logs that error instead.
+var errGraphSearchTxnLoad = errors.New("failed to load transaction bytes")
+
+// fetchGraphSearchTxns reads transactions of slp graph search, serialized, in
+// the order of their hashes.  The graph holds a memory pool transaction before
+// a block does, so one in the memory pool is read from it, and the others from
+// their blocks, found in the transaction index, all in one database
+// transaction.  The index holds only the blocks of the main chain, so their
+// heights are not looked up.  A transaction in neither fails the read with an
+// errGraphSearchTxnNotFound, and the database failing with
+// errGraphSearchTxnLoad.
+func (s *GrpcServer) fetchGraphSearchTxns(txnHashes []chainhash.Hash) ([][]byte, error) {
+	txns := make([][]byte, len(txnHashes))
+	confirmed := make([]int, 0, len(txnHashes))
+	for i := range txnHashes {
+		// Most transactions a search returns are confirmed, and
+		// FetchTransaction allocates an error for each the memory pool
+		// does not hold.
+		if s.txMemPool.IsTransactionInPool(&txnHashes[i]) {
+			if tx, err := s.txMemPool.FetchTransaction(&txnHashes[i]); err == nil {
+				txBuf := bytes.NewBuffer(make([]byte, 0, tx.MsgTx().SerializeSize()))
+				if err := tx.MsgTx().Serialize(txBuf); err != nil {
+					return nil, err
+				}
+				txns[i] = txBuf.Bytes()
+				continue
+			}
+		}
+		confirmed = append(confirmed, i)
+	}
+	if len(confirmed) == 0 {
+		return txns, nil
+	}
+	err := s.db.View(func(dbTx database.Tx) error {
+		regions := make([]database.BlockRegion, len(confirmed))
+		for j, i := range confirmed {
+			region, err := s.txIndex.TxBlockRegionIn(dbTx, &txnHashes[i])
+			if err != nil {
+				return err
+			}
+			if region == nil {
+				return errGraphSearchTxnNotFound(txnHashes[i])
+			}
+			regions[j] = *region
+		}
+		txBytes, err := dbTx.FetchBlockRegions(regions)
+		if err != nil {
+			return err
+		}
+		for j, i := range confirmed {
+			txns[i] = txBytes[j]
+		}
+		return nil
+	})
+	if err != nil {
+		var notFound errGraphSearchTxnNotFound
+		if errors.As(err, &notFound) {
+			return nil, err
+		}
+		log.Errorf("Failed to load graph search transactions: %v", err)
+		return nil, errGraphSearchTxnLoad
+	}
+	return txns, nil
+}
+
 func (s *GrpcServer) fetchTransactionFromBlock(txHash *chainhash.Hash) ([]byte, int32, *chainhash.Hash, error) {
 	// Look up the location of the transaction.
 	blockRegion, err := s.txIndex.TxBlockRegion(txHash)
@@ -2676,74 +3537,227 @@ func (s *GrpcServer) fetchTransactionFromBlock(txHash *chainhash.Hash) ([]byte, 
 	return txBytes, blockHeight, blockRegion.Hash, nil
 }
 
-// setInputMetadata will set the value, previous script, and address for each input in the transaction
-// by loading the previous transaction from the txindex and using its data.
-func (s *GrpcServer) setInputMetadata(tx *pb.Transaction) error {
-	inputTxMap := make(map[chainhash.Hash]*wire.MsgTx)
-	for i, in := range tx.Inputs {
-		ch, err := chainhash.NewHash(in.Outpoint.Hash)
+// txSpentScripts returns the function MatchAndUpdate looks up the outputs a
+// memory pool transaction spends with.  While the transaction is in the
+// memory pool they are in the pool or the utxo set.
+func (s *GrpcServer) txSpentScripts(event *rpcEventTxAccepted) prevOutScriptFunc {
+	return event.spent.lookup(func() map[wire.OutPoint][]byte {
+		txIns := event.Tx.MsgTx().TxIn
+		scripts := make(map[wire.OutPoint][]byte, len(txIns))
+		for _, txIn := range txIns {
+			op := txIn.PreviousOutPoint
+			scripts[op] = s.fetchPrevOutScript(op)
+		}
+		return scripts
+	})
+}
+
+// blockSpentScripts returns the function MatchAndUpdate looks up the outputs
+// a connected block's transactions spend with.  They are read from the
+// block's spend journal at once, or, when that fails, as when the block was
+// disconnected since, looked up one at a time.
+func (s *GrpcServer) blockSpentScripts(event *rpcEventBlockConnected) prevOutScriptFunc {
+	return event.spent.lookup(func() map[wire.OutPoint][]byte {
+		stxos, _, err := s.blockSpendJournal(event)
+		scripts := make(map[wire.OutPoint][]byte, len(stxos))
+		i := 0
+		for _, tx := range event.Transactions()[1:] {
+			for _, txIn := range tx.MsgTx().TxIn {
+				op := txIn.PreviousOutPoint
+				if err != nil {
+					scripts[op] = s.fetchPrevOutScript(op)
+					continue
+				}
+				// The journal holds a token output's script with
+				// its token prefix.
+				_, scripts[op] = wire.SplitPkScript(stxos[i].PkScript)
+				i++
+			}
+		}
+		return scripts
+	})
+}
+
+// blockSpendJournal returns the outputs that the transactions of a connected
+// block spend, in the order of their inputs, and the index of the first that
+// each transaction spends.  The block's spend journal is read the first time
+// any subscription asks for the event.
+func (s *GrpcServer) blockSpendJournal(event *rpcEventBlockConnected) ([]blockchain.SpentTxOut, []int, error) {
+	j := &event.journal
+	j.once.Do(func() {
+		j.stxos, j.err = s.chain.FetchSpendJournal(event.Block)
+		if j.err != nil {
+			return
+		}
+		txs := event.Transactions()
+		j.starts = make([]int, len(txs))
+		n := 0
+		for i := 1; i < len(txs); i++ {
+			j.starts[i] = n
+			n += len(txs[i].MsgTx().TxIn)
+		}
+	})
+	return j.stxos, j.starts, j.err
+}
+
+// fetchPrevOutScript returns the pkScript for the output referenced by op. It
+// searches the mempool first, then the utxo set, then the transaction index
+// when enabled, which also has spent outputs. It returns nil if the script
+// cannot be resolved, which is expected for spent outputs on pruned or
+// unindexed nodes.
+//
+// Subscription filters use it to match inputs against their funding addresses,
+// allowing spends to trigger notifications even when the corresponding output
+// was not previously observed.
+func (s *GrpcServer) fetchPrevOutScript(op wire.OutPoint) []byte {
+	if tx, err := s.txMemPool.FetchTransaction(&op.Hash); err == nil {
+		if op.Index < uint32(len(tx.MsgTx().TxOut)) {
+			return tx.MsgTx().TxOut[op.Index].PkScript
+		}
+		return nil
+	}
+
+	// The utxo cache may hold an output spent since its last flush, marked
+	// spent and without its script.
+	entry, err := s.chain.FetchUtxoEntryUncached(op)
+	if err == nil && entry != nil && !entry.IsSpent() {
+		return entry.PkScript()
+	}
+
+	if s.txIndex == nil {
+		return nil
+	}
+
+	blockRegion, err := s.txIndex.TxBlockRegion(&op.Hash)
+	if err != nil || blockRegion == nil {
+		return nil
+	}
+
+	var txBytes []byte
+	if err := s.db.View(func(dbTx database.Tx) error {
+		var err error
+		txBytes, err = dbTx.FetchBlockRegion(blockRegion)
+		return err
+	}); err != nil {
+		return nil
+	}
+
+	var loadedTx wire.MsgTx
+	if err := loadedTx.BchDecode(bytes.NewReader(txBytes), wire.ProtocolVersion,
+		wire.BaseEncoding); err != nil {
+		return nil
+	}
+	if op.Index >= uint32(len(loadedTx.TxOut)) {
+		return nil
+	}
+
+	return loadedTx.TxOut[op.Index].PkScript
+}
+
+// setInputMetadata sets the value, previous script, token data and address of
+// each input of the confirmed transactions txs from the output it spends,
+// loading the transaction of that output from the transaction index.  Each
+// such transaction is loaded once for all of txs, as BCHN loads each once for
+// the inputs of a transaction (rpc/rawtransaction.cpp:140-199), and only the
+// outputs spent are kept from it, so a call listing many transactions that
+// spend from one large transaction decodes it once rather than once for each.
+func (s *GrpcServer) setInputMetadata(txs ...*pb.Transaction) error {
+	// The inputs spending from each transaction, which are loaded in the
+	// order they are first spent from.
+	spends := make(map[chainhash.Hash][]*pb.Transaction_Input)
+	var prevHashes []chainhash.Hash
+	for _, tx := range txs {
+		for _, in := range tx.Inputs {
+			ch, err := chainhash.NewHash(in.Outpoint.Hash)
+			if err != nil {
+				return status.Error(codes.Internal, "error marshaling chainhash")
+			}
+			if ch.IsEqual(&chainhash.Hash{}) { // Coinbase txs don't have an input.
+				continue
+			}
+			if _, ok := spends[*ch]; !ok {
+				prevHashes = append(prevHashes, *ch)
+			}
+			spends[*ch] = append(spends[*ch], in)
+		}
+	}
+
+	for i := range prevHashes {
+		blockRegion, err := s.txIndex.TxBlockRegion(&prevHashes[i])
 		if err != nil {
-			return status.Error(codes.Internal, "error marshaling chainhash")
+			return status.Error(codes.InvalidArgument, "failed to retrieve transaction location")
 		}
-		if ch.IsEqual(&chainhash.Hash{}) { // Coinbase txs don't have an input.
-			continue
+		if blockRegion == nil {
+			return status.Error(codes.NotFound, "transaction not found")
 		}
-		if prevTx, ok := inputTxMap[*ch]; ok {
-			tokenData := prevTx.TxOut[in.Outpoint.Index].TokenData
-			if !tokenData.IsEmpty() {
-				tx.Inputs[i].CashToken = getPbCashTokenDataFromTokenData(tokenData)
-			}
 
-			tx.Inputs[i].Value = prevTx.TxOut[in.Outpoint.Index].Value
-			tx.Inputs[i].PreviousScript = prevTx.TxOut[in.Outpoint.Index].PkScript
+		var txBytes []byte
+		err = s.db.View(func(dbTx database.Tx) error {
+			var err error
+			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
+			return err
+		})
+		if err != nil {
+			return status.Error(codes.Internal, "failed to load transaction bytes")
+		}
 
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(prevTx.TxOut[in.Outpoint.Index].PkScript, s.chainParams)
-			if err == nil && len(addrs) > 0 {
-				tx.Inputs[i].Address = addrs[0].String()
-				s.setInputSlpTokenAddress(tx.Inputs[i], addrs[0])
-			}
-		} else {
-			blockRegion, err := s.txIndex.TxBlockRegion(ch)
-			if err != nil {
-				return status.Error(codes.InvalidArgument, "failed to retrieve transaction location")
-			}
-			if blockRegion == nil {
-				return status.Error(codes.NotFound, "transaction not found")
-			}
+		loadedTx := wire.MsgTx{}
+		if err := loadedTx.BchDecode(bytes.NewReader(txBytes), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+			return status.Error(codes.Internal, "failed to unmarshal transaction")
+		}
 
-			var txBytes []byte
-			err = s.db.View(func(dbTx database.Tx) error {
-				var err error
-				txBytes, err = dbTx.FetchBlockRegion(blockRegion)
-				return err
-			})
-			if err != nil {
-				return status.Error(codes.Internal, "failed to load transaction bytes")
-			}
-
-			loadedTx := wire.MsgTx{}
-			if err := loadedTx.BchDecode(bytes.NewReader(txBytes), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-				return status.Error(codes.Internal, "failed to unmarshal transaction")
-			}
-
-			tokenData := loadedTx.TxOut[in.Outpoint.Index].TokenData
-			if !tokenData.IsEmpty() {
-				tx.Inputs[i].CashToken = getPbCashTokenDataFromTokenData(tokenData)
-			}
-
-			tx.Inputs[i].Value = loadedTx.TxOut[in.Outpoint.Index].Value
-			tx.Inputs[i].PreviousScript = loadedTx.TxOut[in.Outpoint.Index].PkScript
-
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(loadedTx.TxOut[in.Outpoint.Index].PkScript, s.chainParams)
-			if err == nil && len(addrs) > 0 {
-				tx.Inputs[i].Address = addrs[0].String()
-				s.setInputSlpTokenAddress(tx.Inputs[i], addrs[0])
-			}
-
-			inputTxMap[*ch] = &loadedTx
+		for _, in := range spends[prevHashes[i]] {
+			// The script is copied, as the decoded transaction holds
+			// all its scripts in one buffer, which the reply would
+			// otherwise keep.
+			out := *loadedTx.TxOut[in.Outpoint.Index]
+			out.PkScript = bytes.Clone(out.PkScript)
+			s.setSpentOutput(in, &out)
 		}
 	}
 	return nil
+}
+
+// setBlockInputMetadata sets the value, previous script, token data and
+// address of each input of respTx, the transaction at index idx of the
+// connected block of event, from the block's spend journal, as GetBlock does.
+// The journal is read once for all the transactions of the block that the
+// subscriptions send, instead of each transaction loading those it spends
+// from.  The first transaction, the coinbase, spends nothing, and when the
+// journal cannot be read, as for a block disconnected since, the outputs are
+// loaded from the transaction index by setInputMetadata.
+func (s *GrpcServer) setBlockInputMetadata(respTx *pb.Transaction, event *rpcEventBlockConnected, idx int) error {
+	stxos, starts, err := s.blockSpendJournal(event)
+	if err != nil || idx == 0 {
+		return s.setInputMetadata(respTx)
+	}
+	for i, in := range respTx.Inputs {
+		stxo := &stxos[starts[idx]+i]
+
+		// The journal holds a token output's script with its token
+		// prefix.
+		tokenData, pkScript := wire.SplitPkScript(stxo.PkScript)
+		s.setSpentOutput(in, &wire.TxOut{Value: stxo.Amount,
+			PkScript: pkScript, TokenData: tokenData})
+	}
+	return nil
+}
+
+// setSpentOutput sets the value, previous script, token data and address of
+// the input from out, the output it spends.
+func (s *GrpcServer) setSpentOutput(in *pb.Transaction_Input, out *wire.TxOut) {
+	if !out.TokenData.IsEmpty() {
+		in.CashToken = getPbCashTokenDataFromTokenData(out.TokenData)
+	}
+
+	in.Value = out.Value
+	in.PreviousScript = out.PkScript
+
+	_, addrs, _, err := txscript.ExtractPkScriptAddrs(out.PkScript, s.chainParams)
+	if err == nil && len(addrs) > 0 {
+		in.Address = addrs[0].String()
+		s.setInputSlpTokenAddress(in, addrs[0])
+	}
 }
 
 type retrievedTx struct {
@@ -2753,26 +3767,28 @@ type retrievedTx struct {
 	blockHeight int32
 }
 
-func (s *GrpcServer) fetchTransactionsByAddress(addr bchutil.Address, startHeight int32, nbFetch, nbSkip int) ([]retrievedTx, error) {
+// fetchTransactionsByAddress returns the address's confirmed transactions
+// that GetAddressTransactions returns for the passed start height, number to
+// fetch and number to skip, newest first, when count is set the number of
+// confirmed transactions the address has, whatever the others, and those of
+// the passed memory pool transactions of the address that the transaction
+// index does not hold.  All are read in one database transaction, so they
+// agree.
+func (s *GrpcServer) fetchTransactionsByAddress(addr bchutil.Address, startHeight int32, nbFetch, nbSkip uint32, count bool, unconfirmed []*bchutil.Tx) ([]retrievedTx, uint32, []*bchutil.Tx, error) {
 	// Override the default number of requested entries if needed.  Also,
 	// just return now if the number of requested entries is zero to avoid
 	// extra work.
-	numRequested := 100
+	numRequested := uint32(100)
 	if nbFetch > 0 {
 		numRequested = nbFetch
-		if numRequested < 0 {
-			numRequested = 1
-		}
 	}
 	if numRequested == 0 {
-		return nil, nil
+		return nil, 0, unconfirmed, nil
 	}
 
-	// Override the default number of entries to skip if needed.
-	var numToSkip int
-	if nbSkip > 0 {
-		numToSkip = max(nbSkip, 0)
-	}
+	// The number of entries to skip stays unsigned, as an int would turn a
+	// skip of 2^31 or more negative on 32-bit platforms.
+	numToSkip := nbSkip
 
 	// Add transactions from mempool first if client asked for reverse
 	// order.  Otherwise, they will be added last (as needed depending on
@@ -2783,63 +3799,100 @@ func (s *GrpcServer) fetchTransactionsByAddress(addr bchutil.Address, startHeigh
 	// client.
 	numSkipped := uint32(0)
 	addressTxns := make([]retrievedTx, 0, numRequested)
+	var total uint32
 
 	// Fetch transactions from the database in the desired order if more are
 	// needed.
-	if len(addressTxns) < numRequested {
+	if uint32(len(addressTxns)) < numRequested {
 		err := s.db.View(func(dbTx database.Tx) error {
-			regions, dbSkipped, err := s.addrIndex.TxRegionsForAddress(
-				dbTx, addr, uint32(numToSkip)-numSkipped,
-				uint32(numRequested-len(addressTxns)), true)
+			var (
+				regions   []database.BlockRegion
+				dbSkipped uint32
+				err       error
+			)
+			if count {
+				regions, dbSkipped, total, err = s.addrIndex.TxRegionsAndCountForAddress(
+					dbTx, addr, numToSkip-numSkipped,
+					numRequested-uint32(len(addressTxns)))
+			} else {
+				regions, dbSkipped, err = s.addrIndex.TxRegionsForAddress(
+					dbTx, addr, numToSkip-numSkipped,
+					numRequested-uint32(len(addressTxns)), true)
+			}
 			if err != nil {
 				return err
 			}
-
-			// Load the raw transaction bytes from the database.
-			serializedTxns, err := dbTx.FetchBlockRegions(regions)
+			addressTxns, err = s.appendRegionTxs(addressTxns, dbTx,
+				regions, startHeight)
 			if err != nil {
 				return err
-			}
-
-			// Add the transaction and the hash of the block it is
-			// contained in to the list.  Note that the transaction
-			// is left serialized here since the caller might have
-			// requested non-verbose output and hence there would be
-			// no point in deserializing it just to reserialize it
-			// later.
-			for i, serializedTx := range serializedTxns {
-				blockHeight, err := s.chain.BlockHeightByHash(regions[i].Hash)
-				if err != nil {
-					return err
-				}
-				if blockHeight >= startHeight {
-					header, err := s.chain.HeaderByHash(regions[i].Hash)
-					if err != nil {
-						return err
-					}
-					tx := wire.MsgTx{}
-					if err := tx.BchDecode(bytes.NewReader(serializedTx), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-						return err
-					}
-					addressTxns = append(addressTxns, retrievedTx{
-						tx:          tx,
-						txBytes:     serializedTx,
-						blockHeight: blockHeight,
-						blockHeader: &header,
-					})
-				}
 			}
 			numSkipped += dbSkipped
 
+			// A memory pool transaction the transaction index holds
+			// was confirmed by a block whose transactions the memory
+			// pool has yet to remove.
+			if s.txIndex == nil {
+				return nil
+			}
+			pooled := make([]*bchutil.Tx, 0, len(unconfirmed))
+			for _, tx := range unconfirmed {
+				confirmed, err := s.txIndex.HasTx(dbTx, tx.Hash())
+				if err != nil {
+					return err
+				}
+				if !confirmed {
+					pooled = append(pooled, tx)
+				}
+			}
+			unconfirmed = pooled
 			return nil
 		})
 		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, "failed to load address index entries")
+			return nil, 0, nil, status.Error(codes.InvalidArgument, "failed to load address index entries")
 		}
 
 	}
 
-	return addressTxns, nil
+	return addressTxns, total, unconfirmed, nil
+}
+
+// appendRegionTxs appends to txs the transactions at the regions, read with
+// dbTx, but those in blocks below startHeight.
+func (s *GrpcServer) appendRegionTxs(txs []retrievedTx, dbTx database.Tx, regions []database.BlockRegion, startHeight int32) ([]retrievedTx, error) {
+	// Load the raw transaction bytes from the database.
+	serializedTxns, err := dbTx.FetchBlockRegions(regions)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add the transaction and the hash of the block it is contained in to
+	// the list.  Note that the transaction is left serialized here since
+	// the caller might have requested non-verbose output and hence there
+	// would be no point in deserializing it just to reserialize it later.
+	for i, serializedTx := range serializedTxns {
+		blockHeight, err := s.chain.BlockHeightByHash(regions[i].Hash)
+		if err != nil {
+			return nil, err
+		}
+		if blockHeight >= startHeight {
+			header, err := s.chain.HeaderByHash(regions[i].Hash)
+			if err != nil {
+				return nil, err
+			}
+			tx := wire.MsgTx{}
+			if err := tx.BchDecode(bytes.NewReader(serializedTx), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+				return nil, err
+			}
+			txs = append(txs, retrievedTx{
+				tx:          tx,
+				txBytes:     serializedTx,
+				blockHeight: blockHeight,
+				blockHeader: &header,
+			})
+		}
+	}
+	return txs, nil
 }
 
 // getSlpIndexEntry fetches an SlpIndexEntry object leveraging a cache of SlpIndexEntry items
@@ -2857,11 +3910,51 @@ func (s *GrpcServer) getSlpIndexEntry(hash *chainhash.Hash) (*indexers.SlpTxEntr
 		entry, err = s.slpIndex.GetSlpIndexEntry(dbTx, hash)
 		return err
 	})
+	if err != nil && !indexers.IsSlpEntryNotFound(err) {
+		return nil, errSlpIndexFailure{err}
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	return entry, nil
+}
+
+// errSlpIndexFailure is the error getSlpIndexEntry returns when the slp index
+// fails to read an entry, as opposed to holding none for the transaction.  Its
+// callers pass it on as it is.
+type errSlpIndexFailure struct {
+	err error
+}
+
+// Error implements the error interface.
+func (e errSlpIndexFailure) Error() string {
+	return e.err.Error()
+}
+
+// Unwrap returns the index's error.
+func (e errSlpIndexFailure) Unwrap() error {
+	return e.err
+}
+
+// errSlpMsgUnparsable returns the failure of the slp index whose entry of the
+// transaction hash holds an slp message that fails to parse with err, which
+// only a corrupt index holds, as it stores the messages of valid transactions.
+func errSlpMsgUnparsable(hash *chainhash.Hash, err error) error {
+	return errSlpIndexFailure{fmt.Errorf("the slp message stored for "+
+		"transaction %v does not parse: %v", hash, err)}
+}
+
+// slpEntryStatus returns the status a call answers with when it cannot read
+// the slp entry of the transaction hash: NotFound for a transaction the slp
+// index does not hold, and Internal for a failure of the database, without
+// its error, which can name the node's files, and which is logged instead.
+func slpEntryStatus(hash *chainhash.Hash, err error) error {
+	if indexers.IsSlpEntryNotFound(err) {
+		return status.Errorf(codes.NotFound, "transaction %v is not in the slp index", hash)
+	}
+	log.Errorf("Failed to load the slp entry of transaction %v: %v", hash, err)
+	return status.Error(codes.Internal, "failed to load slp index entry")
 }
 
 // Get decimal amount from Genesis for convenience
@@ -2875,18 +3968,22 @@ func (s *GrpcServer) getDecimalsForTokenID(tokenID chainhash.Hash) (int, error) 
 		log.Criticalf("Failed to create chainhash from token ID from %s, with error: %v", hex.EncodeToString(tokenIDHash), err)
 		return -1, err
 	}
+	// A SEND of zero tokens is valid whatever token ID it names, so the
+	// token ID need not name a transaction, or a GENESIS.
 	genEntry, err := s.getSlpIndexEntry(tokenIDRev)
 	if err != nil {
-		log.Criticalf("Failed to fetch slp entry for %s, with error: %v", tokenIDRev, err)
+		log.Debugf("No slp transaction for token ID %v: %v", tokenIDRev, err)
 		return -1, err
 	}
 	genSlpMsg, err := v1parser.ParseSLP(genEntry.SlpOpReturn)
 	if err != nil {
-		log.Criticalf("Failed to parse slp message for %v, with error: %v", tokenIDRev, err)
-		return -1, err
+		return -1, errSlpMsgUnparsable(tokenIDRev, err)
 	}
-	decimals := genSlpMsg.(*v1parser.SlpGenesis).Decimals
-	return decimals, nil
+	genesis, ok := genSlpMsg.(*v1parser.SlpGenesis)
+	if !ok {
+		return -1, fmt.Errorf("token ID %v is not a GENESIS transaction", tokenIDRev)
+	}
+	return genesis.Decimals, nil
 }
 
 // getSlpToken fetches an SlpToken object leveraging a cache of SlpIndexEntry items
@@ -2913,8 +4010,7 @@ func (s *GrpcServer) getSlpToken(hash *chainhash.Hash, vout uint32, scriptPubKey
 
 	slpMsg, err := v1parser.ParseSLP(entry.SlpOpReturn)
 	if err != nil {
-		log.Criticalf("Failed to parse an slp entry message stored in the index db for txn: %v, this should never happen.", hash)
-		return nil, err
+		return nil, errSlpMsgUnparsable(hash, err)
 	}
 
 	// set isMintBaton and also check that vout is within proper range
@@ -2977,11 +4073,14 @@ func (s *GrpcServer) getSlpToken(hash *chainhash.Hash, vout uint32, scriptPubKey
 	if scriptPubKey != nil {
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(scriptPubKey, s.chainParams)
 		if err == nil && len(addrs) == 1 {
+			// An address with no slp form, such as P2SH32 or a bare
+			// pubkey, is left out.
 			slpAddr, err := bchutil.ConvertCashToSlpAddress(addrs[0], s.chainParams)
 			if err != nil {
-				log.Critical(err)
+				log.Debugf("could not convert address %s: %v", addrs[0].String(), err)
+			} else {
+				address = slpAddr.String()
 			}
-			address = slpAddr.String()
 		}
 	}
 
@@ -3013,11 +4112,24 @@ func (s *GrpcServer) slpEventHandler() {
 	// any txns to the graph search db
 	initWg := sync.WaitGroup{}
 
-	subscription := s.subscribeEvents()
+	// The memory pool transactions whose check a read of the database
+	// failed, which are checked again at each block event while they are in
+	// the memory pool, as it may not fail again.  One whose check found a
+	// corrupt entry of the slp index is not: only rebuilding the index mends
+	// the entry, so the transaction is left unjudged.
+	recheck := make(map[chainhash.Hash]*wire.MsgTx)
+
+	// This subscription is not bounded, since dropping it would stop SLP
+	// validation of mempool transactions.
+	subscription := s.subscribeEvents(0,
+		rpcEventsTxAccepted|rpcEventsBlockConnected|rpcEventsBlockDisconnected)
 	defer subscription.Unsubscribe()
 
 	for {
-		event := <-subscription.Events()
+		event, ok := <-subscription.Events()
+		if !ok {
+			return
+		}
 		switch event := event.(type) {
 		case *rpcEventTxAccepted:
 			txDesc := event
@@ -3028,24 +4140,43 @@ func (s *GrpcServer) slpEventHandler() {
 				firstMempoolTxnSeen = true
 				if s.slpIndex.GraphSearchEnabled() {
 					log.Debug("starting slp graph search")
-					fetchTxn := func(txnHash *chainhash.Hash) ([]byte, error) {
-						txn, _, _, err := s.fetchTransactionFromBlock(txnHash)
-						return txn, err
-					}
 					initWg.Add(1)
-					go s.slpIndex.LoadSlpGraphSearchDb(fetchTxn, &initWg, &s.shutdown)
+					go s.slpIndex.LoadSlpGraphSearchDb(s.fetchGraphSearchTxns, &initWg, &s.shutdown)
 				}
 			}
 
 			// validate new slp txns
-			isSlpValid := s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "mempool")
+			isSlpValid, err := s.checkSlpTxOnEvent(txDesc.Tx.MsgTx(), "mempool")
+			if err != nil && !indexers.IsSlpEntryCorrupt(err) {
+				recheck[*txDesc.Tx.Hash()] = txDesc.Tx.MsgTx()
+			}
 			if isSlpValid && s.slpIndex.GraphSearchEnabled() {
 				initWg.Wait()
 				go s.slpIndex.AddGraphSearchTxn(txDesc.Tx.MsgTx())
 			}
 
 			continue
-		case *rpcEventBlockConnected:
+		case *rpcEventBlockConnected, *rpcEventBlockDisconnected:
+			// By now the memory pool has dropped the transactions a
+			// block confirms or conflicts with, and taken back those
+			// of a block disconnected that it takes, so the slp cache
+			// drops what the transactions not in it put there.
+			s.slpIndex.RemoveMempoolSlpTxsNotIn(s.txMemPool.IsTransactionInPool)
+			for hash, tx := range recheck {
+				if !s.txMemPool.IsTransactionInPool(&hash) {
+					delete(recheck, hash)
+					continue
+				}
+				isSlpValid, err := s.checkSlpTxOnEvent(tx, "mempool")
+				if err != nil && !indexers.IsSlpEntryCorrupt(err) {
+					continue
+				}
+				delete(recheck, hash)
+				if isSlpValid && s.slpIndex.GraphSearchEnabled() {
+					initWg.Wait()
+					go s.slpIndex.AddGraphSearchTxn(tx)
+				}
+			}
 			continue
 		}
 	}
@@ -3054,26 +4185,59 @@ func (s *GrpcServer) slpEventHandler() {
 // checkSlpTxOnEvent is used to make sure slp information has been processed before
 // returning subscriber event info to the client.  Without this, a race condition exists
 // where the subscriber event can be returned before the slp validation is completed.
-func (s *GrpcServer) checkSlpTxOnEvent(tx *wire.MsgTx, eventStr string) bool {
+//
+// It returns whether tx is valid slp, and the failure of the database that
+// kept it from telling, which it logs as an error: a read of the database
+// that failed, or a corrupt entry of the slp index, which it cannot read or
+// whose slp message does not parse.
+func (s *GrpcServer) checkSlpTxOnEvent(tx *wire.MsgTx, eventStr string) (bool, error) {
 	if !isMaybeSlpTransaction(tx) {
-		return false
+		return false, nil
 	}
 	log.Debugf("possible slp transaction added %v (%s)", tx.TxHash(), eventStr)
+	var (
+		valid    bool
+		checkErr error
+	)
 	err := s.db.View(func(dbTx database.Tx) error {
-		valid, err := s.slpIndex.AddPotentialSlpEntries(dbTx, tx)
-		if err != nil {
-			return fmt.Errorf("invalid slp transaction %v (%s): %v", tx.TxHash(), eventStr, err)
-		} else if valid {
-			log.Debugf("valid slp transaction %v (%s)", tx.TxHash(), eventStr)
-			return nil
-		}
-		return fmt.Errorf("invalid slp transaction in %v (%s)", tx.TxHash(), eventStr)
+		valid, checkErr = s.slpIndex.AddPotentialSlpEntries(dbTx, tx)
+		return checkErr
 	})
-	if err != nil {
-		log.Debug(err)
-		return false
+	switch {
+	case err != nil && (err != checkErr || indexers.IsSlpEntryCorrupt(err)):
+		log.Errorf("Failed to check slp transaction %v (%s): %v", tx.TxHash(), eventStr, err)
+		return false, err
+	case err != nil:
+		log.Debugf("invalid slp transaction %v (%s): %v", tx.TxHash(), eventStr, err)
+		return false, nil
+	case !valid:
+		log.Debugf("invalid slp transaction in %v (%s)", tx.TxHash(), eventStr)
+		return false, nil
 	}
-	return true
+	log.Debugf("valid slp transaction %v (%s)", tx.TxHash(), eventStr)
+	return true, nil
+}
+
+// errTokenNotGenesis is the error for a token ID that names an slp transaction
+// other than a GENESIS, as a valid SEND of zero tokens may.
+var errTokenNotGenesis = errors.New("cannot build token metadata from a non-genesis entry")
+
+// tokenMetadataOrNil returns the metadata of the token, or nil when it cannot
+// be built.  A valid SEND of zero tokens may name a token ID that is no
+// GENESIS, so the metadata of a transaction or output is then just missing.
+// A failure of the slp index to read it is logged and returned, for the call
+// to fail with rather than answer without the metadata.
+func (s *GrpcServer) tokenMetadataOrNil(tokenID chainhash.Hash) (*pb.SlpTokenMetadata, error) {
+	tm, err := s.marshalTokenMetadata(tokenID)
+	if _, ok := err.(errSlpIndexFailure); ok {
+		log.Errorf("Failed to load slp token metadata of token ID %x: %v", tokenID[:], err)
+		return nil, err
+	}
+	if err != nil {
+		log.Debugf("No token metadata for token ID %v: %v", tokenID, err)
+		return nil, nil
+	}
+	return tm, nil
 }
 
 // marshalTokenMetadata returns marshalled token metadata for the provided tokenID hash
@@ -3094,18 +4258,18 @@ func (s *GrpcServer) marshalTokenMetadata(tokenID chainhash.Hash) (*pb.SlpTokenM
 	}
 	entry, err := s.getSlpIndexEntry(tokenIDRev)
 	if err != nil {
-		log.Criticalf("Failed to parse token ID: %s, with error: %v", hex.EncodeToString(tokenIDHash), err)
+		log.Debugf("No slp transaction for token ID %s: %v", hex.EncodeToString(tokenIDHash), err)
 		return nil, err
 	}
 
 	slpMsg, err := v1parser.ParseSLP(entry.SlpOpReturn)
 	if err != nil {
-		return nil, err
+		return nil, errSlpMsgUnparsable(tokenIDRev, err)
 	}
 
 	genMsg, isGenesis := slpMsg.(*v1parser.SlpGenesis)
 	if !isGenesis {
-		return nil, errors.New("cannot build token metadata from a non-genesis entry")
+		return nil, errTokenNotGenesis
 	}
 
 	tm := &pb.SlpTokenMetadata{
@@ -3113,11 +4277,20 @@ func (s *GrpcServer) marshalTokenMetadata(tokenID chainhash.Hash) (*pb.SlpTokenM
 		TokenType: getTokenType(slpMsg.TokenType()),
 	}
 
-	var dbTm *indexers.TokenMetadata
+	// A read of the database that fails is a failure of the slp index, as
+	// is a metadata record it cannot read, as opposed to the index holding
+	// no metadata for the token.
+	var (
+		dbTm  *indexers.TokenMetadata
+		tmErr error
+	)
 	err = s.db.View(func(dbTx database.Tx) error {
-		dbTm, err = s.slpIndex.GetTokenMetadata(dbTx, entry)
-		return err
+		dbTm, tmErr = s.slpIndex.GetTokenMetadata(dbTx, entry)
+		return tmErr
 	})
+	if err != nil && (err != tmErr || !indexers.IsTokenNotIndexed(err)) {
+		return nil, errSlpIndexFailure{err}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3212,6 +4385,16 @@ func marshalBlockInfo(block *bchutil.Block, confirmations int32, medianTime time
 }
 
 func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.BlockHeader, blockHeight int32, s *GrpcServer) *pb.Transaction {
+	respTx, _ := marshalTransactionChecked(tx, confirmations, blockHeader, blockHeight, s)
+	return respTx
+}
+
+// marshalTransactionChecked is marshalTransaction for a call that answers with
+// the transactions alone, which fails with the slp index's error rather than
+// send a transaction with its slp state unknown.  A stream sends it, as ending
+// the stream for it would take more from the client than the transaction's
+// slp state.
+func marshalTransactionChecked(tx *bchutil.Tx, confirmations int32, blockHeader *wire.BlockHeader, blockHeight int32, s *GrpcServer) (*pb.Transaction, error) {
 	var (
 		txid        = tx.Hash()
 		slpMsg      v1parser.ParseResult
@@ -3226,14 +4409,14 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 		var err error
 		slpMsg, err = v1parser.ParseSLP(tx.MsgTx().TxOut[0].PkScript)
 		if err != nil {
-			if err.Error() == v1parser.ErrUnsupportedSlpVersion.Error() {
+			if errors.Is(err, v1parser.ErrUnsupportedSlpVersion) {
 				slpInfo.SlpAction = pb.SlpAction_SLP_UNSUPPORTED_VERSION
 			} else {
 				slpInfo.ParseError = err.Error()
 				slpInfo.SlpAction = pb.SlpAction_SLP_PARSE_ERROR
 			}
 		} else {
-			tokenID, err := goslp.GetSlpTokenID(tx.MsgTx())
+			tokenID, err := goslp.GetSlpTokenIDFromMsg(tx.MsgTx(), slpMsg)
 			if err != nil {
 				log.Criticalf("failed to parse token ID for transaction %v", txid)
 			}
@@ -3333,21 +4516,37 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 	}
 
 	// check slp validity
+	var indexErr error
 	if s.slpIndex != nil {
+		var groupErr error
 		err := s.db.View(func(dbTx database.Tx) error {
 			entry, err := s.slpIndex.GetSlpIndexEntry(dbTx, txid)
 			if err != nil {
-				return fmt.Errorf("slp entry does not exist for %v", txid)
+				return err
 			}
 			slpInfo.ValidityJudgement = pb.SlpTransactionInfo_VALID
 
 			// for nft children we populate the group token ID property in TxMetadata
 			if entry.SlpVersionType == v1parser.TokenTypeNft1Child41 {
+				// A SEND of zero tokens is valid whatever token ID it
+				// names, so the token of an NFT1 child SEND may have no
+				// GENESIS, and no group.
+				logMissing := log.Criticalf
+				if _, ok := slpMsg.(*v1parser.SlpSend); ok {
+					logMissing = log.Debugf
+				}
+				// A metadata record the index cannot read is a
+				// failure of the index, as opposed to a token it
+				// holds no metadata for.
 				tm, err := s.slpIndex.GetTokenMetadata(dbTx, entry)
+				if err != nil && !indexers.IsTokenNotIndexed(err) {
+					return err
+				}
 				if err != nil {
 					msg := fmt.Sprintf("missing group id metadata for nft child txid %v, tokenId: %v, tokenIdHash: %v, %v", txid, entry.TokenID, hex.EncodeToString(entry.TokenIDHash[:]), err)
-					log.Critical(msg)
-					return errors.New(msg)
+					logMissing("%s", msg)
+					groupErr = errors.New(msg)
+					return groupErr
 				}
 				if tm.NftGroupID != nil {
 					if t, ok := slpInfo.TxMetadata.(*pb.SlpTransactionInfo_V1Nft1ChildGenesis); ok {
@@ -3358,14 +4557,20 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 						log.Criticalf("slpInfo has wrong TxMetadata type for nft child %v", txid)
 					}
 				} else {
-					log.Criticalf("missing group id in token metadata for nft child %v", txid)
+					logMissing("missing group id in token metadata for nft child %v", txid)
 				}
 			}
 
 			return nil
 		})
-		if err != nil {
+		switch {
+		case err == nil:
+		case indexers.IsSlpEntryNotFound(err):
+			log.Debugf("slp entry does not exist for %v", txid)
+		case err == groupErr:
 			log.Debug(err)
+		default:
+			indexErr = err
 		}
 	}
 
@@ -3389,7 +4594,9 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 	for i, input := range tx.MsgTx().TxIn {
 
 		inputToken, err := s.getSlpToken(&input.PreviousOutPoint.Hash, input.PreviousOutPoint.Index, nil)
-		if err != nil {
+		if _, ok := err.(errSlpIndexFailure); ok {
+			indexErr = err
+		} else if err != nil {
 			log.Debugf("error: %v (input %v:%s)", err, input.PreviousOutPoint.Hash, fmt.Sprint(input.PreviousOutPoint.Index))
 		}
 
@@ -3425,16 +4632,10 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 	// loop through outputs
 	for i, output := range tx.MsgTx().TxOut {
 
-		pkScript, err := output.TokenData.SeparateTokenDataFromPKScriptIfExists(output.PkScript, 0)
-		if err != nil {
-			log.Debugf("could not parse token data for %v index: %v", txid, uint32(i))
-		}
-		if pkScript != nil {
-			output.PkScript = pkScript
-		}
-
 		outputToken, err := s.getSlpToken(tx.Hash(), uint32(i), output.PkScript)
-		if err != nil {
+		if _, ok := err.(errSlpIndexFailure); ok {
+			indexErr = err
+		} else if err != nil {
 			log.Debugf("no token stored for %v index: %v", txid, uint32(i))
 		}
 
@@ -3448,22 +4649,36 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 			out.CashToken = getPbCashTokenDataFromTokenData(output.TokenData)
 		}
 
-		scriptClass, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript, params)
-		if err == nil {
-			if scriptClass == txscript.NullDataTy {
-				out.ScriptClass = "datacarrier"
-			} else {
-				out.ScriptClass = scriptClass.String()
-			}
-			if len(addrs) > 0 {
-				out.Address = addrs[0].String()
-			}
+		out.ScriptClass = txscript.ScriptTypeName(output.PkScript)
+		if out.ScriptClass == txscript.NullDataTy.String() {
+			out.ScriptClass = "datacarrier"
+		}
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript, params)
+		if err == nil && len(addrs) > 0 {
+			out.Address = addrs[0].String()
 		}
 		disassm, err := txscript.DisasmString(output.PkScript)
 		if err == nil {
 			out.DisassembledScript = disassm
 		}
 		respTx.Outputs = append(respTx.Outputs, out)
+	}
+
+	// A failure of the slp index leaves the transaction's slp state unknown
+	// rather than judged.  The proto has no value for unknown alone, so it
+	// is UNKNOWN_OR_INVALID, without burn flags, which would claim tokens
+	// burned, and without tokens on the inputs and outputs, which the index
+	// could not all tell.
+	if indexErr != nil {
+		log.Errorf("Failed to load the slp data of transaction %v: %v", txid, indexErr)
+		slpInfo.ValidityJudgement = pb.SlpTransactionInfo_UNKNOWN_OR_INVALID
+		for _, in := range respTx.Inputs {
+			in.SlpToken = nil
+		}
+		for _, out := range respTx.Outputs {
+			out.SlpToken = nil
+		}
+		return respTx, indexErr
 	}
 
 	// label slp burns caused by missing bch outputs, or input amt > output amt
@@ -3517,7 +4732,7 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 		}
 	}
 
-	return respTx
+	return respTx, nil
 }
 
 // setInputMetadataFromView will set the value, previous script, and address for each input in the mempool transaction
@@ -3542,6 +4757,35 @@ func (s *GrpcServer) setInputMetadataFromView(respTx *pb.Transaction, txDesc *rp
 			}
 		}
 	}
+}
+
+// toCashAddress returns the passed address in the cash address format that
+// the address index lookups and output matching expect.  Legacy, P2SH32 and
+// pubkey addresses are rebuilt from their hash since the slp converter does
+// not handle them.
+func toCashAddress(addr bchutil.Address, params *chaincfg.Params) (bchutil.Address, error) {
+	switch a := addr.(type) {
+	case *bchutil.LegacyAddressPubKeyHash:
+		if !a.IsForNet(params) {
+			return nil, errors.New("address is for another network")
+		}
+		return bchutil.NewAddressPubKeyHash(a.Hash160()[:], params)
+
+	case *bchutil.LegacyAddressScriptHash:
+		if !a.IsForNet(params) {
+			return nil, errors.New("address is for another network")
+		}
+		return bchutil.NewAddressScriptHashFromHash(a.Hash160()[:], params)
+
+	case *bchutil.AddressScriptHash32:
+		return bchutil.NewAddressScriptHash32FromHash(a.Hash256()[:], params)
+
+	case *bchutil.AddressPubKey:
+		// The address index files pay to pubkey outputs under the
+		// P2PKH address of the key.
+		return bchutil.NewAddressPubKeyHash(a.AddressPubKeyHash().Hash160()[:], params)
+	}
+	return bchutil.ConvertSlpToCashAddress(addr, params)
 }
 
 // setInputSlpTokenAddress is used to apply the SlpToken.Aaddress to a transaction input
@@ -3602,20 +4846,23 @@ func getPbCashTokenDataFromTokenData(tokenData wire.TokenData) *pb.CashToken {
 
 // queueHandler manages a queue of empty interfaces, reading from in and
 // sending the oldest unsent to out.  This handler stops when either of the
-// in or quit channels are closed, and closes out before returning, without
-// waiting to send any variables still remaining in the queue.
-func queueHandler(in <-chan interface{}, out chan<- interface{}, quit <-chan struct{}) {
+// in, quit or unsubscribe channels are closed, or when more than maxQueue
+// items are waiting if maxQueue is not 0, and closes out before returning,
+// without waiting to send any variables still remaining in the queue.  It
+// returns false when it stopped because the queue was full.
+func queueHandler(in <-chan interface{}, out chan<- interface{}, quit, unsubscribe <-chan struct{}, maxQueue int) bool {
+	defer close(out)
+
 	var q []interface{}
 	var dequeue chan<- interface{}
 	skipQueue := out
 	var next interface{}
-out:
 	for {
 		select {
 		case n, ok := <-in:
 			if !ok {
 				// Sender closed input channel.
-				break out
+				return true
 			}
 
 			// Either send to out immediately if skipQueue is
@@ -3624,6 +4871,9 @@ out:
 			select {
 			case skipQueue <- n:
 			default:
+				if maxQueue > 0 && len(q) >= maxQueue {
+					return false
+				}
 				q = append(q, n)
 				dequeue = out
 				skipQueue = nil
@@ -3631,19 +4881,21 @@ out:
 			}
 
 		case dequeue <- next:
-			copy(q, q[1:])
-			q[len(q)-1] = nil // avoid leak
-			q = q[:len(q)-1]
+			q[0] = nil // avoid leak
+			q = q[1:]
 			if len(q) == 0 {
+				q = nil
 				dequeue = nil
 				skipQueue = out
 			} else {
 				next = q[0]
 			}
 
+		case <-unsubscribe:
+			return true
+
 		case <-quit:
-			break out
+			return true
 		}
 	}
-	close(out)
 }

@@ -7,6 +7,7 @@ package mining
 import (
 	"container/heap"
 	"fmt"
+	"math"
 	"time"
 
 	"sort"
@@ -20,10 +21,6 @@ import (
 )
 
 const (
-	// MinHighPriority is the minimum priority value that allows a
-	// transaction to be considered high priority.
-	MinHighPriority = bchutil.SatoshiPerBitcoin * 144.0 / 250
-
 	// blockHeaderOverhead is the max number of bytes it takes to serialize
 	// a block header and max possible transaction count.
 	blockHeaderOverhead = wire.MaxBlockHeaderPayload + wire.MaxVarIntPayload
@@ -76,12 +73,11 @@ type TxSource interface {
 }
 
 // txPrioItem houses a transaction along with extra information that allows the
-// transaction to be prioritized and track dependencies on other transactions
-// which have not been mined into a block yet.
+// transaction to be prioritized by fee and track dependencies on other
+// transactions which have not been mined into a block yet.
 type txPrioItem struct {
 	tx       *bchutil.Tx
 	fee      int64
-	priority float64
 	feePerKB int64
 
 	// dependsOn holds a map of transaction hashes which this one depends
@@ -91,15 +87,10 @@ type txPrioItem struct {
 	dependsOn map[chainhash.Hash]struct{}
 }
 
-// txPriorityQueueLessFunc describes a function that can be used as a compare
-// function for a transaction priority queue (txPriorityQueue).
-type txPriorityQueueLessFunc func(*txPriorityQueue, int, int) bool
-
-// txPriorityQueue implements a priority queue of txPrioItem elements that
-// supports an arbitrary compare function as defined by txPriorityQueueLessFunc.
+// txPriorityQueue implements a priority queue of txPrioItem elements ordered
+// by fee per kilobyte, highest first.
 type txPriorityQueue struct {
-	lessFunc txPriorityQueueLessFunc
-	items    []*txPrioItem
+	items []*txPrioItem
 }
 
 // Len returns the number of items in the priority queue.  It is part of the
@@ -109,10 +100,12 @@ func (pq *txPriorityQueue) Len() int {
 }
 
 // Less returns whether the item in the priority queue with index i should sort
-// before the item with index j by deferring to the assigned less function.  It
-// is part of the heap.Interface implementation.
+// before the item with index j.  It is part of the heap.Interface
+// implementation.
 func (pq *txPriorityQueue) Less(i, j int) bool {
-	return pq.lessFunc(pq, i, j)
+	// Using > here so that pop gives the highest fee item as opposed
+	// to the lowest.
+	return pq.items[i].feePerKB > pq.items[j].feePerKB
 }
 
 // Swap swaps the items at the passed indices in the priority queue.  It is
@@ -127,8 +120,8 @@ func (pq *txPriorityQueue) Push(x interface{}) {
 	pq.items = append(pq.items, x.(*txPrioItem))
 }
 
-// Pop removes the highest priority item (according to Less) from the priority
-// queue and returns it.  It is part of the heap.Interface implementation.
+// Pop removes the highest fee item from the priority queue and returns it.
+// It is part of the heap.Interface implementation.
 func (pq *txPriorityQueue) Pop() interface{} {
 	n := len(pq.items)
 	item := pq.items[n-1]
@@ -137,53 +130,24 @@ func (pq *txPriorityQueue) Pop() interface{} {
 	return item
 }
 
-// SetLessFunc sets the compare function for the priority queue to the provided
-// function.  It also invokes heap.Init on the priority queue using the new
-// function so it can immediately be used with heap.Push/Pop.
-func (pq *txPriorityQueue) SetLessFunc(lessFunc txPriorityQueueLessFunc) {
-	pq.lessFunc = lessFunc
-	heap.Init(pq)
-}
-
-// txPQByPriority sorts a txPriorityQueue by transaction priority and then fees
-// per kilobyte.
-func txPQByPriority(pq *txPriorityQueue, i, j int) bool {
-	// Using > here so that pop gives the highest priority item as opposed
-	// to the lowest.  Sort by priority first, then fee.
-	if pq.items[i].priority == pq.items[j].priority {
-		return pq.items[i].feePerKB > pq.items[j].feePerKB
+// minTxFee returns the fee a transaction of the given size must pay at the
+// given fee rate per 1000 bytes, rounded down.  The mempool rounds down too,
+// but asks for at least one satoshi, so every transaction it takes passes.
+func minTxFee(size int64, feePerKB bchutil.Amount) int64 {
+	if feePerKB > 0 && size > math.MaxInt64/int64(feePerKB) {
+		return math.MaxInt64
 	}
-	return pq.items[i].priority > pq.items[j].priority
-
-}
-
-// txPQByFee sorts a txPriorityQueue by fees per kilobyte and then transaction
-// priority.
-func txPQByFee(pq *txPriorityQueue, i, j int) bool {
-	// Using > here so that pop gives the highest fee item as opposed
-	// to the lowest.  Sort by fee first, then priority.
-	if pq.items[i].feePerKB == pq.items[j].feePerKB {
-		return pq.items[i].priority > pq.items[j].priority
-	}
-	return pq.items[i].feePerKB > pq.items[j].feePerKB
+	return size * int64(feePerKB) / 1000
 }
 
 // newTxPriorityQueue returns a new transaction priority queue that reserves the
-// passed amount of space for the elements.  The new priority queue uses either
-// the txPQByPriority or the txPQByFee compare function depending on the
-// sortByFee parameter and is already initialized for use with heap.Push/Pop.
-// The priority queue can grow larger than the reserved space, but extra copies
-// of the underlying array can be avoided by reserving a sane value.
-func newTxPriorityQueue(reserve int, sortByFee bool) *txPriorityQueue {
-	pq := &txPriorityQueue{
+// passed amount of space for the elements.  The priority queue can grow larger
+// than the reserved space, but extra copies of the underlying array can be
+// avoided by reserving a sane value.
+func newTxPriorityQueue(reserve int) *txPriorityQueue {
+	return &txPriorityQueue{
 		items: make([]*txPrioItem, 0, reserve),
 	}
-	if sortByFee {
-		pq.SetLessFunc(txPQByFee)
-	} else {
-		pq.SetLessFunc(txPQByPriority)
-	}
-	return pq
 }
 
 // BlockTemplate houses a block that has yet to be solved along with additional
@@ -215,8 +179,9 @@ type BlockTemplate struct {
 	// templates without a coinbase payment address.
 	ValidPayAddress bool
 
-	// MaxBlockSize is the block size consensus rule used when creating the block
-	MaxBlockSize uint32
+	// MaxBlockSize is the maximum size of the block allowed by the
+	// consensus rules.
+	MaxBlockSize uint64
 
 	// MaxSigChecks is the total sigchecks allowed in the block given the
 	// consensus rules.
@@ -287,17 +252,31 @@ func createCoinbaseTx(params *chaincfg.Params, coinbaseScript []byte, nextBlockH
 		Value:    blockchain.CalcBlockSubsidy(nextBlockHeight, params),
 		PkScript: pkScript,
 	})
-	padCoinbaseScript(tx)
+	padCoinbaseScript(tx, minCoinbaseSize(params, nextBlockHeight))
 
 	return bchutil.NewTx(tx), nil
 }
 
+// minCoinbaseSize returns the minimum serialized transaction size the coinbase
+// must reach for a block at the provided height.  Upgrade9 lowered the minimum,
+// so until it activates the larger Magnetic Anomaly minimum still applies.
+//
+// This matters well beyond the historical fork window: simnet sets
+// Upgrade9ForkHeight far in the future, so there the larger minimum applies to
+// every block mined above the Magnetic Anomaly height.
+func minCoinbaseSize(params *chaincfg.Params, nextBlockHeight int32) int {
+	if nextBlockHeight > params.Upgrade9ForkHeight {
+		return blockchain.MinTransactionSize
+	}
+	return blockchain.MagneticAnomalyMinTransactionSize
+}
+
 // padCoinbaseScript makes sure the coinbase script is above the minimum tx size
-// threshold.
-func padCoinbaseScript(tx *wire.MsgTx) {
-	if tx.SerializeSize() < blockchain.MinTransactionSize {
+// threshold that applies to the block being built.
+func padCoinbaseScript(tx *wire.MsgTx, minSize int) {
+	if tx.SerializeSize() < minSize {
 		tx.TxIn[0].SignatureScript = append(tx.TxIn[0].SignatureScript,
-			make([]byte, blockchain.MinTransactionSize-tx.SerializeSize())...)
+			make([]byte, minSize-tx.SerializeSize())...)
 	}
 }
 
@@ -402,59 +381,18 @@ func NewBlkTmplGenerator(policy *Policy, params *chaincfg.Params,
 // coinbase which will replace the one generated for the block template.  Thus
 // the need to have configured address can be avoided.
 //
-// The transactions selected and included are prioritized according to several
-// factors.  First, each transaction has a priority calculated based on its
-// value, age of inputs, and size.  Transactions which consist of larger
-// amounts, older inputs, and small sizes have the highest priority.  Second, a
-// fee per kilobyte is calculated for each transaction.  Transactions with a
-// higher fee per kilobyte are preferred.  Finally, the block generation related
-// policy settings are all taken into account.
+// Transactions are selected by fee per kilobyte, highest first.  Transactions
+// which only spend outputs from other transactions already in the block chain
+// are immediately added to a priority queue.  Transactions which spend outputs
+// from other transactions in the source pool are added to a dependency map so
+// they can be added to the priority queue once the transactions they depend on
+// have been included.
 //
-// Transactions which only spend outputs from other transactions already in the
-// block chain are immediately added to a priority queue which either
-// prioritizes based on the priority (then fee per kilobyte) or the fee per
-// kilobyte (then priority) depending on whether or not the BlockPrioritySize
-// policy setting allots space for high-priority transactions.  Transactions
-// which spend outputs from other transactions in the source pool are added to a
-// dependency map so they can be added to the priority queue once the
-// transactions they depend on have been included.
-//
-// Once the high-priority area (if configured) has been filled with
-// transactions, or the priority falls below what is considered high-priority,
-// the priority queue is updated to prioritize by fees per kilobyte (then
-// priority).
-//
-// When the fees per kilobyte drop below the TxMinFreeFee policy setting, the
-// transaction will be skipped unless the BlockMinSize policy setting is
-// nonzero, in which case the block will be filled with the low-fee/free
-// transactions until the block size reaches that minimum size.
-//
-// Any transactions which would cause the block to exceed the BlockMaxSize
-// policy setting, exceed the maximum allowed signature operations per block, or
-// otherwise cause the block to be invalid are skipped.
-//
-// Given the above, a block generated by this function is of the following form:
-//
-//	 -----------------------------------  --  --
-//	|      Coinbase Transaction         |   |   |
-//	|-----------------------------------|   |   |
-//	|                                   |   |   | ----- policy.BlockPrioritySize
-//	|   High-priority Transactions      |   |   |
-//	|                                   |   |   |
-//	|-----------------------------------|   | --
-//	|                                   |   |
-//	|                                   |   |
-//	|                                   |   |--- policy.BlockMaxSize
-//	|  Transactions prioritized by fee  |   |
-//	|  until <= policy.TxMinFreeFee     |   |
-//	|                                   |   |
-//	|                                   |   |
-//	|                                   |   |
-//	|-----------------------------------|   |
-//	|  Low-fee/Non high-priority (free) |   |
-//	|  transactions (while block size   |   |
-//	|  <= policy.BlockMinSize)          |   |
-//	 -----------------------------------  --
+// Transactions paying less than the TxMinFreeFee policy setting per kilobyte
+// are skipped.  Any transactions which would cause the block to exceed the
+// BlockMaxSize policy setting or the block size limit less 1000 bytes, exceed
+// the maximum allowed signature checks per block, or otherwise cause the block
+// to be invalid are skipped.
 func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress bchutil.Address) (*BlockTemplate, error) {
 	// Extend the most recently known best block.
 	best := g.chain.BestSnapshot()
@@ -462,9 +400,21 @@ func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress bchutil.Address) (*Bloc
 
 	ts := medianAdjustedTime(best, g.timeSource)
 
-	maxBlockSize := g.chain.MaxBlockSize(true, false)
+	// Use the limits block validation applies to a block on the tip.
+	maxBlockSize, err := g.chain.NextBlockSizeLimit(&best.Hash)
+	if err != nil {
+		return nil, err
+	}
+	maxSigChecks := min(maxBlockSize/blockchain.BlockMaxBytesMaxSigChecksRatio,
+		math.MaxUint32)
 
-	maxSigChecks := maxBlockSize / blockchain.BlockMaxBytesMaxSigChecksRatio
+	// Select transactions up to the configured size, but no further than
+	// the limit less room for the coinbase.
+	selectMaxSize := maxBlockSize - 1000
+	if g.policy.BlockMaxSize != 0 {
+		selectMaxSize = min(selectMaxSize, uint64(g.policy.BlockMaxSize))
+	}
+	selectMaxSize = min(max(selectMaxSize, 1000), math.MaxUint32)
 
 	// Create a standard coinbase transaction paying to the provided
 	// address.  NOTE: The coinbase value will be updated to include the
@@ -487,13 +437,10 @@ func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress bchutil.Address) (*Bloc
 
 	// Get the current source transactions and create a priority queue to
 	// hold the transactions which are ready for inclusion into a block
-	// along with some priority related and fee metadata.  Reserve the same
-	// number of items that are available for the priority queue.  Also,
-	// choose the initial sort order for the priority queue based on whether
-	// or not there is an area allocated for high-priority transactions.
+	// along with their fee metadata.  Reserve the same number of items that
+	// are available for the priority queue.
 	sourceTxns := g.txSource.MiningDescs()
-	sortedByFee := g.policy.BlockPrioritySize == 0
-	priorityQueue := newTxPriorityQueue(len(sourceTxns), sortedByFee)
+	priorityQueue := newTxPriorityQueue(len(sourceTxns))
 
 	// Create a slice to hold the transactions to be included in the
 	// generated block with reserved space.  Also create a utxo view to
@@ -533,7 +480,7 @@ mempoolLoop:
 			continue
 		}
 		if !blockchain.IsFinalizedTransaction(tx, nextBlockHeight,
-			g.timeSource.AdjustedTime()) {
+			best.MedianTime) {
 
 			log.Tracef("Skipping non-finalized tx %s", tx.Hash())
 			continue
@@ -588,12 +535,6 @@ mempoolLoop:
 			}
 		}
 
-		// Calculate the final transaction priority using the input
-		// value age sum as well as the adjusted transaction size.  The
-		// formula is: sum(inputValue * inputAge) / adjustedTxSize
-		prioItem.priority = CalcPriority(tx.MsgTx(), utxos,
-			nextBlockHeight)
-
 		// Calculate the fee in Satoshi/kB.
 		prioItem.feePerKB = txDesc.FeePerKB
 		prioItem.fee = txDesc.Fee
@@ -615,15 +556,33 @@ mempoolLoop:
 
 	// The starting block size is the size of the block header plus the max
 	// possible transaction count size, plus the size of the coinbase
-	// transaction.
-	blockSize := uint32(blockHeaderOverhead * coinbaseTx.MsgTx().SerializeSize())
+	// transaction, with at least 1000 bytes kept for both so a miner can
+	// extend the coinbase.
+	blockSize := uint32(max(blockHeaderOverhead+coinbaseTx.MsgTx().SerializeSize(),
+		1000))
 	blockSigChecks := int64(0)
 	totalFees := int64(0)
 
+	// Consensus script-verification flags for the block being built. Mirror the
+	// mempool (mempool.AcceptTransaction): the bare StandardVerifyFlags omits
+	// the post-Upgrade9 CashTokens flag (and the May2025/May2026 flags), so
+	// token transactions — valid and already accepted into the mempool — would
+	// fail ValidateTransactionScripts below and be dropped from the template,
+	// yielding empty blocks on token-active networks (e.g. chipnet).
+	scriptFlags := txscript.StandardVerifyFlags
+	if nextBlockHeight > g.chainParams.Upgrade9ForkHeight {
+		scriptFlags |= txscript.ScriptAllowCashTokens
+	}
+	if best.MedianTime.Unix() >= int64(g.chainParams.Upgrade11ActivationTime) {
+		scriptFlags |= txscript.ScriptAllowMay2025
+	}
+	if best.MedianTime.Unix() >= int64(g.chainParams.Upgrade12ActivationTime) {
+		scriptFlags |= txscript.ScriptAllowMay2026
+	}
+
 	// Choose which transactions make it into the block.
 	for priorityQueue.Len() > 0 {
-		// Grab the highest priority (or highest fee per kilobyte
-		// depending on the sort order) transaction.
+		// Grab the highest fee per kilobyte transaction.
 		prioItem := heap.Pop(priorityQueue).(*txPrioItem)
 		tx := prioItem.tx
 
@@ -634,7 +593,7 @@ mempoolLoop:
 		txSize := uint32(tx.MsgTx().SerializeSize())
 		blockPlusTxSize := blockSize + txSize
 		if blockPlusTxSize < txSize ||
-			blockPlusTxSize >= g.policy.BlockMaxSize {
+			uint64(blockPlusTxSize) >= selectMaxSize {
 
 			log.Tracef("Skipping tx %s because it would exceed "+
 				"the max block size", tx.Hash())
@@ -642,48 +601,13 @@ mempoolLoop:
 			continue
 		}
 
-		// Skip free transactions once the block is larger than the
-		// minimum block size.
-		if sortedByFee &&
-			prioItem.feePerKB < int64(g.policy.TxMinFreeFee) &&
-			blockPlusTxSize >= g.policy.BlockMinSize {
-
+		// Skip transactions paying less than the minimum fee rate.
+		if prioItem.fee < minTxFee(int64(txSize), g.policy.TxMinFreeFee) {
 			log.Tracef("Skipping tx %s with feePerKB %d "+
-				"< TxMinFreeFee %d and block size %d >= "+
-				"minBlockSize %d", tx.Hash(), prioItem.feePerKB,
-				g.policy.TxMinFreeFee, blockPlusTxSize,
-				g.policy.BlockMinSize)
+				"< TxMinFreeFee %d", tx.Hash(), prioItem.feePerKB,
+				g.policy.TxMinFreeFee)
 			logSkippedDeps(tx, deps)
 			continue
-		}
-
-		// Prioritize by fee per kilobyte once the block is larger than
-		// the priority size or there are no more high-priority
-		// transactions.
-		if !sortedByFee && (blockPlusTxSize >= g.policy.BlockPrioritySize ||
-			prioItem.priority <= MinHighPriority) {
-
-			log.Tracef("Switching to sort by fees per "+
-				"kilobyte blockSize %d >= BlockPrioritySize "+
-				"%d || priority %.2f <= minHighPriority %.2f",
-				blockPlusTxSize, g.policy.BlockPrioritySize,
-				prioItem.priority, MinHighPriority)
-
-			sortedByFee = true
-			priorityQueue.SetLessFunc(txPQByFee)
-
-			// Put the transaction back into the priority queue and
-			// skip it so it is re-priortized by fees if it won't
-			// fit into the high-priority section or the priority
-			// is too low.  Otherwise this transaction will be the
-			// final one in the high-priority section, so just fall
-			// though to the code below so it is added now.
-			if blockPlusTxSize > g.policy.BlockPrioritySize ||
-				prioItem.priority < MinHighPriority {
-
-				heap.Push(priorityQueue, prioItem)
-				continue
-			}
 		}
 
 		// Ensure the transaction inputs pass all of the necessary
@@ -696,8 +620,18 @@ mempoolLoop:
 			logSkippedDeps(tx, deps)
 			continue
 		}
+		seqLock, err := g.chain.NextBlockSequenceLock(&best.Hash, tx,
+			blockUtxos)
+		if err != nil || !blockchain.SequenceLockActive(seqLock,
+			nextBlockHeight, best.MedianTime) {
+
+			log.Tracef("Skipping tx %s because its sequence locks "+
+				"are not met: %v", tx.Hash(), err)
+			logSkippedDeps(tx, deps)
+			continue
+		}
 		sigchecks, err := blockchain.ValidateTransactionScripts(tx, blockUtxos,
-			txscript.StandardVerifyFlags, g.sigCache,
+			scriptFlags, g.sigCache,
 			g.hashCache, g.chainParams.Upgrade9ForkHeight)
 		if err != nil {
 			log.Tracef("Skipping tx %s due to error in "+
@@ -730,8 +664,8 @@ mempoolLoop:
 		txFees = append(txFees, prioItem.fee)
 		txSigChecks = append(txSigChecks, int64(sigchecks))
 
-		log.Tracef("Adding tx %s (priority %.2f, feePerKB %d)",
-			prioItem.tx.Hash(), prioItem.priority, prioItem.feePerKB)
+		log.Tracef("Adding tx %s (feePerKB %d)", prioItem.tx.Hash(),
+			prioItem.feePerKB)
 
 		// Add transactions which depend on this one (and also do not
 		// have any other unsatisified dependencies) to the priority
@@ -769,9 +703,10 @@ mempoolLoop:
 	}
 
 	// If MagneticAnomaly is enabled we need to sort transactions by txid to
-	// comply with the CTOR consensus rule.
+	// comply with the CTOR consensus rule.  Each transaction keeps its fee
+	// and signature check count, which follow the coinbase's entries.
 	if nextBlockHeight > g.chainParams.MagneticAnonomalyForkHeight {
-		sort.Sort(TxSorter(blockTxns))
+		sort.Sort(templateTxSorter{blockTxns, txFees[1:], txSigChecks[1:]})
 	}
 	blockTxns = append([]*bchutil.Tx{coinbaseTx}, blockTxns...)
 
@@ -812,7 +747,7 @@ mempoolLoop:
 		MaxSigChecks:    uint32(maxSigChecks),
 		Height:          nextBlockHeight,
 		ValidPayAddress: payToAddress != nil,
-		MaxBlockSize:    uint32(maxBlockSize),
+		MaxBlockSize:    maxBlockSize,
 	}, nil
 }
 
@@ -859,7 +794,8 @@ func (g *BlkTmplGenerator) UpdateExtraNonce(msgBlock *wire.MsgBlock, blockHeight
 	msgBlock.Transactions[0].TxIn[0].SignatureScript = coinbaseScript
 
 	// Make sure the coinbase is above the minimum size threshold.
-	padCoinbaseScript((msgBlock.Transactions[0]))
+	padCoinbaseScript(msgBlock.Transactions[0],
+		minCoinbaseSize(g.chainParams, blockHeight))
 
 	// TODO(davec): A bchutil.Block should use saved in the state to avoid
 	// recalculating all of the other transaction hashes.

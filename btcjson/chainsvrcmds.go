@@ -8,9 +8,12 @@
 package btcjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/gcash/bchd/wire"
 )
@@ -47,26 +50,138 @@ func NewAddNodeCmd(addr string, subCmd AddNodeSubCmd) *AddNodeCmd {
 	}
 }
 
-// TransactionInput represents the inputs to a transaction.  Specifically a
-// transaction hash and output number pair.
-type TransactionInput struct {
-	Txid string `json:"txid"`
-	Vout uint32 `json:"vout"`
+// SetBanSubCmd defines the type used in the setban JSON-RPC command for the
+// command field.
+type SetBanSubCmd string
+
+const (
+	// SBAdd indicates the specified host or subnet should be banned.
+	SBAdd SetBanSubCmd = "add"
+
+	// SBRemove indicates the ban of the specified host or subnet should be
+	// lifted.
+	SBRemove SetBanSubCmd = "remove"
+)
+
+// SetBanCmd defines the setban JSON-RPC command.
+type SetBanCmd struct {
+	Subnet   string
+	Command  SetBanSubCmd `jsonrpcusage:"\"add|remove\""`
+	BanTime  *int64       `jsonrpcdefault:"0"`
+	Absolute *bool        `jsonrpcdefault:"false"`
 }
 
+// NewSetBanCmd returns a new instance which can be used to issue a setban
+// JSON-RPC command.
+//
+// The parameters which are pointers indicate they are optional.  Passing nil
+// for optional parameters will use the default value.
+func NewSetBanCmd(subnet string, command SetBanSubCmd, banTime *int64, absolute *bool) *SetBanCmd {
+	// The parameters end at the first nil, so a later one needs this one.
+	if banTime == nil && absolute != nil {
+		banTime = Int64(0)
+	}
+	return &SetBanCmd{
+		Subnet:   subnet,
+		Command:  command,
+		BanTime:  banTime,
+		Absolute: absolute,
+	}
+}
+
+// ListBannedCmd defines the listbanned JSON-RPC command.
+type ListBannedCmd struct{}
+
+// NewListBannedCmd returns a new instance which can be used to issue a
+// listbanned JSON-RPC command.
+func NewListBannedCmd() *ListBannedCmd {
+	return &ListBannedCmd{}
+}
+
+// ClearBannedCmd defines the clearbanned JSON-RPC command.
+type ClearBannedCmd struct {
+	Manual    *bool `jsonrpcdefault:"true"`
+	Automatic *bool `jsonrpcdefault:"true"`
+}
+
+// NewClearBannedCmd returns a new instance which can be used to issue a
+// clearbanned JSON-RPC command.
+//
+// The parameters which are pointers indicate they are optional.  Passing nil
+// for optional parameters will use the default value.
+func NewClearBannedCmd(manual, automatic *bool) *ClearBannedCmd {
+	// The parameters end at the first nil, so a later one needs this one.
+	if manual == nil && automatic != nil {
+		manual = Bool(true)
+	}
+	return &ClearBannedCmd{
+		Manual:    manual,
+		Automatic: automatic,
+	}
+}
+
+// TransactionInput represents the inputs to a transaction.  Specifically a
+// transaction hash and output number pair, and, for createrawtransaction,
+// optionally the sequence number of the input.
+type TransactionInput struct {
+	Txid     string  `json:"txid"`
+	Vout     uint32  `json:"vout"`
+	Sequence *uint32 `json:"sequence,omitempty"`
+}
+
+// TransactionOutputCashToken is an entry of createrawtransaction's cashtokens
+// param.  It is marshalled with the names the server documents, without the
+// capability and the commitment when they are empty, as for no NFT.  Names
+// are matched without regard to case when it is unmarshalled, so entries with
+// Go's field names, as earlier clients sent them, still decode.
 type TransactionOutputCashToken struct {
-	Address    string
-	Category   string // hex
-	Amount     uint64
-	Capability string // none, mutable or minting
-	Commitment string // hex
+	Address    string `json:"address"`
+	Category   string `json:"category"` // hex
+	Amount     uint64 `json:"amount"`
+	Capability string `json:"capability,omitempty"` // none, mutable or minting
+	Commitment string `json:"commitment,omitempty"` // hex
+}
+
+// UnmarshalJSON reads the token amount from a JSON integer or a string of
+// decimal digits, as Bitcoin Cash Node does, so clients that can't hold an
+// integer above 2^53 in a JSON number can still pass any amount exactly.
+func (t *TransactionOutputCashToken) UnmarshalJSON(b []byte) error {
+	// The raw amount has the amount field's name, so it takes the place of
+	// the uint64 field, which would refuse a string.
+	type tokenOutput TransactionOutputCashToken
+	aux := struct {
+		*tokenOutput
+		Amount json.RawMessage `json:"amount"`
+	}{tokenOutput: (*tokenOutput)(t)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+
+	amount := string(aux.Amount)
+	if amount == "" || amount == "null" {
+		return nil
+	}
+	if amount[0] == '"' {
+		if err := json.Unmarshal(aux.Amount, &amount); err != nil {
+			return err
+		}
+	}
+	value, err := strconv.ParseUint(amount, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid token amount %s", aux.Amount)
+	}
+	t.Amount = value
+	return nil
 }
 
 // CreateRawTransactionCmd defines the createrawtransaction JSON-RPC command.
+// The server also takes BCHN's form, with the outputs as an array of objects
+// of one member each and the locktime as the third and last param, which
+// the command cannot hold; its usage gives both forms as alternatives.
 type CreateRawTransactionCmd struct {
 	Inputs     []TransactionInput
-	Amounts    map[string]float64 `jsonrpcusage:"{\"address\":amount,...}"` // In BTC
-	CashTokens *[]TransactionOutputCashToken
+	Amounts    map[string]float64            `jsonrpcusage:"{\"address\":amount,...}|[{\"address\":amount},{\"data\":\"hex\"},...]"` // In BTC
+	CashTokens *[]TransactionOutputCashToken `jsonrpcusage:"[{\"address\":\"value\",\"category\":\"value\",\"amount\":n,\"capability\":\"value\",\"commitment\":\"value\"},...]|locktime"`
 	LockTime   *int64
 }
 
@@ -138,6 +253,66 @@ func NewGetAddedNodeInfoCmd(dns bool, node *string) *GetAddedNodeInfoCmd {
 	}
 }
 
+// FinalizeBlockCmd defines the finalizeblock JSON-RPC command.
+type FinalizeBlockCmd struct {
+	BlockHash string
+}
+
+// NewFinalizeBlockCmd returns a new instance which can be used to issue a
+// finalizeblock JSON-RPC command.
+func NewFinalizeBlockCmd(blockHash string) *FinalizeBlockCmd {
+	return &FinalizeBlockCmd{
+		BlockHash: blockHash,
+	}
+}
+
+// ListBcmrIdentitiesCmd defines the listbcmridentities JSON-RPC command.
+type ListBcmrIdentitiesCmd struct {
+	After *string
+	Limit *int
+}
+
+// NewListBcmrIdentitiesCmd returns a new instance which can be used to issue a
+// listbcmridentities JSON-RPC command.
+//
+// The parameters which are pointers indicate they are optional.  Passing nil
+// for optional parameters will use the default value.
+func NewListBcmrIdentitiesCmd(after *string, limit *int) *ListBcmrIdentitiesCmd {
+	// The parameters end at the first nil, so limit needs after, which
+	// means the start when it is empty.
+	if after == nil && limit != nil {
+		after = String("")
+	}
+	return &ListBcmrIdentitiesCmd{
+		After: after,
+		Limit: limit,
+	}
+}
+
+// GetBcmrIdentityCmd defines the getbcmridentity JSON-RPC command.
+type GetBcmrIdentityCmd struct {
+	Authbase         string
+	IncludeAuthchain *bool `jsonrpcdefault:"false"`
+	After            *string
+	Limit            *int
+}
+
+// NewGetBcmrIdentityCmd returns a new instance which can be used to issue a
+// getbcmridentity JSON-RPC command.
+//
+// The parameters which are pointers indicate they are optional.  Passing nil
+// for optional parameters will use the default value.
+func NewGetBcmrIdentityCmd(authbase string, includeAuthchain *bool, after *string,
+	limit *int) *GetBcmrIdentityCmd {
+
+	return &GetBcmrIdentityCmd{
+		Authbase:         authbase,
+		IncludeAuthchain: includeAuthchain,
+		After:            after,
+		Limit:            limit,
+	}
+}
+
 // GetBestBlockHashCmd defines the getbestblockhash JSON-RPC command.
 type GetBestBlockHashCmd struct{}
 
@@ -145,6 +320,15 @@ type GetBestBlockHashCmd struct{}
 // getbestblockhash JSON-RPC command.
 func NewGetBestBlockHashCmd() *GetBestBlockHashCmd {
 	return &GetBestBlockHashCmd{}
+}
+
+// GetFinalizedBlockHashCmd defines the getfinalizedblockhash JSON-RPC command.
+type GetFinalizedBlockHashCmd struct{}
+
+// NewGetFinalizedBlockHashCmd returns a new instance which can be used to
+// issue a getfinalizedblockhash JSON-RPC command.
+func NewGetFinalizedBlockHashCmd() *GetFinalizedBlockHashCmd {
+	return &GetFinalizedBlockHashCmd{}
 }
 
 // VerbosityLevel is a type that can unmarshal a bool or an int into an int field!
@@ -161,7 +345,13 @@ func (v *VerbosityLevel) UnmarshalJSON(dat []byte) error {
 	case "2":
 		*v = 2
 	default:
-		return errors.New("invalid VerbosityLevel value")
+		// Accept any level above 2.  The getblock command treats all
+		// of them as level 3.
+		level, err := strconv.ParseInt(string(dat), 10, 32)
+		if err != nil || level < 3 {
+			return errors.New("invalid VerbosityLevel value")
+		}
+		*v = VerbosityLevel(level)
 	}
 	return nil
 }
@@ -382,6 +572,147 @@ type GetConnectionCountCmd struct{}
 // getconnectioncount JSON-RPC command.
 func NewGetConnectionCountCmd() *GetConnectionCountCmd {
 	return &GetConnectionCountCmd{}
+}
+
+// DSProofVerbosity is the verbosity of the double spend proof commands.  It
+// unmarshals from a number, or from a bool where false is 0 and true is 2.
+type DSProofVerbosity int
+
+// UnmarshalJSON allows the DSProofVerbosity to unmarshal either bool or int.
+func (v *DSProofVerbosity) UnmarshalJSON(dat []byte) error {
+	switch string(dat) {
+	case "false":
+		*v = 0
+	case "true":
+		*v = 2
+	default:
+		level, err := strconv.ParseInt(string(dat), 10, 32)
+		if err != nil {
+			return errors.New("invalid DSProofVerbosity value")
+		}
+		*v = DSProofVerbosity(level)
+	}
+	return nil
+}
+
+// DSProofQuery is the first parameter of the getdsproof command: a proof id
+// or transaction id, or an outpoint object with "txid" and "vout" keys,
+// which is kept as its JSON text.
+type DSProofQuery string
+
+// DSProofQueryOutPoint is the outpoint form of a DSProofQuery.
+type DSProofQueryOutPoint struct {
+	TxID string `json:"txid"`
+	Vout int64  `json:"vout"`
+}
+
+// IsOutPoint returns whether the query is an outpoint object.
+func (q DSProofQuery) IsOutPoint() bool {
+	return strings.HasPrefix(strings.TrimSpace(string(q)), "{")
+}
+
+// OutPoint parses the outpoint form of the query.
+func (q DSProofQuery) OutPoint() (*DSProofQueryOutPoint, error) {
+	var op struct {
+		TxID *string      `json:"txid"`
+		Vout *json.Number `json:"vout"`
+	}
+	if err := json.Unmarshal([]byte(q), &op); err != nil {
+		return nil, err
+	}
+	if op.TxID == nil {
+		return nil, errors.New("missing txid in outpoint")
+	}
+	if op.Vout == nil {
+		return nil, errors.New("missing vout in outpoint")
+	}
+	vout, err := op.Vout.Int64()
+	if err != nil {
+		return nil, errors.New("vout must be an integer")
+	}
+	return &DSProofQueryOutPoint{TxID: *op.TxID, Vout: vout}, nil
+}
+
+// MarshalJSON marshals the query as a string or an outpoint object.
+func (q DSProofQuery) MarshalJSON() ([]byte, error) {
+	if q.IsOutPoint() {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, []byte(q)); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	return json.Marshal(string(q))
+}
+
+// UnmarshalJSON unmarshals a string or an outpoint object.
+func (q *DSProofQuery) UnmarshalJSON(dat []byte) error {
+	trimmed := bytes.TrimSpace(dat)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, trimmed); err != nil {
+			return err
+		}
+		*q = DSProofQuery(buf.String())
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err != nil {
+		return errors.New("expected a dspid, a txid or an outpoint object")
+	}
+	*q = DSProofQuery(str)
+	return nil
+}
+
+// DSProofVerbosityPtr returns a pointer to a DSProofVerbosity.
+func DSProofVerbosityPtr(v int) *DSProofVerbosity {
+	d := DSProofVerbosity(v)
+	return &d
+}
+
+// GetDSProofCmd defines the getdsproof JSON-RPC command.
+type GetDSProofCmd struct {
+	Query     DSProofQuery
+	Verbosity *DSProofVerbosity `jsonrpcdefault:"2"`
+	Recursive *bool             `jsonrpcdefault:"true"`
+}
+
+// NewGetDSProofCmd returns a new instance which can be used to issue a
+// getdsproof JSON-RPC command.
+func NewGetDSProofCmd(query DSProofQuery, verbosity *DSProofVerbosity, recursive *bool) *GetDSProofCmd {
+	return &GetDSProofCmd{
+		Query:     query,
+		Verbosity: verbosity,
+		Recursive: recursive,
+	}
+}
+
+// GetDSProofListCmd defines the getdsprooflist JSON-RPC command.
+type GetDSProofListCmd struct {
+	Verbosity      *DSProofVerbosity `jsonrpcdefault:"0"`
+	IncludeOrphans *bool             `jsonrpcdefault:"false"`
+}
+
+// NewGetDSProofListCmd returns a new instance which can be used to issue a
+// getdsprooflist JSON-RPC command.
+func NewGetDSProofListCmd(verbosity *DSProofVerbosity, includeOrphans *bool) *GetDSProofListCmd {
+	return &GetDSProofListCmd{
+		Verbosity:      verbosity,
+		IncludeOrphans: includeOrphans,
+	}
+}
+
+// GetDSProofScoreCmd defines the getdsproofscore JSON-RPC command.
+type GetDSProofScoreCmd struct {
+	TxID string
+}
+
+// NewGetDSProofScoreCmd returns a new instance which can be used to issue a
+// getdsproofscore JSON-RPC command.
+func NewGetDSProofScoreCmd(txID string) *GetDSProofScoreCmd {
+	return &GetDSProofScoreCmd{
+		TxID: txID,
+	}
 }
 
 // GetDifficultyCmd defines the getdifficulty JSON-RPC command.
@@ -758,6 +1089,24 @@ func NewSubmitBlockCmd(hexBlock string, options *SubmitBlockOptions) *SubmitBloc
 	}
 }
 
+// TestMempoolAcceptCmd defines the testmempoolaccept JSON-RPC command.
+type TestMempoolAcceptCmd struct {
+	RawTxs        []string
+	AllowHighFees *bool `jsonrpcdefault:"false"`
+}
+
+// NewTestMempoolAcceptCmd returns a new instance which can be used to issue a
+// testmempoolaccept JSON-RPC command.
+//
+// The parameters which are pointers indicate they are optional.  Passing nil
+// for optional parameters will use the default value.
+func NewTestMempoolAcceptCmd(rawTxs []string, allowHighFees *bool) *TestMempoolAcceptCmd {
+	return &TestMempoolAcceptCmd{
+		RawTxs:        rawTxs,
+		AllowHighFees: allowHighFees,
+	}
+}
+
 // UptimeCmd defines the uptime JSON-RPC command.
 type UptimeCmd struct{}
 
@@ -832,10 +1181,16 @@ func init() {
 	flags := UsageFlag(0)
 
 	MustRegisterCmd("addnode", (*AddNodeCmd)(nil), flags)
+	MustRegisterCmd("clearbanned", (*ClearBannedCmd)(nil), flags)
+	MustRegisterCmd("listbanned", (*ListBannedCmd)(nil), flags)
+	MustRegisterCmd("listbcmridentities", (*ListBcmrIdentitiesCmd)(nil), flags)
+	MustRegisterCmd("setban", (*SetBanCmd)(nil), flags)
 	MustRegisterCmd("createrawtransaction", (*CreateRawTransactionCmd)(nil), flags)
 	MustRegisterCmd("decoderawtransaction", (*DecodeRawTransactionCmd)(nil), flags)
 	MustRegisterCmd("decodescript", (*DecodeScriptCmd)(nil), flags)
+	MustRegisterCmd("finalizeblock", (*FinalizeBlockCmd)(nil), flags)
 	MustRegisterCmd("getaddednodeinfo", (*GetAddedNodeInfoCmd)(nil), flags)
+	MustRegisterCmd("getbcmridentity", (*GetBcmrIdentityCmd)(nil), flags)
 	MustRegisterCmd("getbestblockhash", (*GetBestBlockHashCmd)(nil), flags)
 	MustRegisterCmd("getblock", (*GetBlockCmd)(nil), flags)
 	MustRegisterCmd("getblockchaininfo", (*GetBlockChainInfoCmd)(nil), flags)
@@ -848,6 +1203,10 @@ func init() {
 	MustRegisterCmd("getchaintips", (*GetChainTipsCmd)(nil), flags)
 	MustRegisterCmd("getconnectioncount", (*GetConnectionCountCmd)(nil), flags)
 	MustRegisterCmd("getdifficulty", (*GetDifficultyCmd)(nil), flags)
+	MustRegisterCmd("getdsproof", (*GetDSProofCmd)(nil), flags)
+	MustRegisterCmd("getdsprooflist", (*GetDSProofListCmd)(nil), flags)
+	MustRegisterCmd("getdsproofscore", (*GetDSProofScoreCmd)(nil), flags)
+	MustRegisterCmd("getfinalizedblockhash", (*GetFinalizedBlockHashCmd)(nil), flags)
 	MustRegisterCmd("getgenerate", (*GetGenerateCmd)(nil), flags)
 	MustRegisterCmd("gethashespersec", (*GetHashesPerSecCmd)(nil), flags)
 	MustRegisterCmd("getinfo", (*GetInfoCmd)(nil), flags)
@@ -874,6 +1233,7 @@ func init() {
 	MustRegisterCmd("setgenerate", (*SetGenerateCmd)(nil), flags)
 	MustRegisterCmd("stop", (*StopCmd)(nil), flags)
 	MustRegisterCmd("submitblock", (*SubmitBlockCmd)(nil), flags)
+	MustRegisterCmd("testmempoolaccept", (*TestMempoolAcceptCmd)(nil), flags)
 	MustRegisterCmd("uptime", (*UptimeCmd)(nil), flags)
 	MustRegisterCmd("validateaddress", (*ValidateAddressCmd)(nil), flags)
 	MustRegisterCmd("verifychain", (*VerifyChainCmd)(nil), flags)

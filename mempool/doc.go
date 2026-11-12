@@ -50,9 +50,7 @@ be an exhaustive list.
   - Individual orphan transaction query support
   - Configurable transaction acceptance policy
   - Option to accept or reject standard transactions
-  - Option to accept or reject transactions based on priority calculations
-  - Rate limiting of low-fee and free transactions
-  - Non-zero fee threshold
+  - Minimum relay fee required from every new transaction
   - Max signature operations per transaction
   - Max orphan transaction size
   - Max number of orphan transactions allowed
@@ -60,7 +58,6 @@ be an exhaustive list.
   - Timestamp when the transaction was added to the pool
   - Most recent block height when the transaction was added to the pool
   - The fee the transaction pays
-  - The starting priority for the transaction
   - Manual control of transaction removal
   - Recursive removal of all dependent transactions
 
@@ -70,12 +67,20 @@ Errors returned by this package are either the raw errors provided by underlying
 calls or of type mempool.RuleError.  Since there are two classes of rules
 (mempool acceptance rules and blockchain (consensus) acceptance rules), the
 mempool.RuleError type contains a single Err field which will, in turn, either
-be a mempool.TxRuleError or a blockchain.RuleError.  The first indicates a
-violation of mempool acceptance rules while the latter indicates a violation of
-consensus acceptance rules.  This allows the caller to easily differentiate
+be a mempool.TxRuleError or a blockchain.RuleError, or a mempool.HighFeeError
+for a fee above the caller's limit.  The first indicates a violation of mempool
+acceptance rules while the second indicates a violation of consensus
+acceptance rules.  This allows the caller to easily differentiate
 between unexpected errors, such as database errors, versus errors due to rule
 violations through type assertions.  In addition, callers can programmatically
 determine the specific rule violation by type asserting the Err field to one of
 the aforementioned types and examining their underlying ErrorCode field.
+RejectReason returns the short reason Bitcoin Cash Node gives for a rule
+violation, such as txn-mempool-conflict, and BlockRejectReason the reason for
+a block, which submitblock returns.  As in Bitcoin Cash Node, a
+transaction whose input script fails only standard script flags it does not
+count as mandatory is refused as nonstandard, with a mempool.TxRuleError,
+while the blockchain.RuleError of a script that also fails without them holds
+the script engine's error.
 */
 package mempool

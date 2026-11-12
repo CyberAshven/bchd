@@ -6,20 +6,27 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gcash/bchd/bchec"
 	"github.com/gcash/bchd/chaincfg"
 	"github.com/gcash/bchd/chaincfg/chainhash"
+	"github.com/gcash/bchd/database"
+	"github.com/gcash/bchd/internal/socks"
 	"github.com/gcash/bchd/wire"
 
-	"github.com/btcsuite/go-socks/socks"
 	"github.com/zquestz/grab"
 	"golang.org/x/text/message"
 )
+
+// fastSyncProgressInterval is how often the progress of the verification of
+// the downloaded UTXO set is logged.  It is a variable so tests can shorten it.
+var fastSyncProgressInterval = 5 * time.Minute
 
 // fastSyncUtxoSet will download the UTXO set from the sources provided in the checkpoint. Each
 // UTXO will be saved to the database and the ECMH hash of the UTXO set will be validated against
@@ -70,25 +77,38 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 		pkScript       []byte
 		serializedUtxo []byte
 		n              int
-		totalRead      int
 		scriptLen      uint32
 		progress       float64
 		progressStr    string
+
+		// totalRead is atomic, as the progress goroutine reads it while
+		// the loop below adds to it.
+		totalRead atomic.Int64
 	)
 
-	ticker := time.NewTicker(time.Minute * 5)
+	// Stopping the ticker does not close its channel, so the progress
+	// goroutine also ends when done is closed, as the function returns.
+	ticker := time.NewTicker(fastSyncProgressInterval)
 	defer ticker.Stop()
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		for range ticker.C {
-			progress = math.Min(float64(totalRead)/float64(checkpoint.UtxoSetSize), 1.0) * 100
-			progressStr = fmt.Sprintf("%d/%d MiB (%.2f%%)", totalRead/(1024*1024)+1, checkpoint.UtxoSetSize/(1024*1024)+1, progress)
+		for {
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			}
+			read := totalRead.Load()
+			progress = math.Min(float64(read)/float64(checkpoint.UtxoSetSize), 1.0) * 100
+			progressStr = fmt.Sprintf("%d/%d MiB (%.2f%%)", read/(1024*1024)+1, checkpoint.UtxoSetSize/(1024*1024)+1, progress)
 			log.Infof("UTXO verification progress: processed %s", progressStr)
 		}
 	}()
 
 	resultsChan := make(chan *result)
 	jobsChan := make(chan []byte)
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		go worker(b.utxoCache, jobsChan, resultsChan)
 	}
 
@@ -104,12 +124,12 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 			log.Errorf("Error reading UTXO set: %s", err.Error())
 			return err
 		}
-		totalRead += n
+		totalRead.Add(int64(n))
 
 		// The last four bytes that we read is the length of the script
 		scriptLen = binary.LittleEndian.Uint32(buf52[48:])
 		if scriptLen > maxScriptLen {
-			log.Error("Read invalid UTXO script length", totalRead)
+			log.Error("Read invalid UTXO script length", totalRead.Load())
 			return errors.New("invalid script length")
 		}
 
@@ -120,7 +140,7 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 			log.Errorf("Error reading UTXO set: %s", err.Error())
 			return err
 		}
-		totalRead += n
+		totalRead.Add(int64(n))
 
 		serializedUtxo = append(buf52, pkScript...)
 
@@ -131,7 +151,7 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 	// Read each result and add the returned hash to the
 	// existing multiset.
 	m := bchec.NewMultiset(bchec.S256())
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		result := <-resultsChan
 		if result.err != nil {
 			log.Errorf("Error processing UTXO set: %s", err.Error())
@@ -140,6 +160,16 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 		m.Merge(result.m)
 	}
 	close(resultsChan)
+
+	utxoHash := m.Hash()
+
+	// Make sure the hash of the UTXO set we downloaded matches the expected
+	// hash before the state is marked as consistent at the checkpoint.
+	if !checkpoint.UtxoSetHash.IsEqual(&utxoHash) {
+		log.Errorf("Downloaded UTXO set hash does not match checkpoint."+
+			" Expected %s, got %s.", checkpoint.UtxoSetHash.String(), m.Hash().String())
+		return AssertError("downloaded invalid UTXO set")
+	}
 
 	if err = b.utxoCache.Flush(FlushRequired, &BestState{Hash: *checkpoint.Hash}); err != nil {
 		log.Errorf("Error processing UTXO set: %s", err.Error())
@@ -151,13 +181,13 @@ func (b *BlockChain) fastSyncUtxoSet(checkpoint *chaincfg.Checkpoint, proxyAddr 
 		return err
 	}
 
-	utxoHash := m.Hash()
-
-	// Make sure the hash of the UTXO set we downloaded matches the expected hash.
-	if !checkpoint.UtxoSetHash.IsEqual(&utxoHash) {
-		log.Errorf("Downloaded UTXO set hash does not match checkpoint."+
-			" Expected %s, got %s.", checkpoint.UtxoSetHash.String(), m.Hash().String())
-		return AssertError("downloaded invalid UTXO set")
+	// The UTXO set is complete, so a start without fast sync can use it.
+	err = b.db.Update(func(dbTx database.Tx) error {
+		return dbTx.Metadata().Delete(chainStateFastSyncKeyName)
+	})
+	if err != nil {
+		log.Errorf("Error processing UTXO set: %s", err.Error())
+		return err
 	}
 
 	log.Infof("Verification complete. UTXO hash %s.", m.Hash().String())
@@ -210,6 +240,20 @@ func worker(cache *utxoCache, jobs <-chan []byte, results chan<- *result) {
 	results <- &result{m: m}
 }
 
+// newDownloadClient returns a download client that connects through proxy, if
+// it isn't nil.
+func newDownloadClient(proxy *socks.Proxy) *grab.Client {
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if proxy != nil {
+		transport.DialContext = proxy.DialContext
+	}
+
+	return &grab.Client{
+		UserAgent:  "grab",
+		HTTPClient: &http.Client{Transport: transport},
+	}
+}
+
 // downloadUtxoSet will attempt to connect to make an HTTP GET request to the
 // provided sources one at a time and download the UTXO set to the provided path.
 // If a proxy is provided it will use it for the HTTP connection.
@@ -220,7 +264,7 @@ func downloadUtxoSet(sources []string, proxy *socks.Proxy, destination string) (
 		for retries > 0 {
 			retries--
 
-			client := grab.NewClientWithProxy(proxy)
+			client := newDownloadClient(proxy)
 			request, err := grab.NewRequest(destination, source)
 			if err != nil {
 				log.Errorf("FastSync: Error creating download request: %s", err.Error())
