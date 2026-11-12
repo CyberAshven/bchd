@@ -1,0 +1,31 @@
+# TEST ONLY: runs gcash/bchwallet's own CI script on a branch of the bchwallet
+# fork, whose Actions are not enabled. Not for upstream.
+name: bchwallet-ci-test-only
+on:
+  push:
+    branches:
+      - ci-bchwallet
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the bchwallet ref to test
+        id: ref
+        run: echo "ref=$(cat bchwallet-ref)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchwallet
+          ref: ${{ steps.ref.outputs.ref }}
+          path: bchwallet
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install golangci-lint
+        run: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.14.0
+      - name: Run goclean.sh
+        working-directory: bchwallet
+        run: ./goclean.sh
