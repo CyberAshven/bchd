@@ -5,6 +5,7 @@
 package btcjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -22,10 +23,10 @@ type RPCError struct {
 	Message string       `json:"message,omitempty"`
 }
 
-// Guarantee RPCError satisifies the builtin error interface.
+// Guarantee RPCError satisfies the builtin error interface.
 var _, _ error = RPCError{}, (*RPCError)(nil)
 
-// Error returns a string describing the RPC error.  This satisifies the
+// Error returns a string describing the RPC error.  This satisfies the
 // builtin error interface.
 func (e RPCError) Error() string {
 	return fmt.Sprintf("%d: %s", e.Code, e.Message)
@@ -44,14 +45,18 @@ func NewRPCError(code RPCErrorCode, message string) *RPCError {
 // requests, responses, or notifications) is valid.  JSON-RPC 1.0 allows any
 // valid JSON type.  JSON-RPC 2.0 (which bitcoind follows for some parts) only
 // allows string, number, or null, so this function restricts the allowed types
-// to that list.  This function is only provided in case the caller is manually
-// marshalling for some reason.    The functions which accept an ID in this
-// package already call this function to ensure the provided id is valid.
+// to that list.  A json.Number is the number of a request id as it was sent,
+// and a json.RawMessage a request id of another type, such as a bool, as it
+// was sent, so a server can give back any id JSON-RPC 1.0 allows.  This
+// function is only provided in case the caller is manually marshalling for
+// some reason.  The functions which accept an ID in this package already call
+// this function to ensure the provided id is valid.
 func IsValidIDType(id interface{}) bool {
 	switch id.(type) {
 	case int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64,
 		float32, float64,
+		json.Number, json.RawMessage,
 		string,
 		nil:
 		return true
@@ -75,22 +80,59 @@ type Request struct {
 
 // UnmarshalJSON is a custom unmarshal func for the Request struct. The param
 // field defaults to an empty json.RawMessage array it is omitted by the request
-// or nil if the supplied value is invalid.
+// or nil if the supplied value is invalid.  Each parameter is kept exactly as
+// sent, and so is the id: a number as a json.Number, and a bool, an object or
+// an array as a json.RawMessage.
 func (request *Request) UnmarshalJSON(b []byte) error {
-	var data map[string]interface{}
+	var data map[string]json.RawMessage
 	err := json.Unmarshal(b, &data)
 	if err != nil {
 		return err
 	}
 
-	request.ID = data["id"]
-	methodValue, hasMethod := data["method"]
-	if hasMethod {
-		request.Method = methodValue.(string)
+	// The members other than params are decoded into generic values, so the
+	// id keeps its Go type and method and jsonrpc can be checked to be
+	// strings.  Numbers are kept as sent, as BCHN gives an id back, since a
+	// float64 would round an integer id above 2^53 and change the form of
+	// others, such as 1.0.
+	values := make(map[string]interface{}, 3)
+	for _, name := range []string{"id", "method", "jsonrpc"} {
+		raw, ok := data[name]
+		if !ok {
+			continue
+		}
+		var value interface{}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		values[name] = value
 	}
-	jsonrpcValue, hasJsonrpc := data["jsonrpc"]
+
+	request.ID = values["id"]
+	switch request.ID.(type) {
+	case bool, map[string]interface{}, []interface{}:
+		// JSON-RPC 1.0 allows an id of any type, and BCHN gives it back
+		// as sent.  Decoded, an object would lose the order of its
+		// members, so these are kept as the JSON sent.
+		request.ID = data["id"]
+	}
+	methodValue, hasMethod := values["method"]
+	if hasMethod {
+		method, ok := methodValue.(string)
+		if !ok {
+			return makeError(ErrInvalidType, "method must be a string")
+		}
+		request.Method = method
+	}
+	jsonrpcValue, hasJsonrpc := values["jsonrpc"]
 	if hasJsonrpc {
-		request.Jsonrpc = jsonrpcValue.(string)
+		jsonrpc, ok := jsonrpcValue.(string)
+		if !ok {
+			return makeError(ErrInvalidType, "jsonrpc must be a string")
+		}
+		request.Jsonrpc = jsonrpc
 	}
 	paramsValue, hasParams := data["params"]
 	if !hasParams {
@@ -98,20 +140,12 @@ func (request *Request) UnmarshalJSON(b []byte) error {
 		request.Params = []json.RawMessage{}
 	}
 	if hasParams {
-		// assert the request params is an array of data
-		params, paramsOk := paramsValue.([]interface{})
-		if paramsOk {
-			rawParams := make([]json.RawMessage, 0, len(params))
-			for _, param := range params {
-				marshalledParam, err := json.Marshal(param)
-				if err != nil {
-					return err
-				}
-				rawMessage := json.RawMessage(marshalledParam)
-				rawParams = append(rawParams, rawMessage)
-			}
-
-			request.Params = rawParams
+		// Keep each parameter of an array as sent.  Decoding it into a
+		// generic value first would turn numbers into float64, which
+		// rounds integers above 2^53.
+		var params []json.RawMessage
+		if json.Unmarshal(paramsValue, &params) == nil {
+			request.Params = params
 		}
 	}
 

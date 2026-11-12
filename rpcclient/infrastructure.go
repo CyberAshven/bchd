@@ -23,10 +23,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/btcsuite/go-socks/socks"
-	"github.com/btcsuite/websocket"
 	"github.com/gcash/bchd/btcjson"
 	"github.com/gcash/bchd/chaincfg"
+	"github.com/gcash/bchd/internal/socks"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -119,7 +119,7 @@ type jsonRequest struct {
 type Client struct {
 	id atomic.Uint64 // atomic, so must stay 64-bit aligned
 
-	// config holds the connection configuration assoiated with this client.
+	// config holds the connection configuration associated with this client.
 	config *ConnConfig
 
 	// wsConn is the underlying websocket connection when not in HTTP POST
@@ -382,15 +382,21 @@ func (c *Client) handleMessage(msg []byte) {
 // to have come from reading from the websocket connection in wsInHandler,
 // should be logged.
 func (c *Client) shouldLogReadError(err error) bool {
-	// No logging when the connetion is being forcibly disconnected.
+	// No logging when the connection is being forcibly disconnected.
 	select {
 	case <-c.shutdown:
 		return false
 	default:
 	}
 
-	// No logging when the connection has been disconnected.
+	// No logging when the connection has been disconnected, including when
+	// the server closed it normally with a close frame.
 	if err == io.EOF {
+		return false
+	}
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure,
+		websocket.CloseGoingAway) {
+
 		return false
 	}
 	if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {

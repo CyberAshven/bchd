@@ -5,9 +5,16 @@
 package mempool
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -170,7 +177,7 @@ func (p *poolHarness) CreateCoinbaseTx(blockHeight int32, numOutputs uint32) (*b
 	totalInput := blockchain.CalcBlockSubsidy(blockHeight, p.chainParams)
 	amountPerOutput := totalInput / int64(numOutputs)
 	remainder := totalInput - amountPerOutput*int64(numOutputs)
-	for i := uint32(0); i < numOutputs; i++ {
+	for i := range numOutputs {
 		// Ensure the final output accounts for any remainder that might
 		// be left from splitting the input amount.
 		amount := amountPerOutput
@@ -186,14 +193,19 @@ func (p *poolHarness) CreateCoinbaseTx(blockHeight int32, numOutputs uint32) (*b
 	return bchutil.NewTx(tx), nil
 }
 
+// testTxFee is the fee paid by the transactions the harness creates, which
+// is above the minimum relay fee for their size.
+const testTxFee = 1000
+
 // CreateSignedTx creates a new signed transaction that consumes the provided
 // inputs and generates the provided number of outputs by evenly splitting the
-// total input amount.  All outputs will be to the payment script associated
-// with the harness and all inputs are assumed to do the same.
+// total input amount less testTxFee.  All outputs will be to the payment
+// script associated with the harness and all inputs are assumed to do the
+// same.
 func (p *poolHarness) CreateSignedTx(inputs []spendableOutput, numOutputs uint32) (*bchutil.Tx, error) {
-	// Calculate the total input amount and split it amongst the requested
-	// number of outputs.
-	var totalInput bchutil.Amount
+	// Calculate the total input amount less the fee and split it amongst
+	// the requested number of outputs.
+	totalInput := -bchutil.Amount(testTxFee)
 	for _, input := range inputs {
 		totalInput += input.amount
 	}
@@ -208,7 +220,7 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput, numOutputs uint32
 			Sequence:         wire.MaxTxInSequenceNum,
 		})
 	}
-	for i := uint32(0); i < numOutputs; i++ {
+	for i := range numOutputs {
 		// Ensure the final output accounts for any remainder that might
 		// be left from splitting the input amount.
 		amount := amountPerOutput
@@ -234,18 +246,19 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput, numOutputs uint32
 	return bchutil.NewTx(tx), nil
 }
 
-// CreateTxChain creates a chain of zero-fee transactions (each subsequent
-// transaction spends the entire amount from the previous one) with the first
-// one spending the provided outpoint.  Each transaction spends the entire
-// amount of the previous one and as such does not include any fees.
+// CreateTxChain creates a chain of transactions with the first one spending
+// the provided outpoint and each subsequent one spending the output of the
+// previous one.  Each transaction pays testTxFee.
 func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32) ([]*bchutil.Tx, error) {
 	txChain := make([]*bchutil.Tx, 0, numTxns)
 	prevOutPoint := firstOutput.outPoint
 	spendableAmount := firstOutput.amount
-	for i := uint32(0); i < numTxns; i++ {
+	for range numTxns {
 		// Create the transaction using the previous transaction output
-		// and paying the full amount to the payment address associated
-		// with the harness.
+		// and paying the amount less the fee to the payment address
+		// associated with the harness.
+		inputAmount := spendableAmount
+		spendableAmount -= testTxFee
 		tx := wire.NewMsgTx(wire.TxVersion)
 		tx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: prevOutPoint,
@@ -258,7 +271,7 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 		})
 
 		// Sign the new transaction.
-		sigScript, err := txscript.SignatureScript(tx, 0, int64(spendableAmount), p.payScript,
+		sigScript, err := txscript.SignatureScript(tx, 0, int64(inputAmount), p.payScript,
 			txscript.SigHashAll, p.signKey, true)
 		if err != nil {
 			return nil, err
@@ -312,13 +325,11 @@ func newPoolHarness(chainParams *chaincfg.Params) (*poolHarness, []spendableOutp
 		chain: chain,
 		txPool: New(&Config{
 			Policy: Policy{
-				DisableRelayPriority: true,
-				FreeTxRelayLimit:     15.0,
-				MaxOrphanTxs:         5,
-				MaxOrphanTxSize:      1000,
-				LimitSigChecks:       true,
-				MinRelayTxFee:        1000, // 1 Satoshi per byte
-				MaxTxVersion:         1,
+				MaxOrphanTxs:    5,
+				MaxOrphanTxSize: 1000,
+				LimitSigChecks:  true,
+				MinRelayTxFee:   1000, // 1 Satoshi per byte
+				MaxTxVersion:    1,
 			},
 			ChainParams:      chainParams,
 			FetchUtxoView:    chain.FetchUtxoView,
@@ -343,7 +354,7 @@ func newPoolHarness(chainParams *chaincfg.Params) (*poolHarness, []spendableOutp
 		return nil, nil, err
 	}
 	harness.chain.utxos.AddTxOuts(coinbase, curHeight+1)
-	for i := uint32(0); i < numOutputs; i++ {
+	for i := range numOutputs {
 		outputs = append(outputs, txOutToSpendableOut(coinbase, i))
 	}
 	harness.chain.SetHeight(int32(chainParams.CoinbaseMaturity) + curHeight)
@@ -414,8 +425,7 @@ func TestSimpleOrphanChain(t *testing.T) {
 	// Ensure the orphans are accepted (only up to the maximum allowed so
 	// none are evicted).
 	for _, tx := range chainedTxns[1 : maxOrphans+1] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept valid "+
 				"orphan %v", err)
@@ -438,7 +448,7 @@ func TestSimpleOrphanChain(t *testing.T) {
 	// to ensure it has no bearing on whether or not already existing
 	// orphans in the pool are linked.
 	acceptedTxns, err := harness.txPool.ProcessTransaction(chainedTxns[0],
-		false, false, 0)
+		false, 0)
 	if err != nil {
 		t.Fatalf("ProcessTransaction: failed to accept valid "+
 			"orphan %v", err)
@@ -452,6 +462,43 @@ func TestSimpleOrphanChain(t *testing.T) {
 		// Ensure the transaction is no longer in the orphan pool, is
 		// now in the transaction pool, and is reported as available.
 		testPoolMembership(tc, txD.Tx, false, true)
+	}
+}
+
+// TestChanges ensures that the change count goes up each time a transaction is
+// added to or removed from the main pool, and not for an orphan.
+func TestChanges(t *testing.T) {
+	t.Parallel()
+
+	harness, spendableOuts, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	pool := harness.txPool
+	chain, err := harness.CreateTxChain(spendableOuts[0], 2)
+	if err != nil {
+		t.Fatalf("unable to create transaction chain: %v", err)
+	}
+
+	// The child of a transaction the pool doesn't have is an orphan.
+	if _, err := pool.ProcessTransaction(chain[1], true, 0); err != nil {
+		t.Fatalf("ProcessTransaction: %v", err)
+	}
+	if got := pool.Changes(); got != 0 {
+		t.Fatalf("%d changes after an orphan, want 0", got)
+	}
+
+	// The parent joins the pool, and with it the orphan.
+	if _, err := pool.ProcessTransaction(chain[0], false, 0); err != nil {
+		t.Fatalf("ProcessTransaction: %v", err)
+	}
+	if got := pool.Changes(); got != 2 {
+		t.Fatalf("%d changes after two transactions joined, want 2", got)
+	}
+
+	pool.RemoveTransaction(chain[1], false)
+	if got := pool.Changes(); got != 3 {
+		t.Fatalf("%d changes after a removal, want 3", got)
 	}
 }
 
@@ -476,8 +523,7 @@ func TestOrphanReject(t *testing.T) {
 
 	// Ensure orphans are rejected when the allow orphans flag is not set.
 	for _, tx := range chainedTxns[1:] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, false,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, false, 0)
 		if err == nil {
 			t.Fatalf("ProcessTransaction: did not fail on orphan "+
 				"%v when allow orphans flag is false", tx.Hash())
@@ -496,6 +542,10 @@ func TestOrphanReject(t *testing.T) {
 			t.Fatalf("ProcessTransaction: unexpected reject code "+
 				"-- got %v, want %v", code, wire.RejectDuplicate)
 		}
+		if reason := RejectReason(err); reason != "missing-inputs" {
+			t.Fatalf("ProcessTransaction: got reason %q, want "+
+				"missing-inputs", reason)
+		}
 
 		// Ensure no transactions were reported as accepted.
 		if len(acceptedTxns) != 0 {
@@ -508,6 +558,57 @@ func TestOrphanReject(t *testing.T) {
 		// transaction pool, and not reported as available
 		testPoolMembership(tc, tx, false, false)
 	}
+}
+
+// TestOrphanInPoolNotReportedAsDuplicate ensures a submit path that does not
+// allow orphans reports a transaction already sitting in the orphan pool as
+// having missing parents rather than as a duplicate.
+//
+// The orphan pool is not part of the mempool, so reporting a duplicate for one
+// tells the caller the node has a transaction it cannot then look up.  BCHN
+// does not have this problem because its mempool acceptance has no visibility
+// into the orphan map held by the P2P layer.
+func TestOrphanInPoolNotReportedAsDuplicate(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	tc := &testContext{t, harness}
+
+	chainedTxns, err := harness.CreateTxChain(outputs[0], 2)
+	if err != nil {
+		t.Fatalf("unable to create transaction chain: %v", err)
+	}
+	orphan := chainedTxns[1]
+
+	// Put the transaction in the orphan pool the way peer relay would, which
+	// is the only path that creates orphans.
+	if _, err := harness.txPool.ProcessTransaction(orphan, true, 0); err != nil {
+		t.Fatalf("ProcessTransaction: failed to accept valid orphan: %v", err)
+	}
+	testPoolMembership(tc, orphan, true, false)
+
+	// Now submit it the way the JSON-RPC and gRPC endpoints do.  The error must
+	// describe the missing parent rather than claiming the node already has the
+	// transaction, since it is absent from the mempool and a lookup for it
+	// would report not found.
+	_, err = harness.txPool.ProcessTransaction(orphan, false, 0)
+	if err == nil {
+		t.Fatal("ProcessTransaction: accepted an orphan when the allow " +
+			"orphans flag is false")
+	}
+	if strings.Contains(err.Error(), "already have transaction") {
+		t.Fatalf("ProcessTransaction: orphan reported as a duplicate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "references outputs of unknown") {
+		t.Fatalf("ProcessTransaction: expected a missing parent error, got: %v",
+			err)
+	}
+
+	// The failed submit must not have disturbed the orphan pool.
+	testPoolMembership(tc, orphan, true, false)
 }
 
 // TestOrphanEviction ensures that exceeding the maximum number of orphans
@@ -533,8 +634,7 @@ func TestOrphanEviction(t *testing.T) {
 	// Add enough orphans to exceed the max allowed while ensuring they are
 	// all accepted.  This will cause an eviction.
 	for _, tx := range chainedTxns[1:] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept valid "+
 				"orphan %v", err)
@@ -597,8 +697,7 @@ func TestBasicOrphanRemoval(t *testing.T) {
 	// Ensure the orphans are accepted (only up to the maximum allowed so
 	// none are evicted).
 	for _, tx := range chainedTxns[1 : maxOrphans+1] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept valid "+
 				"orphan %v", err)
@@ -672,8 +771,7 @@ func TestOrphanChainRemoval(t *testing.T) {
 	// Ensure the orphans are accepted (only up to the maximum allowed so
 	// none are evicted).
 	for _, tx := range chainedTxns[1 : maxOrphans+1] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept valid "+
 				"orphan %v", err)
@@ -735,8 +833,7 @@ func TestMultiInputOrphanDoubleSpend(t *testing.T) {
 	// Start by adding the orphan transactions from the generated chain
 	// except the final one.
 	for _, tx := range chainedTxns[1:maxOrphans] {
-		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		acceptedTxns, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept valid "+
 				"orphan %v", err)
@@ -762,7 +859,7 @@ func TestMultiInputOrphanDoubleSpend(t *testing.T) {
 		t.Fatalf("unable to create signed tx: %v", err)
 	}
 	acceptedTxns, err := harness.txPool.ProcessTransaction(doubleSpendTx,
-		true, false, 0)
+		true, 0)
 	if err != nil {
 		t.Fatalf("ProcessTransaction: failed to accept valid orphan %v",
 			err)
@@ -781,7 +878,7 @@ func TestMultiInputOrphanDoubleSpend(t *testing.T) {
 	// This will cause the shared output to become a concrete spend which
 	// will in turn must cause the double spending orphan to be removed.
 	acceptedTxns, err = harness.txPool.ProcessTransaction(chainedTxns[0],
-		false, false, 0)
+		false, 0)
 	if err != nil {
 		t.Fatalf("ProcessTransaction: failed to accept valid tx %v", err)
 	}
@@ -816,7 +913,7 @@ func TestCheckSpend(t *testing.T) {
 	for _, op := range outputs {
 		spend := harness.txPool.CheckSpend(op.outPoint)
 		if spend != nil {
-			t.Fatalf("Unexpeced spend found in pool: %v", spend)
+			t.Fatalf("Unexpected spend found in pool: %v", spend)
 		}
 	}
 
@@ -828,8 +925,7 @@ func TestCheckSpend(t *testing.T) {
 		t.Fatalf("unable to create transaction chain: %v", err)
 	}
 	for _, tx := range chainedTxns {
-		_, err := harness.txPool.ProcessTransaction(tx, true,
-			false, 0)
+		_, err := harness.txPool.ProcessTransaction(tx, true, 0)
 		if err != nil {
 			t.Fatalf("ProcessTransaction: failed to accept "+
 				"tx: %v", err)
@@ -846,7 +942,7 @@ func TestCheckSpend(t *testing.T) {
 	}
 
 	// Now all but the last tx should be spent by the next.
-	for i := 0; i < len(chainedTxns)-1; i++ {
+	for i := range len(chainedTxns) - 1 {
 		op = wire.OutPoint{
 			Hash:  *chainedTxns[i].Hash(),
 			Index: 0,
@@ -866,7 +962,7 @@ func TestCheckSpend(t *testing.T) {
 	}
 	spend = harness.txPool.CheckSpend(op)
 	if spend != nil {
-		t.Fatalf("Unexpeced spend found in pool: %v", spend)
+		t.Fatalf("Unexpected spend found in pool: %v", spend)
 	}
 }
 
@@ -936,5 +1032,1295 @@ func TestTxPool_DecodeCompressedBlock(t *testing.T) {
 		if !txHash.IsEqual(&target) {
 			t.Errorf("decoded tx at index %d does not match original: wanted %v, got %v", i, txHash, target)
 		}
+	}
+}
+
+// poolState is a snapshot of the parts of a pool that adding a transaction
+// changes.
+type poolState struct {
+	pool, orphans, outpoints, observed int
+	lastUpdated                        int64
+}
+
+// snapshotPool returns the current state of the harness pool.
+func snapshotPool(p *poolHarness) poolState {
+	mp := p.txPool
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+
+	mp.cfg.FeeEstimator.mtx.RLock()
+	observed := len(mp.cfg.FeeEstimator.observed)
+	mp.cfg.FeeEstimator.mtx.RUnlock()
+
+	return poolState{
+		pool:        len(mp.pool),
+		orphans:     len(mp.orphans),
+		outpoints:   len(mp.outpoints),
+		observed:    observed,
+		lastUpdated: mp.lastUpdated.Load(),
+	}
+}
+
+// TestCheckMempoolAcceptance ensures that CheckMempoolAcceptance reports the
+// same outcome as adding a transaction, without changing the pool.
+func TestCheckMempoolAcceptance(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	tc := &testContext{t, harness}
+	feeEstimator := NewFeeEstimator(DefaultEstimateFeeMaxRollback,
+		DefaultEstimateFeeMinRegisteredBlocks)
+	feeEstimator.lastKnownHeight = harness.chain.BestHeight()
+	harness.txPool.cfg.FeeEstimator = feeEstimator
+	hashCache := txscript.NewHashCache(10)
+	harness.txPool.cfg.HashCache = hashCache
+
+	chainedTxns, err := harness.CreateTxChain(outputs[0], 2)
+	if err != nil {
+		t.Fatalf("unable to create transaction chain: %v", err)
+	}
+	parent, child := chainedTxns[0], chainedTxns[1]
+
+	check := func(tx *bchutil.Tx) (*MempoolAcceptResult, error) {
+		t.Helper()
+		cached := hashCache.ContainsHashes(tx.Hash())
+		before := snapshotPool(harness)
+		result, err := harness.txPool.CheckMempoolAcceptance(tx, 0)
+		if after := snapshotPool(harness); after != before {
+			t.Fatalf("CheckMempoolAcceptance changed the pool: "+
+				"before %+v, after %+v", before, after)
+		}
+		if hashCache.ContainsHashes(tx.Hash()) != cached {
+			t.Fatalf("CheckMempoolAcceptance changed the hash cache")
+		}
+		return result, err
+	}
+
+	// A valid transaction passes and stays out of the pool.
+	result, err := check(parent)
+	if err != nil {
+		t.Fatalf("CheckMempoolAcceptance: unexpected error: %v", err)
+	}
+	if len(result.MissingParents) != 0 || result.Fee != testTxFee ||
+		result.SigChecks != 1 {
+
+		t.Fatalf("CheckMempoolAcceptance: unexpected result %+v", result)
+	}
+	testPoolMembership(tc, parent, false, false)
+
+	// A transaction with unknown inputs reports its missing parent and is
+	// not added to the orphan pool.
+	result, err = check(child)
+	if err != nil {
+		t.Fatalf("CheckMempoolAcceptance: unexpected error: %v", err)
+	}
+	if len(result.MissingParents) != 1 ||
+		*result.MissingParents[0] != *parent.Hash() {
+
+		t.Fatalf("CheckMempoolAcceptance: unexpected missing parents "+
+			"%v", result.MissingParents)
+	}
+	testPoolMembership(tc, child, false, false)
+
+	// Adding the parent changes the pool, which the snapshot detects.
+	before := snapshotPool(harness)
+	_, _, err = harness.txPool.MaybeAcceptTransaction(parent, true)
+	if err != nil {
+		t.Fatalf("MaybeAcceptTransaction: unexpected error: %v", err)
+	}
+	after := snapshotPool(harness)
+	if after.pool != before.pool+1 || after.outpoints != before.outpoints+1 ||
+		after.observed != before.observed+1 {
+
+		t.Fatalf("MaybeAcceptTransaction: unexpected pool change: "+
+			"before %+v, after %+v", before, after)
+	}
+
+	// A transaction already in the pool is rejected as a duplicate.
+	_, err = check(parent)
+	if code, _ := extractRejectCode(err); code != wire.RejectDuplicate ||
+		RejectReason(err) != "txn-already-in-mempool" {
+
+		t.Fatalf("CheckMempoolAcceptance: unexpected error for a "+
+			"transaction in the pool: %v", err)
+	}
+
+	// Its child now passes, without being added.
+	result, err = check(child)
+	if err != nil || len(result.MissingParents) != 0 {
+		t.Fatalf("CheckMempoolAcceptance: unexpected result %+v, "+
+			"error %v", result, err)
+	}
+	testPoolMembership(tc, child, false, false)
+}
+
+// TestCheckMempoolAcceptanceMaxFee ensures that CheckMempoolAcceptance rejects
+// a transaction that pays more than the maximum fee passed to it.
+func TestCheckMempoolAcceptanceMaxFee(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+
+	// Spend the output with a fee of 1 BCH.
+	const fee = bchutil.SatoshiPerBitcoin
+	msgTx := wire.NewMsgTx(wire.TxVersion)
+	msgTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: outputs[0].outPoint,
+		Sequence:         wire.MaxTxInSequenceNum,
+	})
+	msgTx.AddTxOut(&wire.TxOut{
+		PkScript: harness.payScript,
+		Value:    int64(outputs[0].amount) - fee,
+	})
+	sigScript, err := txscript.SignatureScript(msgTx, 0,
+		int64(outputs[0].amount), harness.payScript, txscript.SigHashAll,
+		harness.signKey, true)
+	if err != nil {
+		t.Fatalf("unable to sign transaction: %v", err)
+	}
+	msgTx.TxIn[0].SignatureScript = sigScript
+	tx := bchutil.NewTx(msgTx)
+
+	tests := []struct {
+		maxFee  bchutil.Amount
+		allowed bool
+	}{
+		{maxFee: 0, allowed: true},
+		{maxFee: fee, allowed: true},
+		{maxFee: fee - 1, allowed: false},
+	}
+	for _, test := range tests {
+		result, err := harness.txPool.CheckMempoolAcceptance(tx,
+			test.maxFee)
+		if test.allowed {
+			if err != nil || result.Fee != fee {
+				t.Fatalf("max fee %d: unexpected result %+v, "+
+					"error %v", test.maxFee, result, err)
+			}
+			continue
+		}
+		ruleErr, ok := err.(RuleError)
+		if !ok {
+			t.Fatalf("max fee %d: unexpected error %v", test.maxFee,
+				err)
+		}
+		want := HighFeeError{Fee: fee, MaxFee: int64(test.maxFee)}
+		if ruleErr.Err != want {
+			t.Fatalf("max fee %d: got error %v, want %v",
+				test.maxFee, ruleErr.Err, want)
+		}
+	}
+}
+
+// TestRejectReason ensures RejectReason gives BCHN's short reason for the
+// rules of the pool, for the consensus rules a transaction can break and for
+// a fee above the maximum, and none for other errors.
+func TestRejectReason(t *testing.T) {
+	t.Parallel()
+
+	chainErr := func(code blockchain.ErrorCode) error {
+		return chainRuleError(blockchain.RuleError{ErrorCode: code})
+	}
+	script := "mandatory-script-verify-flag-failed (unknown error)"
+	scriptErr := func(code txscript.ErrorCode, desc string) error {
+		return chainRuleError(blockchain.RuleError{
+			ErrorCode: blockchain.ErrScriptValidation,
+			ScriptErr: txscript.Error{ErrorCode: code, Description: desc},
+		})
+	}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"pool rule", txRuleError(wire.RejectDuplicate,
+			"txn-mempool-conflict", "conflict"), "txn-mempool-conflict"},
+		{"bare pool rule", TxRuleError{Reason: "dust"}, "dust"},
+		{"fee above the maximum", RuleError{Err: HighFeeError{}},
+			"absurdly-high-fee"},
+		{"no inputs", chainErr(blockchain.ErrNoTxInputs),
+			"bad-txns-vin-empty"},
+		{"no outputs", chainErr(blockchain.ErrNoTxOutputs),
+			"bad-txns-vout-empty"},
+		{"too big", chainErr(blockchain.ErrTxTooBig), "bad-txns-oversize"},
+		{"too small", chainErr(blockchain.ErrTxTooSmall),
+			"bad-txns-undersize"},
+		{"version", chainErr(blockchain.ErrBadTxVersion),
+			"bad-txns-version"},
+		{"negative output", chainErr(blockchain.ErrTxOutValueNegative),
+			"bad-txns-vout-negative"},
+		{"output too large", chainErr(blockchain.ErrTxOutValueTooHigh),
+			"bad-txns-vout-toolarge"},
+		{"outputs too large", chainErr(blockchain.ErrTxOutTotalTooHigh),
+			"bad-txns-txouttotal-toolarge"},
+		{"input values", chainErr(blockchain.ErrTxInValueOutOfRange),
+			"bad-txns-inputvalues-outofrange"},
+		{"duplicate inputs", chainErr(blockchain.ErrDuplicateTxInputs),
+			"bad-txns-inputs-duplicate"},
+		{"null input", chainErr(blockchain.ErrBadTxInput),
+			"bad-txns-prevout-null"},
+		{"coinbase script", chainErr(blockchain.ErrBadCoinbaseScriptLen),
+			"bad-tx-coinbase"},
+		{"missing output", chainErr(blockchain.ErrMissingTxOut),
+			"bad-txns-inputs-missingorspent"},
+		{"spent output", chainErr(blockchain.ErrSpentTxOut),
+			"bad-txns-inputs-missingorspent"},
+		{"immature coinbase", chainErr(blockchain.ErrImmatureSpend),
+			"bad-txns-premature-spend-of-coinbase"},
+		{"outputs above the inputs", chainErr(blockchain.ErrSpendTooHigh),
+			"bad-txns-in-belowout"},
+		{"tokens", chainErr(blockchain.ErrCashTokensValidation),
+			"bad-txns-token-invalid"},
+		{"sigchecks", chainErr(blockchain.ErrTxTooManySigChecks),
+			"non-mandatory-script-verify-flag (Validation resources " +
+				"exceeded (SigChecks))"},
+		{"script malformed", chainErr(blockchain.ErrScriptMalformed),
+			script},
+		{"script failed", chainErr(blockchain.ErrScriptValidation),
+			script},
+		{"signature failed", scriptErr(txscript.ErrNullFail, "x"),
+			"mandatory-script-verify-flag-failed (Signature must be " +
+				"zero for failed CHECK(MULTI)SIG operation)"},
+		{"division by zero", scriptErr(txscript.ErrDivByZero,
+			"divide by zero"),
+			"mandatory-script-verify-flag-failed (Division by zero error)"},
+		{"no error of BCHN's", scriptErr(txscript.ErrInternal,
+			"internal error"),
+			"mandatory-script-verify-flag-failed (internal error)"},
+		{"bare consensus rule",
+			blockchain.RuleError{ErrorCode: blockchain.ErrSpendTooHigh},
+			"bad-txns-in-belowout"},
+		{"block rule", chainErr(blockchain.ErrBadFees), "rejected"},
+		{"other error", errors.New("database failure"), ""},
+		{"no error", nil, ""},
+	}
+	for _, test := range tests {
+		if got := RejectReason(test.err); got != test.want {
+			t.Errorf("%s: got %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// TestBlockRejectReason ensures rule errors are reported with Bitcoin Cash
+// Node's reason strings where it has one for the same check, that the reason
+// for a template that does not build on the tip uses the BIP22 spelling, and
+// that an old block version is given as BCHN gives it.
+func TestBlockRejectReason(t *testing.T) {
+	tests := []struct {
+		code blockchain.ErrorCode
+		want string
+	}{
+		{blockchain.ErrNoTransactions, "bad-cb-missing"},
+		{blockchain.ErrFirstTxNotCoinbase, "bad-cb-missing"},
+		{blockchain.ErrMultipleCoinbases, "bad-tx-coinbase"},
+		{blockchain.ErrNoTxInputs, "bad-txns-vin-empty"},
+		{blockchain.ErrNoTxOutputs, "bad-txns-vout-empty"},
+		{blockchain.ErrTxTooBig, "bad-txns-oversize"},
+		{blockchain.ErrTxTooSmall, "bad-txns-undersize"},
+		{blockchain.ErrDuplicateTxInputs, "bad-txns-inputs-duplicate"},
+		{blockchain.ErrBadTxInput, "bad-txns-prevout-null"},
+		{blockchain.ErrMissingTxOut, "bad-txns-inputs-missingorspent"},
+		{blockchain.ErrSpentTxOut, "bad-txns-inputs-missingorspent"},
+		{blockchain.ErrUnfinalizedTx, "bad-txns-nonfinal"},
+		{blockchain.ErrOverwriteTx, "bad-txns-BIP30"},
+		{blockchain.ErrImmatureSpend, "bad-txns-premature-spend-of-coinbase"},
+		{blockchain.ErrSpendTooHigh, "bad-txns-in-belowout"},
+		{blockchain.ErrBadCoinbaseValue, "bad-cb-amount"},
+		{blockchain.ErrBadFees, "bad-txns-accumulated-fee-outofrange"},
+		{blockchain.ErrTooManySigChecks, "blk-bad-inputs"},
+		{blockchain.ErrScriptMalformed, "blk-bad-inputs"},
+		{blockchain.ErrScriptValidation, "blk-bad-inputs"},
+		{blockchain.ErrInvalidTxOrder, "tx-ordering"},
+		{blockchain.ErrBadCheckpoint, "checkpoint mismatch"},
+		{blockchain.ErrForkTooOld, "bad-fork-prior-to-checkpoint"},
+		{blockchain.ErrForkBeforeFinalized, "bad-fork-prior-finalized"},
+		{blockchain.ErrTxTooManySigChecks, "blk-bad-inputs"},
+		{blockchain.ErrTxOutValueNegative, "bad-txns-vout-negative"},
+		{blockchain.ErrTxOutValueTooHigh, "bad-txns-vout-toolarge"},
+		{blockchain.ErrTxOutTotalTooHigh, "bad-txns-txouttotal-toolarge"},
+		{blockchain.ErrTxInValueOutOfRange, "bad-txns-inputvalues-outofrange"},
+		{blockchain.ErrPrevBlockNotBest, "inconclusive-not-best-prevblk"},
+	}
+	for _, test := range tests {
+		err := blockchain.RuleError{ErrorCode: test.code, Description: "x"}
+		if got := BlockRejectReason(err, 4); got != test.want {
+			t.Errorf("%v: got %q, want %q", test.code, got, test.want)
+		}
+	}
+
+	for version, want := range map[int32]string{
+		1:  "bad-version(0x00000001)",
+		3:  "bad-version(0x00000003)",
+		-1: "bad-version(0xffffffff)",
+	} {
+		err := blockchain.RuleError{ErrorCode: blockchain.ErrBlockVersionTooOld}
+		if got := BlockRejectReason(err, version); got != want {
+			t.Errorf("version %d: got %q, want %q", version, got, want)
+		}
+	}
+}
+
+// TestScriptErrorString ensures each script error code the script engine
+// returns for a failing script gets the text BCHN gives the error it stands
+// for, and the others their own text.
+func TestScriptErrorString(t *testing.T) {
+	t.Parallel()
+
+	der := "Non-canonical DER signature"
+	evalFalse := "Script evaluated without error but finished with a " +
+		"false/empty top stack element"
+	tests := []struct {
+		code txscript.ErrorCode
+		want string
+	}{
+		{txscript.ErrEarlyReturn, "OP_RETURN was encountered"},
+		{txscript.ErrEmptyStack, evalFalse},
+		{txscript.ErrEvalFalse, evalFalse},
+		{txscript.ErrScriptTooBig, "Script is too big"},
+		{txscript.ErrElementTooBig, "Push value size limit exceeded"},
+		{txscript.ErrTooManyOperations, "Operation limit exceeded"},
+		{txscript.ErrStackOverflow, "Stack size limit exceeded"},
+		{txscript.ErrInvalidPubKeyCount,
+			"Pubkey count negative or limit exceeded"},
+		{txscript.ErrInvalidSignatureCount,
+			"Signature count negative or greater than pubkey count"},
+		{txscript.ErrOpCost, "VM cost limit exceeded"},
+		{txscript.ErrTooManyHashIters, "Hash iteration limit exceeded"},
+		{txscript.ErrConditionalStackDepth,
+			"Conditional depth limit exceeded"},
+		{txscript.ErrControlStackDepth,
+			"Control stack depth limit exceeded"},
+		{txscript.ErrVerify, "Script failed an OP_VERIFY operation"},
+		{txscript.ErrEqualVerify,
+			"Script failed an OP_EQUALVERIFY operation"},
+		{txscript.ErrNumEqualVerify,
+			"Script failed an OP_NUMEQUALVERIFY operation"},
+		{txscript.ErrCheckSigVerify,
+			"Script failed an OP_CHECKSIGVERIFY operation"},
+		{txscript.ErrCheckMultiSigVerify,
+			"Script failed an OP_CHECKMULTISIGVERIFY operation"},
+		{txscript.ErrCheckDataSigVerify,
+			"Script failed an OP_CHECKDATASIGVERIFY operation"},
+		{txscript.ErrDisabledOpcode, "Attempted to use a disabled opcode"},
+		{txscript.ErrReservedOpcode, "Opcode missing or not understood"},
+		{txscript.ErrMalformedPush, "Opcode missing or not understood"},
+		{txscript.ErrInvalidStackOperation,
+			"Operation not valid with the current stack size"},
+		{txscript.ErrInvalidAltStackOperation,
+			"Operation not valid with the current altstack size"},
+		{txscript.ErrUnbalancedConditional, "Invalid OP_IF construction"},
+		{txscript.ErrUnbalancedControlFlow,
+			"Invalid control flow construction"},
+		{txscript.ErrInvalidInputLength, "Invalid operand size"},
+		{txscript.ErrMinimalData, "Data push larger than necessary"},
+		{txscript.ErrMinimalNumber, "Number encoding must be minimal"},
+		{txscript.ErrMinimalIf, "OP_IF/NOTIF argument must be minimal"},
+		{txscript.ErrNumberRange32Bit, "Given operand is not a number " +
+			"within the valid range [-2^31 + 1, 2^31 - 1]"},
+		{txscript.ErrNumberRange64Bit, "Given operand is not a number " +
+			"within the valid range [-2^63 + 1, 2^63 - 1]"},
+		{txscript.ErrNumberRangeBigInt, "Given operand is not a number " +
+			"within the valid range [-2^79,999 + 1, 2^79,999 - 1]"},
+		{txscript.ErrImpossibleEncoding,
+			"The requested encoding is impossible to satisfy"},
+		{txscript.ErrInvalidSplitRange, "Invalid OP_SPLIT range"},
+		{txscript.ErrDivByZero, "Division by zero error"},
+		{txscript.ErrModByZero, "Modulo by zero error"},
+		{txscript.ErrInvalidBitShift, "Given bit shift amount is negative"},
+		{txscript.ErrInvalidSigHashType,
+			"Signature hash type missing or not understood"},
+		{txscript.ErrIllegalForkID, "Illegal use of SIGHASH_FORKID"},
+		{txscript.ErrMustUseForkID, "Signature must use SIGHASH_FORKID"},
+		{txscript.ErrSigTooShort, der},
+		{txscript.ErrSigTooLong, der},
+		{txscript.ErrSigInvalidSeqID, der},
+		{txscript.ErrSigInvalidDataLen, der},
+		{txscript.ErrSigMissingSTypeID, der},
+		{txscript.ErrSigMissingSLen, der},
+		{txscript.ErrSigInvalidSLen, der},
+		{txscript.ErrSigInvalidRIntID, der},
+		{txscript.ErrSigZeroRLen, der},
+		{txscript.ErrSigNegativeR, der},
+		{txscript.ErrSigTooMuchRPadding, der},
+		{txscript.ErrSigInvalidSIntID, der},
+		{txscript.ErrSigZeroSLen, der},
+		{txscript.ErrSigNegativeS, der},
+		{txscript.ErrSigTooMuchSPadding, der},
+		{txscript.ErrSigHighS,
+			"Non-canonical signature: S value is unnecessarily high"},
+		{txscript.ErrSigBadLength,
+			"Signature cannot be 65 bytes in CHECKMULTISIG"},
+		{txscript.ErrSigNonSchnorr,
+			"Only Schnorr signatures allowed in this operation"},
+		{txscript.ErrNotPushOnly,
+			"Only push operators allowed in signatures"},
+		{txscript.ErrPubKeyType,
+			"Public key is neither compressed or uncompressed"},
+		{txscript.ErrCleanStack,
+			"Extra items left on stack after execution"},
+		{txscript.ErrNullFail, "Signature must be zero for failed " +
+			"CHECK(MULTI)SIG operation"},
+		{txscript.ErrDiscourageUpgradableNOPs,
+			"NOPx reserved for soft-fork upgrades"},
+		{txscript.ErrNegativeLockTime, "Negative locktime"},
+		{txscript.ErrUnsatisfiedLockTime,
+			"Locktime requirement not satisfied"},
+		{txscript.ErrInvalidDummy, "Bitfield of unexpected size error"},
+		{txscript.ErrInvalidBitCount,
+			"Invalid number of bit set in OP_CHECKMULTISIG"},
+		{txscript.ErrInvalidBitRange,
+			"Bitfield's bit out of the expected range"},
+		{txscript.ErrInputSigChecks, "Input SigChecks limit exceeded"},
+		{txscript.ErrInvalidTxInputIndex,
+			"The specified transaction input index is out of range"},
+		{txscript.ErrInvalidTxOutputIndex,
+			"The specified transaction output index is out of range"},
+		{txscript.ErrInvalidFunctionIdentifier, "Function identifier is " +
+			"not within the valid range [0, 999]"},
+		{txscript.ErrFunctionAlreadyDefined, "Redefinition of an existing " +
+			"function with the same identifier is disallowed"},
+		{txscript.ErrUndefinedFunction,
+			"Attempted to invoke an undefined function"},
+
+		// Codes the engine no longer returns for a failing script, or
+		// that stand for no error of BCHN's.
+		{txscript.ErrNumberTooBig, "own text"},
+		{txscript.ErrNumberTooSmall, "own text"},
+		{txscript.ErrIntegerOverflow, "own text"},
+		{txscript.ErrInvalidIndex, "own text"},
+		{txscript.ErrSigNullDummy, "own text"},
+		{txscript.ErrInternal, "own text"},
+	}
+	for _, test := range tests {
+		err := txscript.Error{ErrorCode: test.code, Description: "own text"}
+		if got := scriptErrorString(err); got != test.want {
+			t.Errorf("%v: got %q, want %q", test.code, got, test.want)
+		}
+	}
+	if got := scriptErrorString(nil); got != "unknown error" {
+		t.Errorf("no error: got %q, want %q", got, "unknown error")
+	}
+	if got := scriptErrorString(errors.New("x")); got != "x" {
+		t.Errorf("other error: got %q, want %q", got, "x")
+	}
+}
+
+// TestPoolRejectCodes ensures the pool reports a transaction below the
+// minimum size, one with a version outside the consensus range and one above
+// its sigchecks limit as nonstandard, as BCHN's memory pool does, while a
+// block holding one is still invalid, and that other consensus failures are
+// invalid in both.
+func TestPoolRejectCodes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		code blockchain.ErrorCode
+		pool wire.RejectCode
+	}{
+		{blockchain.ErrTxTooSmall, wire.RejectNonstandard},
+		{blockchain.ErrBadTxVersion, wire.RejectNonstandard},
+		{blockchain.ErrTxTooManySigChecks, wire.RejectNonstandard},
+		{blockchain.ErrTxTooBig, wire.RejectInvalid},
+		{blockchain.ErrScriptValidation, wire.RejectInvalid},
+	}
+	for _, test := range tests {
+		cerr := blockchain.RuleError{ErrorCode: test.code, Description: "desc"}
+		code, desc := ErrToRejectErr(chainRuleError(cerr))
+		if code != test.pool || desc != "desc" {
+			t.Errorf("%v in the pool: got %v %q, want %v %q", test.code,
+				code, desc, test.pool, "desc")
+		}
+		if code, _ := ErrToRejectErr(cerr); code != wire.RejectInvalid {
+			t.Errorf("%v in a block: got %v, want %v", test.code, code,
+				wire.RejectInvalid)
+		}
+	}
+}
+
+// TestPoolRejectReasons ensures the pool gives BCHN's reason for a spend of
+// a nonstandard output, and its own for an orphan too large to keep.
+func TestPoolRejectReasons(t *testing.T) {
+	t.Parallel()
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+
+	// An output whose script is longer than a standard one.
+	prev := wire.NewMsgTx(1)
+	prev.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{1}}})
+	prev.AddTxOut(wire.NewTxOut(100000, bytes.Repeat([]byte{txscript.OP_1},
+		maxStandardP2SScriptSize+1), wire.TokenData{}))
+	harness.chain.utxos.AddTxOuts(bchutil.NewTx(prev),
+		harness.chain.BestHeight())
+	spend := wire.NewMsgTx(1)
+	spend.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash()},
+		Sequence:         wire.MaxTxInSequenceNum,
+	})
+	spend.AddTxOut(wire.NewTxOut(99000, harness.payScript, wire.TokenData{}))
+	_, err = harness.txPool.ProcessTransaction(bchutil.NewTx(spend), false, 0)
+	if reason := RejectReason(err); reason != "bad-txns-nonstandard-inputs" {
+		t.Errorf("nonstandard input: got reason %q, error %v", reason, err)
+	}
+
+	// An orphan above the maximum orphan size.
+	orphan := wire.NewMsgTx(1)
+	orphan.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{2}},
+		Sequence:         wire.MaxTxInSequenceNum,
+	})
+	for range 40 {
+		orphan.AddTxOut(wire.NewTxOut(1000, harness.payScript,
+			wire.TokenData{}))
+	}
+	_, err = harness.txPool.ProcessTransaction(bchutil.NewTx(orphan), true, 0)
+	if reason := RejectReason(err); reason != "orphan-tx-size" {
+		t.Errorf("large orphan: got reason %q, error %v", reason, err)
+	}
+
+	// A pay to script hash 32 output before tokens.
+	hash32 := bytes.Repeat([]byte{0x11}, 32)
+	p2sh32, err := txscript.NewScriptBuilder().AddOp(txscript.OP_HASH256).
+		AddData(hash32).AddOp(txscript.OP_EQUAL).Script()
+	if err != nil {
+		t.Fatalf("unable to build script: %v", err)
+	}
+	prev.TxOut[0].PkScript = p2sh32
+	view := blockchain.NewUtxoViewpoint()
+	view.AddTxOuts(bchutil.NewTx(prev), 1)
+	spend.TxIn[0].PreviousOutPoint.Hash = prev.TxHash()
+	err = checkInputsStandard(bchutil.NewTx(spend), view, 0)
+	if reason := RejectReason(err); reason != "bad-txns-nonstandard-inputs" {
+		t.Errorf("pay to script hash 32: got reason %q, error %v", reason,
+			err)
+	}
+}
+
+// TestPoolScriptFailures ensures the pool tells an input script that fails
+// only standard flags BCHN does not count as mandatory from one that fails
+// without them, as BCHN does: the first is refused with code 64 and a
+// non-mandatory reason naming its failure, the second with code 16 and a
+// mandatory reason naming its failure without those flags.
+func TestPoolScriptFailures(t *testing.T) {
+	t.Parallel()
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	script := func(b *txscript.ScriptBuilder) []byte {
+		s, err := b.Script()
+		if err != nil {
+			t.Fatalf("unable to build script: %v", err)
+		}
+		return s
+	}
+
+	// Three signature checks for a signature script of 62 bytes, which
+	// allows two, with an operation cost within its limit.
+	msgHash := sha256.Sum256([]byte{1})
+	sig, err := harness.signKey.SignSchnorr(msgHash[:])
+	if err != nil {
+		t.Fatalf("unable to sign: %v", err)
+	}
+	pubKey := harness.signKey.PubKey().SerializeCompressed()
+	sigChecks := script(txscript.NewScriptBuilder().AddOp(txscript.OP_DROP).
+		AddData(sig.Serialize()).AddOp(txscript.OP_1).AddData(pubKey).
+		AddOp(txscript.OP_3DUP).AddOp(txscript.OP_3DUP).
+		AddOp(txscript.OP_CHECKDATASIGVERIFY).
+		AddOp(txscript.OP_CHECKDATASIGVERIFY).
+		AddOp(txscript.OP_CHECKDATASIG))
+	sigChecksSig := script(txscript.NewScriptBuilder().
+		AddData(make([]byte, 61)))
+
+	// A pay to script hash output whose redeem script is a segwit program
+	// leaving a false item on the stack, which only the segwit recovery
+	// exemption lets pass.
+	redeem := append([]byte{txscript.OP_0, txscript.OP_DATA_20},
+		make([]byte, 20)...)
+	p2sh := script(txscript.NewScriptBuilder().AddOp(txscript.OP_HASH160).
+		AddData(bchutil.Hash160(redeem)).AddOp(txscript.OP_EQUAL))
+	redeemSig := script(txscript.NewScriptBuilder().AddData(redeem))
+
+	// 21 hash iterations, one more than the standard limit of an empty
+	// signature script allows and fewer than the consensus limit.
+	hashes := append([]byte{txscript.OP_1},
+		bytes.Repeat([]byte{txscript.OP_SHA256}, 21)...)
+
+	// highS returns the signature script of input 1 of tx, which spends a
+	// pay to pubkey hash output of the harness key holding amount, whose
+	// ECDSA signature has its S value replaced by N - S, which only the low
+	// S rule refuses.
+	highS := func(tx *wire.MsgTx, amount int64) []byte {
+		raw, err := txscript.RawTxInECDSASignature(tx, 1, harness.payScript,
+			txscript.SigHashAll, harness.signKey, amount)
+		if err != nil {
+			t.Fatalf("unable to sign: %v", err)
+		}
+		sig, err := bchec.ParseDERSignature(raw[:len(raw)-1], bchec.S256())
+		if err != nil {
+			t.Fatalf("unable to parse signature: %v", err)
+		}
+		integer := func(n *big.Int) []byte {
+			b := n.Bytes()
+			if b[0]&0x80 != 0 {
+				b = append([]byte{0}, b...)
+			}
+			return append([]byte{0x02, byte(len(b))}, b...)
+		}
+		body := append(integer(sig.R),
+			integer(new(big.Int).Sub(bchec.S256().N, sig.S))...)
+		der := append([]byte{0x30, byte(len(body))}, body...)
+		return script(txscript.NewScriptBuilder().
+			AddData(append(der, raw[len(raw)-1])).AddData(pubKey))
+	}
+
+	lockTime := script(txscript.NewScriptBuilder().AddInt64(500000).
+		AddOp(txscript.OP_CHECKLOCKTIMEVERIFY).AddOp(txscript.OP_DROP).
+		AddOp(txscript.OP_TRUE))
+	sequence := script(txscript.NewScriptBuilder().AddInt64(10).
+		AddOp(txscript.OP_CHECKSEQUENCEVERIFY).AddOp(txscript.OP_DROP).
+		AddOp(txscript.OP_TRUE))
+
+	nonMandatory := func(s string) string {
+		return "non-mandatory-script-verify-flag (" + s + ")"
+	}
+	mandatory := func(s string) string {
+		return "mandatory-script-verify-flag-failed (" + s + ")"
+	}
+	evalFalse := "Script evaluated without error but finished with a " +
+		"false/empty top stack element"
+	tests := []struct {
+		name         string
+		pkScript     []byte
+		sigScript    []byte
+		acceptNonStd bool
+		code         wire.RejectCode
+		reason       string
+		desc         string
+	}{
+		{"upgradable nop", []byte{txscript.OP_NOP10, txscript.OP_TRUE},
+			nil, false, wire.RejectNonstandard,
+			nonMandatory("NOPx reserved for soft-fork upgrades"),
+			"OP_NOP10 reserved for soft-fork upgrades"},
+		{"clean stack", []byte{txscript.OP_TRUE}, []byte{txscript.OP_TRUE},
+			false, wire.RejectNonstandard,
+			nonMandatory("Extra items left on stack after execution"),
+			"stack contains 1 unexpected items"},
+		{"lock time", lockTime, nil, false, wire.RejectNonstandard,
+			nonMandatory("Locktime requirement not satisfied"),
+			"locktime requirement not satisfied"},
+		{"sequence lock", sequence, nil, false, wire.RejectNonstandard,
+			nonMandatory("Locktime requirement not satisfied"),
+			"invalid transaction version: 1"},
+		{"signature script not push only", []byte{txscript.OP_TRUE},
+			[]byte{txscript.OP_TRUE, txscript.OP_DROP}, true,
+			wire.RejectNonstandard,
+			nonMandatory("Only push operators allowed in signatures"),
+			"failed to parse input"},
+		{"signature density", sigChecks, sigChecksSig, false,
+			wire.RejectNonstandard,
+			nonMandatory("Input SigChecks limit exceeded"),
+			"script exceeds maximum signature density"},
+		{"segwit recovery", p2sh, redeemSig, false, wire.RejectNonstandard,
+			nonMandatory(evalFalse),
+			"false stack entry at end of script execution"},
+		{"false result", []byte{txscript.OP_FALSE}, nil, false,
+			wire.RejectInvalid, mandatory(evalFalse),
+			"false stack entry at end of script execution"},
+		{"upgradable nop and false result",
+			[]byte{txscript.OP_NOP10, txscript.OP_FALSE}, nil, false,
+			wire.RejectInvalid, mandatory(evalFalse),
+			"false stack entry at end of script execution"},
+		{"standard hash costing", hashes, nil, false, wire.RejectInvalid,
+			mandatory("Hash iteration limit exceeded"),
+			"hash iteration limit exceeded"},
+		{"high S", harness.payScript, nil, false, wire.RejectInvalid,
+			mandatory("Non-canonical signature: S value is " +
+				"unnecessarily high"),
+			"signature is not canonical due to unnecessarily high S " +
+				"value"},
+	}
+	for i, test := range tests {
+		// The script of the first input passes, so the second one is
+		// the one that fails.
+		prev := wire.NewMsgTx(1)
+		prev.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+			Hash: chainhash.Hash{byte(i + 1)}, Index: 7}})
+		prev.AddTxOut(wire.NewTxOut(1000, []byte{txscript.OP_TRUE},
+			wire.TokenData{}))
+		prev.AddTxOut(wire.NewTxOut(100000, test.pkScript,
+			wire.TokenData{}))
+		harness.chain.utxos.AddTxOuts(bchutil.NewTx(prev),
+			harness.chain.BestHeight())
+		spend := wire.NewMsgTx(1)
+		spend.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash()},
+		})
+		spend.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash(), Index: 1},
+			SignatureScript:  test.sigScript,
+		})
+		spend.AddTxOut(wire.NewTxOut(99000, harness.payScript,
+			wire.TokenData{}))
+		// The spend of the harness key's output is signed.
+		if bytes.Equal(test.pkScript, harness.payScript) {
+			spend.TxIn[1].SignatureScript = highS(spend, 100000)
+		}
+
+		harness.txPool.cfg.Policy.AcceptNonStd = test.acceptNonStd
+		_, err := harness.txPool.ProcessTransaction(bchutil.NewTx(spend),
+			false, 0)
+		code, desc := ErrToRejectErr(err)
+		if code != test.code || !strings.Contains(desc, test.desc) {
+			t.Errorf("%s: got %v %q, want %v and %q", test.name, code,
+				desc, test.code, test.desc)
+		}
+		if reason := RejectReason(err); reason != test.reason {
+			t.Errorf("%s: got reason %q, want %q", test.name, reason,
+				test.reason)
+		}
+
+		// A failure without the standard flags is still a script
+		// failure for code that looks at the chain error.
+		ruleErr, _ := err.(RuleError)
+		chainErr, ok := ruleErr.Err.(blockchain.RuleError)
+		failed := ok && chainErr.ErrorCode == blockchain.ErrScriptValidation
+		if failed != (test.code == wire.RejectInvalid) {
+			t.Errorf("%s: got error %#v", test.name, ruleErr.Err)
+		}
+	}
+}
+
+// TestPoolScriptErrorReasons ensures the pool names the script error BCHN
+// names for a failing input script, for failures txscript used to report
+// with a code shared with other errors, or after a different check.
+func TestPoolScriptErrorReasons(t *testing.T) {
+	t.Parallel()
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	script := func(b *txscript.ScriptBuilder) []byte {
+		s, err := b.Script()
+		if err != nil {
+			t.Fatalf("unable to build script: %v", err)
+		}
+		return s
+	}
+	pushes := func(data ...[]byte) []byte {
+		b := txscript.NewScriptBuilder()
+		for _, d := range data {
+			b.AddData(d)
+		}
+		return script(b)
+	}
+	pubKey := harness.signKey.PubKey().SerializeCompressed()
+
+	// sigWithHashType returns a DER signature by the harness key whose hash
+	// type byte is replaced, for the spend of input 1 of tx paying to the
+	// harness key.
+	sigWithHashType := func(tx *wire.MsgTx, hashType byte) []byte {
+		raw, err := txscript.RawTxInECDSASignature(tx, 1, harness.payScript,
+			txscript.SigHashAll, harness.signKey, 100000)
+		if err != nil {
+			t.Fatalf("unable to sign: %v", err)
+		}
+		raw[len(raw)-1] = hashType
+		return raw
+	}
+	multisig := func(sigs int) []byte {
+		return script(txscript.NewScriptBuilder().AddInt64(int64(sigs)).
+			AddData(pubKey).AddOp(txscript.OP_1).
+			AddOp(txscript.OP_CHECKMULTISIG))
+	}
+	schnorrSize := append(bytes.Repeat([]byte{1}, 64), 0x41)
+	redeem := []byte{txscript.OP_TRUE}
+	p2sh := script(txscript.NewScriptBuilder().AddOp(txscript.OP_HASH160).
+		AddData(bchutil.Hash160(redeem)).AddOp(txscript.OP_EQUAL))
+
+	mandatory := func(s string) string {
+		return "mandatory-script-verify-flag-failed (" + s + ")"
+	}
+	tests := []struct {
+		name         string
+		pkScript     []byte
+		sigScript    []byte
+		sign         byte // a hash type to sign the input with, or 0
+		acceptNonStd bool
+		reason       string
+	}{
+		{"push size", []byte{txscript.OP_DUP, txscript.OP_CAT},
+			pushes(make([]byte, 5001)), 0, false,
+			mandatory("Push value size limit exceeded")},
+		{"stack position over 8 bytes",
+			[]byte{txscript.OP_PICK}, pushes([]byte{1},
+				[]byte{1, 0, 0, 0, 0, 0, 0, 0, 1}), 0, false,
+			mandatory("Given operand is not a number within the " +
+				"valid range [-2^63 + 1, 2^63 - 1]")},
+		{"number not minimal", []byte{txscript.OP_1ADD},
+			pushes([]byte{1, 0}), 0, false,
+			mandatory("Number encoding must be minimal")},
+		{"push not minimal", []byte{txscript.OP_TRUE},
+			[]byte{txscript.OP_PUSHDATA1, 1, 5}, 0, false,
+			mandatory("Data push larger than necessary")},
+		{"stack size before the number", []byte{txscript.OP_ADD},
+			pushes([]byte{1, 0}), 0, false,
+			mandatory("Operation not valid with the current stack size")},
+		{"stack size before the position", []byte{txscript.OP_PICK},
+			pushes([]byte{1, 0}), 0, false,
+			mandatory("Operation not valid with the current stack size")},
+		{"empty alternate stack", []byte{txscript.OP_FROMALTSTACK}, nil, 0,
+			false, mandatory("Operation not valid with the current " +
+				"altstack size")},
+		{"conditional without an item",
+			[]byte{txscript.OP_IF, txscript.OP_ENDIF, txscript.OP_TRUE},
+			nil, 0, false, mandatory("Invalid OP_IF construction")},
+		{"control stack depth", bytes.Repeat([]byte{txscript.OP_IF}, 101),
+			bytes.Repeat([]byte{txscript.OP_1}, 101), 0, false,
+			mandatory("Control stack depth limit exceeded")},
+		{"split range", []byte{txscript.OP_SPLIT},
+			pushes([]byte{1, 2}, []byte{3}), 0, false,
+			mandatory("Invalid OP_SPLIT range")},
+		{"impossible encoding", []byte{txscript.OP_NUM2BIN},
+			pushes([]byte{1, 2}, []byte{1}), 0, false,
+			mandatory("The requested encoding is impossible to satisfy")},
+		{"division by zero", []byte{txscript.OP_DIV},
+			pushes([]byte{1}, nil), 0, false,
+			mandatory("Division by zero error")},
+		{"modulo by zero", []byte{txscript.OP_MOD},
+			pushes([]byte{1}, nil), 0, false,
+			mandatory("Modulo by zero error")},
+		{"negative shift", []byte{txscript.OP_LSHIFTNUM},
+			pushes([]byte{1}, []byte{0x81}), 0, false,
+			mandatory("Given bit shift amount is negative")},
+		{"input index", []byte{txscript.OP_5, txscript.OP_UTXOVALUE},
+			nil, 0, false, mandatory("The specified transaction input " +
+				"index is out of range")},
+		{"output index", []byte{txscript.OP_5, txscript.OP_OUTPUTVALUE},
+			nil, 0, false, mandatory("The specified transaction output " +
+				"index is out of range")},
+		{"hash type without fork id", harness.payScript, nil, 0x01, false,
+			mandatory("Signature must use SIGHASH_FORKID")},
+		{"undefined hash type", harness.payScript, nil, 0x44, false,
+			mandatory("Signature hash type missing or not understood")},
+		{"undefined hash type without fork id", harness.payScript, nil,
+			0x04, false, mandatory("Signature hash type missing or not " +
+				"understood")},
+		{"schnorr multisig signature size", multisig(1),
+			pushes([]byte{1}, make([]byte, 71)), 0, false,
+			mandatory("Only Schnorr signatures allowed in this operation")},
+		{"ecdsa multisig signature size", multisig(1),
+			pushes(nil, schnorrSize), 0, false,
+			mandatory("Signature cannot be 65 bytes in CHECKMULTISIG")},
+		{"bitfield range", multisig(1), pushes([]byte{2}, schnorrSize), 0,
+			false, mandatory("Bitfield's bit out of the expected range")},
+		{"bitfield range before count", multisig(1),
+			pushes([]byte{3}, schnorrSize), 0, false,
+			mandatory("Bitfield's bit out of the expected range")},
+		{"bitfield count", multisig(0), pushes([]byte{1}), 0, false,
+			mandatory("Invalid number of bit set in OP_CHECKMULTISIG")},
+		{"pay to script hash push only after the scripts", p2sh,
+			append([]byte{txscript.OP_0, txscript.OP_VERIFY},
+				pushes(redeem)...), 0, true,
+			mandatory("Script failed an OP_VERIFY operation")},
+	}
+	for i, test := range tests {
+		// The script of the first input passes, so the second one is
+		// the one that fails.
+		prev := wire.NewMsgTx(1)
+		prev.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+			Hash: chainhash.Hash{byte(i + 1), 0x5e}, Index: 7}})
+		prev.AddTxOut(wire.NewTxOut(1000, []byte{txscript.OP_TRUE},
+			wire.TokenData{}))
+		prev.AddTxOut(wire.NewTxOut(100000, test.pkScript,
+			wire.TokenData{}))
+		harness.chain.utxos.AddTxOuts(bchutil.NewTx(prev),
+			harness.chain.BestHeight())
+		spend := wire.NewMsgTx(1)
+		spend.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash()},
+		})
+		spend.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash(), Index: 1},
+			SignatureScript:  test.sigScript,
+		})
+		spend.AddTxOut(wire.NewTxOut(90000, harness.payScript,
+			wire.TokenData{}))
+		if test.sign != 0 {
+			spend.TxIn[1].SignatureScript = pushes(
+				sigWithHashType(spend, test.sign), pubKey)
+		}
+
+		harness.txPool.cfg.Policy.AcceptNonStd = test.acceptNonStd
+		_, err := harness.txPool.ProcessTransaction(bchutil.NewTx(spend),
+			false, 0)
+		if reason := RejectReason(err); reason != test.reason {
+			t.Errorf("%s: got reason %q, want %q (error %v)", test.name,
+				reason, test.reason, err)
+		}
+	}
+}
+
+// TestPoolTxVersionRule ensures the pool applies the consensus transaction
+// version rule from the first block it is active in, before the inputs and
+// scripts, also when nonstandard transactions are accepted, and refuses a
+// transaction that breaks it with code 64 and bad-txns-version, as BCHN's
+// contextual checks do.  Without nonstandard transactions the standardness
+// check refuses such a version first, as before.
+func TestPoolTxVersionRule(t *testing.T) {
+	t.Parallel()
+
+	// At this best height the next block is the first the rule applies to.
+	active := chaincfg.MainNetParams.Upgrade9ForkHeight
+	tests := []struct {
+		name         string
+		version      int32
+		bestHeight   int32
+		acceptNonStd bool
+		orphan       bool
+		reason       string // empty when the transaction is accepted
+		desc         string
+	}{
+		{"version 3", 3, active, true, false, "bad-txns-version",
+			"has version 3 which is not in the valid range of 1-2"},
+		{"version 0", 0, active, true, false, "bad-txns-version",
+			"has version 0 which is not in the valid range of 1-2"},
+		{"negative version", -1, active, true, false, "bad-txns-version",
+			"has version -1 which is not in the valid range of 1-2"},
+		{"version 3 orphan", 3, active, true, true, "bad-txns-version",
+			"has version 3 which is not in the valid range of 1-2"},
+		{"version 1", 1, active, true, false, "", ""},
+		{"version 2", 2, active, true, false, "", ""},
+		{"version 3 before the rule", 3, active - 1, true, false, "", ""},
+		{"version 3 standard only", 3, active, false, false, "version",
+			"transaction version 3 is not in the valid range of 1-2"},
+	}
+	for _, test := range tests {
+		harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+		if err != nil {
+			t.Fatalf("unable to create test pool: %v", err)
+		}
+		harness.txPool.cfg.Policy.AcceptNonStd = test.acceptNonStd
+		harness.txPool.cfg.Policy.MaxTxVersion = 2
+		harness.chain.SetHeight(test.bestHeight)
+
+		out := outputs[0]
+		if test.orphan {
+			out.outPoint.Hash = chainhash.Hash{1}
+		}
+		tx := wire.NewMsgTx(test.version)
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: out.outPoint,
+			Sequence:         wire.MaxTxInSequenceNum,
+		})
+		tx.AddTxOut(wire.NewTxOut(int64(out.amount)-1000,
+			harness.payScript, wire.TokenData{}))
+		sigScript, err := txscript.SignatureScript(tx, 0,
+			int64(out.amount), harness.payScript, txscript.SigHashAll,
+			harness.signKey, true)
+		if err != nil {
+			t.Fatalf("unable to sign: %v", err)
+		}
+		tx.TxIn[0].SignatureScript = sigScript
+
+		btx := bchutil.NewTx(tx)
+		_, err = harness.txPool.ProcessTransaction(btx, true, 0)
+		if test.reason == "" {
+			if err != nil {
+				t.Errorf("%s: refused: %v", test.name, err)
+			}
+			continue
+		}
+		code, desc := ErrToRejectErr(err)
+		if code != wire.RejectNonstandard || !strings.Contains(desc,
+			test.desc) {
+
+			t.Errorf("%s: got %v %q, want %v and %q", test.name, code,
+				desc, wire.RejectNonstandard, test.desc)
+		}
+		if reason := RejectReason(err); reason != test.reason {
+			t.Errorf("%s: got reason %q, want %q", test.name, reason,
+				test.reason)
+		}
+		if harness.txPool.HaveTransaction(btx.Hash()) {
+			t.Errorf("%s: refused transaction kept", test.name)
+		}
+
+		// Code that looks at the chain error finds the consensus rule.
+		ruleErr, _ := err.(RuleError)
+		chainErr, ok := ruleErr.Err.(blockchain.RuleError)
+		consensus := ok && chainErr.ErrorCode == blockchain.ErrBadTxVersion
+		if consensus != (test.reason == "bad-txns-version") {
+			t.Errorf("%s: got error %#v", test.name, ruleErr.Err)
+		}
+	}
+}
+
+// TestRefusedTxSigHashes ensures the transactions the pool refuses because
+// their scripts fail leave at most the hash cache's maximum number of entries
+// behind, however many there are.
+func TestRefusedTxSigHashes(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	const maxEntries = 5
+	hashCache := txscript.NewHashCache(maxEntries)
+	harness.txPool.cfg.HashCache = hashCache
+
+	// Spends of the output that pay less than they sign for, so their
+	// signatures fail.
+	refused := make([]*bchutil.Tx, 4*maxEntries)
+	for i := range refused {
+		signed, err := harness.CreateTxChain(outputs[0], 1)
+		if err != nil {
+			t.Fatalf("unable to create signed tx: %v", err)
+		}
+		msgTx := signed[0].MsgTx()
+		msgTx.TxOut[0].Value -= int64(i + 1)
+		refused[i] = bchutil.NewTx(msgTx)
+		_, err = harness.txPool.ProcessTransaction(refused[i], false, 0)
+		ruleErr, _ := err.(RuleError)
+		chainErr, ok := ruleErr.Err.(blockchain.RuleError)
+		if !ok || chainErr.ErrorCode != blockchain.ErrScriptValidation {
+			t.Fatalf("tx %d: got error %v, want a script failure", i,
+				err)
+		}
+	}
+
+	cached := 0
+	for _, tx := range refused {
+		if hashCache.ContainsHashes(tx.Hash()) {
+			cached++
+		}
+	}
+	if cached > maxEntries {
+		t.Fatalf("%d of the %d refused transactions are in the hash "+
+			"cache, at most %d fit", cached, len(refused), maxEntries)
+	}
+}
+
+// TestDecodeCompressedBlockPrefilledIndexes ensures DecodeCompressedBlock
+// rejects compact blocks whose prefilled transaction indexes or transaction
+// counts do not describe a valid block layout, and that well-formed compact
+// blocks still reconstruct the original block.
+func TestDecodeCompressedBlockPrefilledIndexes(t *testing.T) {
+	t.Parallel()
+
+	harness, spendableOutputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	txs, err := harness.CreateTxChain(spendableOutputs[0], 6)
+	if err != nil {
+		t.Fatalf("unable to create test txs: %v", err)
+	}
+	originalBlock := wire.NewMsgBlock(&wire.BlockHeader{Version: 1, Bits: 1})
+	for _, tx := range txs {
+		originalBlock.Transactions = append(originalBlock.Transactions,
+			tx.MsgTx())
+		harness.txPool.pool[*tx.Hash()] = &TxDesc{
+			TxDesc: mining.TxDesc{Tx: tx},
+		}
+	}
+	targetHash := originalBlock.BlockHash()
+
+	// decode runs DecodeCompressedBlock and converts a panic into an error so
+	// that every case is reported.
+	decode := func(msg *wire.MsgCmpctBlock) (block *wire.MsgBlock, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return harness.txPool.DecodeCompressedBlock(msg)
+	}
+
+	// Well-formed compact blocks built from the original block with
+	// different sets of prefilled transactions must decode to the same
+	// block.
+	validTests := []struct {
+		name      string
+		prefilled func(i int) bool
+	}{
+		{"all short ids", func(i int) bool { return false }},
+		{"all prefilled", func(i int) bool { return true }},
+		{"first prefilled", func(i int) bool { return i == 0 }},
+		{"last prefilled", func(i int) bool { return i == len(txs)-1 }},
+		{"alternating", func(i int) bool { return i%2 == 1 }},
+		{"middle run", func(i int) bool { return i >= 2 && i <= 3 }},
+	}
+	for _, test := range validTests {
+		knownInventory := make(map[chainhash.Hash]bool)
+		for i, tx := range originalBlock.Transactions {
+			if !test.prefilled(i) {
+				knownInventory[tx.TxHash()] = true
+			}
+		}
+		cmpctBlock, err := wire.NewMsgCmpctBlockFromBlock(originalBlock,
+			knownInventory)
+		if err != nil {
+			t.Fatalf("%s: unable to create cmpctblock: %v", test.name, err)
+		}
+		decoded, err := decode(cmpctBlock)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", test.name, err)
+			continue
+		}
+		if len(decoded.Transactions) != len(originalBlock.Transactions) {
+			t.Errorf("%s: decoded %d txs, want %d", test.name,
+				len(decoded.Transactions), len(originalBlock.Transactions))
+			continue
+		}
+		for i, tx := range decoded.Transactions {
+			want := originalBlock.Transactions[i].TxHash()
+			if tx == nil || tx.TxHash() != want {
+				t.Errorf("%s: decoded tx %d does not match the "+
+					"original", test.name, i)
+			}
+		}
+		if decodedHash := decoded.BlockHash(); decodedHash != targetHash {
+			t.Errorf("%s: decoded block hash %v, want %v", test.name,
+				decodedHash, targetHash)
+		}
+	}
+
+	// Compact blocks with inconsistent prefilled indexes or transaction
+	// counts must be rejected with an error.  Prefilled indexes are
+	// differentially encoded, so each index is relative to the position
+	// after the previous prefilled transaction.
+	tx := txs[0].MsgTx()
+	prefilled := func(indexes ...uint32) []*wire.PrefilledTx {
+		ptxs := make([]*wire.PrefilledTx, 0, len(indexes))
+		for _, index := range indexes {
+			ptxs = append(ptxs, &wire.PrefilledTx{Index: index, Tx: tx})
+		}
+		return ptxs
+	}
+	invalidTests := []struct {
+		name        string
+		prefilled   []*wire.PrefilledTx
+		numShortIDs int
+	}{
+		{"empty block", nil, 0},
+		{"first index past the end", prefilled(5), 0},
+		{"later index past the end", prefilled(0, 3), 1},
+		{"prefilled positions exceed tx count", prefilled(0, 1, 0), 0},
+		{"too few short ids before prefilled tx", prefilled(2), 1},
+		{"too few short ids between prefilled txs", prefilled(0, 2, 0), 1},
+		{"duplicate position after 32-bit wrap", prefilled(0, 0xffffffff), 1},
+		{"first index at 32-bit maximum", prefilled(0xffffffff), 1},
+		{"differential index overflows 32 bits",
+			prefilled(0xffffffff, 0xffffffff), 1},
+		{"nil prefilled tx", []*wire.PrefilledTx{{Index: 0}}, 1},
+		{"empty prefilled tx",
+			[]*wire.PrefilledTx{{Index: 0, Tx: wire.NewMsgTx(1)}}, 1},
+		{"tx count above limit", prefilled(0), int(maxCompactBlockTxs())},
+	}
+	for _, test := range invalidTests {
+		msg := &wire.MsgCmpctBlock{
+			Header:       wire.BlockHeader{Version: 1, Bits: 1},
+			PrefilledTxs: test.prefilled,
+		}
+		for i := 0; i < test.numShortIDs; i++ {
+			msg.ShortIDs = append(msg.ShortIDs, [wire.ShortIDSize]byte{
+				byte(i), byte(i >> 8), byte(i >> 16), 0xff, 0xff, 0xff,
+			})
+		}
+		_, err := decode(msg)
+		if err == nil || strings.HasPrefix(err.Error(), "panic") {
+			t.Errorf("%s: expected an error, got %v", test.name, err)
+		}
+	}
+}
+
+// TestOrphanAfterInvalidOrphan ensures an orphan is accepted when its parent
+// arrives even if another orphan spending the same output turns out invalid,
+// so a junk orphan cannot hold back a valid one until it expires.  Orphans
+// spending an output are tried in no fixed order, so this repeats.
+func TestOrphanAfterInvalidOrphan(t *testing.T) {
+	t.Parallel()
+
+	for range 20 {
+		harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+		if err != nil {
+			t.Fatalf("unable to create test pool: %v", err)
+		}
+		chainedTxns, err := harness.CreateTxChain(outputs[0], 2)
+		if err != nil {
+			t.Fatalf("unable to create transaction chain: %v", err)
+		}
+		parent, child := chainedTxns[0], chainedTxns[1]
+
+		// A spend of the same output whose signature cannot verify.
+		junk, err := harness.CreateSignedTx([]spendableOutput{
+			txOutToSpendableOut(parent, 0),
+		}, 1)
+		if err != nil {
+			t.Fatalf("unable to create signed tx: %v", err)
+		}
+		junk.MsgTx().TxIn[0].SignatureScript, err = txscript.NewScriptBuilder().
+			AddData(make([]byte, 72)).AddData(make([]byte, 33)).Script()
+		if err != nil {
+			t.Fatal(err)
+		}
+		junk = bchutil.NewTx(junk.MsgTx())
+
+		for _, tx := range []*bchutil.Tx{junk, child} {
+			if _, err := harness.txPool.ProcessTransaction(tx, true, 0); err != nil {
+				t.Fatalf("orphan not accepted: %v", err)
+			}
+		}
+		if _, err := harness.txPool.ProcessTransaction(parent, true, 0); err != nil {
+			t.Fatalf("parent not accepted: %v", err)
+		}
+		if !harness.txPool.IsTransactionInPool(child.Hash()) {
+			t.Fatal("the valid orphan was not accepted with its parent")
+		}
+	}
+}
+
+// TestStandardScriptFlagsAfterUpgrades ensures the script flags the pool
+// sets with the node's default policy on mainnet, once every upgrade it knows
+// is active, are txscript.RelayVerifyFlags, which tests outside the pool
+// verify the scripts they make with, and those the VMB tests give the pool's
+// checks with every upgrade, so an upgrade's flag can't be left out of either.
+func TestStandardScriptFlagsAfterUpgrades(t *testing.T) {
+	t.Parallel()
+
+	// The policy the server gives the pool, with the default for
+	// non-standard transactions on mainnet.
+	mp := &TxPool{cfg: Config{
+		Policy: Policy{
+			AcceptNonStd:   chaincfg.MainNetParams.RelayNonStdTxs,
+			LimitSigChecks: true,
+		},
+		ChainParams: &chaincfg.MainNetParams,
+	}}
+
+	// A height and a time past every upgrade.
+	got := mp.standardScriptFlags(math.MaxInt32, time.Unix(1<<62, 0))
+	if got != txscript.RelayVerifyFlags {
+		t.Errorf("pool flags %#x, txscript.RelayVerifyFlags %#x: they "+
+			"differ in %#x", got, txscript.RelayVerifyFlags,
+			got^txscript.RelayVerifyFlags)
+	}
+	all := vmbEra{upgrade9: true, upgrade11: true, upgrade12: true}
+	if vmb := vmbMempoolFlags(all); vmb != got {
+		t.Errorf("pool flags %#x, vmbMempoolFlags %#x: they differ in %#x",
+			got, vmb, got^vmb)
 	}
 }

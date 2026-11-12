@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -51,6 +52,10 @@ var (
 	// the block height -> ablaState index.
 	ablaStateBucketName = []byte("ablaidx")
 
+	// ablaConfigKeyName is the name of the db key used to store the ABLA
+	// configuration the stored ABLA states were computed with.
+	ablaConfigKeyName = []byte("ablaconfig")
+
 	// chainStateKeyName is the name of the db key used to store the best
 	// chain state.
 	chainStateKeyName = []byte("chainstate")
@@ -79,6 +84,15 @@ var (
 	// utxoSetVersionKeyName is the name of the db key used to store the
 	// version of the utxo set currently in the database.
 	utxoSetVersionKeyName = []byte("utxosetversion")
+
+	// chainStateReIndexKeyName is the name of the db key that marks a
+	// re-index of the chain state as started and not yet finished.
+	chainStateReIndexKeyName = []byte("chainstatereindex")
+
+	// chainStateFastSyncKeyName is the name of the db key that marks the
+	// utxo set as being replaced by the download of a fast sync that has
+	// not yet been verified.
+	chainStateFastSyncKeyName = []byte("chainstatefastsync")
 
 	// utxoSetBucketName is the name of the db bucket used to house the
 	// unspent transaction output set.
@@ -132,6 +146,19 @@ func isDeserializeErr(err error) bool {
 func isDbBucketNotFoundErr(err error) bool {
 	dbErr, ok := err.(database.Error)
 	return ok && dbErr.ErrorCode == database.ErrBucketNotFound
+}
+
+// isDbErr returns whether or not the passed error is a database.Error.
+func isDbErr(err error) bool {
+	_, ok := err.(database.Error)
+	return ok
+}
+
+// isDbCorruptionErr returns whether or not the passed error is a
+// database.Error with an error code of database.ErrCorruption.
+func isDbCorruptionErr(err error) bool {
+	dbErr, ok := err.(database.Error)
+	return ok && dbErr.ErrorCode == database.ErrCorruption
 }
 
 // dbFetchVersion fetches an individual version with the given key from the
@@ -717,13 +744,19 @@ func DeserializeUtxoEntry(serialized []byte) (*UtxoEntry, error) {
 			"utxo: %v", err))
 	}
 
+	// Token data is stored in front of the script.  Copy the script when
+	// it is split off so the entry doesn't keep the prefix.
+	tokenData, pkScript := wire.SplitPkScript(pkScript)
+	if !tokenData.IsEmpty() {
+		pkScript = slices.Clone(pkScript)
+	}
 	entry := &UtxoEntry{
 		amount:      int64(amount),
 		pkScript:    pkScript,
+		tokenData:   tokenData,
 		blockHeight: blockHeight,
 		packedFlags: 0,
 	}
-	entry.pkScript, _ = entry.tokenData.SeparateTokenDataFromPKScriptIfExists(entry.pkScript, 0)
 
 	if isCoinBase {
 		entry.packedFlags |= tfCoinBase
@@ -750,16 +783,16 @@ func deserializeUtxoCommitmentFormat(serialized []byte) (*wire.OutPoint, *UtxoEn
 
 	value := binary.LittleEndian.Uint64(serialized[40:48])
 
-	pkScript := serialized[52:]
-
+	// Copy the script so the entry doesn't keep the serialized utxo.
+	tokenData, pkScript := wire.SplitPkScript(serialized[52:])
 	op := wire.NewOutPoint(txid, index)
 	entry := &UtxoEntry{
 		amount:      int64(value),
 		blockHeight: int32(height),
-		pkScript:    pkScript,
+		pkScript:    slices.Clone(pkScript),
+		tokenData:   tokenData,
 		packedFlags: 0,
 	}
-	entry.pkScript, _ = entry.tokenData.SeparateTokenDataFromPKScriptIfExists(entry.pkScript, 0)
 	if coinbaseFlag > 0 {
 		entry.packedFlags |= tfCoinBase
 	}
@@ -819,8 +852,11 @@ func dbFetchUtxoEntry(dbTx database.Tx, outpoint wire.OutPoint) (*UtxoEntry, err
 	// A non-nil zero-length entry means there is an entry in the database
 	// for a spent transaction output which should never be the case.
 	if len(serializedUtxo) == 0 {
-		return nil, AssertError(fmt.Sprintf("database contains entry "+
-			"for spent tx output %v", outpoint))
+		return nil, database.Error{
+			ErrorCode: database.ErrCorruption,
+			Description: fmt.Sprintf("database contains entry "+
+				"for spent tx output %v", outpoint),
+		}
 	}
 
 	// Deserialize the utxo entry and return it.
@@ -1000,8 +1036,8 @@ func dbPutABLAStateIndex(dbTx database.Tx, ablaState ABLAState, height int32) er
 	byteOrder.PutUint32(serializedHeight[:], uint32(height))
 
 	var serializedAblaState [16]byte
-	byteOrder.PutUint64(serializedAblaState[:], ablaState.controlBlockSize)
-	byteOrder.PutUint64(serializedAblaState[:], ablaState.elasticBufferSize)
+	byteOrder.PutUint64(serializedAblaState[0:8], ablaState.controlBlockSize)
+	byteOrder.PutUint64(serializedAblaState[8:16], ablaState.elasticBufferSize)
 
 	// Add the block hash to height mapping to the index.
 	meta := dbTx.Metadata()
@@ -1038,19 +1074,25 @@ func dbFetchAblaStateByHeight(dbTx database.Tx, height int32) (*ABLAState, error
 		str := fmt.Sprintf("no ABLA state at height %d exists", height)
 		return nil, errNotInMainChain(str)
 	}
+	return deserializeABLAState(height, serializedData)
+}
 
+// deserializeABLAState decodes the ABLA state stored after the block at the
+// given height.
+func deserializeABLAState(height int32, serializedData []byte) (*ABLAState, error) {
 	// Ensure the serialized data has the right length.
-	if uint32(len(serializedData[:])) > 16 {
-		return &ABLAState{}, database.Error{
+	if len(serializedData) != 16 {
+		return nil, database.Error{
 			ErrorCode:   database.ErrCorruption,
 			Description: "corrupt ABLA state",
 		}
 	}
 
+	// The state after a block applies to the next block.
 	var ablaState ABLAState
-	ablaState.blockHeight = uint64(height)
+	ablaState.blockHeight = uint64(height) + 1
 	ablaState.controlBlockSize = byteOrder.Uint64(serializedData[0:8])
-	ablaState.elasticBufferSize = byteOrder.Uint64(serializedData[8:])
+	ablaState.elasticBufferSize = byteOrder.Uint64(serializedData[8:16])
 
 	return &ablaState, nil
 
@@ -1405,13 +1447,16 @@ func (b *BlockChain) initChainState(fastSync bool) error {
 	if !initialized {
 		// At this point the database has not already been initialized, so
 		// initialize both it and the chain state to the genesis block.
-		return b.createChainState()
+		if err := b.createChainState(); err != nil {
+			return err
+		}
+		return b.initABLAState()
 	}
 
 	if !hasBlockIndex {
 		err := migrateBlockIndex(b.db)
 		if err != nil {
-			return nil
+			return err
 		}
 	}
 
@@ -1490,17 +1535,6 @@ func (b *BlockChain) initChainState(fastSync bool) error {
 		}
 		b.bestChain.SetTip(tip)
 
-		ablaState, err := dbFetchAblaStateByHeight(dbTx, tip.height)
-		if err == nil {
-			b.ablaState = *ablaState
-		} else {
-			// check if upgrade is active for block
-			if tip.height > b.chainParams.ABLAForkHeight {
-				return AssertError(fmt.Sprintf("initChainState: cannot find "+
-					"ABLA state index for block at height: %d", tip.height))
-			}
-		}
-
 		// Load the raw block bytes for the best block.
 		var block wire.MsgBlock
 		var blockBytes []byte
@@ -1550,7 +1584,11 @@ func (b *BlockChain) initChainState(fastSync bool) error {
 	// As we might have updated the index after it was loaded, we'll
 	// attempt to flush the index to the DB. This will only result in a
 	// write if the elements are dirty, so it'll usually be a noop.
-	return b.index.flushToDB()
+	if err := b.index.flushToDB(); err != nil {
+		return err
+	}
+
+	return b.initABLAState()
 }
 
 // deserializeBlockRow parses a value in the block index bucket into a block

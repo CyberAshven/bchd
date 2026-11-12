@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
@@ -41,6 +42,10 @@ const (
 	// BFNoDupBlockCheck signals if the block should skip existence
 	// checks.
 	BFNoDupBlockCheck
+
+	// BFUnrequested signals that the block was not requested from the
+	// peer, so it is only stored when it could extend the best chain.
+	BFUnrequested
 
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
@@ -89,16 +94,34 @@ func (b *BlockChain) blockExists(hash *chainhash.Hash) (bool, error) {
 	return exists, err
 }
 
+// heightFlags returns flags with the upgrade flags added for the rules that
+// apply to a block at the given height.
+func (b *BlockChain) heightFlags(height int32, flags BehaviorFlags) BehaviorFlags {
+	if height > b.chainParams.MagneticAnonomalyForkHeight {
+		flags |= BFMagneticAnomaly
+	}
+	if height > b.chainParams.Upgrade9ForkHeight {
+		flags |= BFUpgrade9
+	}
+	return flags
+}
+
 // processOrphans determines if there are any orphans which depend on the passed
 // block hash (they are no longer orphans if true) and potentially accepts them.
 // It repeats the process for the newly accepted blocks (to detect further
 // orphans which may no longer be orphans) until there are no more.
 //
 // The flags do not modify the behavior of this function directly, however they
-// are needed to pass along to maybeAcceptBlock.
+// are needed to pass along to maybeAcceptBlock.  BFFastAdd only applies to the
+// block it was passed with, so it is not passed on to the orphans.
 //
-// This function MUST be called with the chain state lock held (for writes).
+// This function MUST be called with processLock and the chain state lock held
+// (for writes).
 func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) error {
+	// parentErr is the error that showed the passed block or one of its
+	// ancestors to be invalid while connecting an orphan.
+	var parentErr error
+
 	// Start with processing at least the passed hash.
 	var processHashes []*chainhash.Hash
 	processHashes = append(processHashes, hash)
@@ -136,8 +159,47 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 				orphan.block.SetHeight(prevNode.height + 1)
 			}
 
-			_, err := b.maybeAcceptBlock(orphan.block, prevHash, prevNode, flags)
-			if err != nil {
+			// The orphan was sanity checked before its height was
+			// known, so check it again with the rules for its height.
+			// BFUnrequested only describes the block it was passed
+			// with and is never inherited.
+			orphanFlags := b.heightFlags(orphan.block.Height(),
+				flags&^(BFFastAdd|BFMagneticAnomaly|BFUpgrade9|
+					BFUnrequested))
+			if orphan.unrequested {
+				orphanFlags |= BFUnrequested
+			}
+			err := checkBlockSanity(orphan.block, b.chainParams.PowLimit,
+				b.timeSource, orphanFlags)
+			if err == nil {
+				_, err = b.maybeAcceptBlock(orphan.block, prevHash,
+					prevNode, orphanFlags)
+			}
+
+			// An orphan's own failure doesn't fail its parent, which
+			// has already been accepted, nor its siblings, as when the
+			// blocks arrive in order.  One rejected before it is
+			// stored is dropped.  One stored but failing to connect
+			// still has its own orphans processed, so they are handled
+			// as they would be in order.  Connecting a stored orphan
+			// can also show the parent or an ancestor to be invalid,
+			// and that error is returned once the orphans are done.
+			var rerr RuleError
+			if errors.As(err, &rerr) {
+				if rerr.ErrorCode == ErrUnrequestedBlock {
+					log.Debugf("Dropped orphan block %v: %v",
+						orphanHash, err)
+				} else {
+					log.Infof("Rejected orphan block %v: %v",
+						orphanHash, err)
+				}
+				if parentErr == nil && b.knownInvalid(hash) {
+					parentErr = err
+				}
+				if b.index.LookupNode(orphanHash) == nil {
+					continue
+				}
+			} else if err != nil {
 				return err
 			}
 
@@ -147,7 +209,14 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			processHashes = append(processHashes, orphanHash)
 		}
 	}
-	return nil
+	return parentErr
+}
+
+// knownInvalid returns whether the block with the given hash is in the block
+// index and known to be invalid.
+func (b *BlockChain) knownInvalid(hash *chainhash.Hash) bool {
+	node := b.index.LookupNode(hash)
+	return node != nil && b.index.NodeStatus(node).KnownInvalid()
 }
 
 // ProcessBlock is the main workhorse for handling insertion of new blocks into
@@ -159,11 +228,39 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 // whether or not the block is on the main chain and the second indicates
 // whether or not the block is an orphan.
 //
+// When processing the block fails with a database error, as when stored data
+// is corrupt or can't be read, the process is requested to shut down, as
+// blocks can't be connected without the data.
+//
 // This function is safe for concurrent access.
 func (b *BlockChain) ProcessBlock(block *bchutil.Block, flags BehaviorFlags) (bool, bool, error) {
+	b.processLock.Lock()
+	defer b.processLock.Unlock()
+
+	return b.lockAndProcessBlock(block, flags)
+}
+
+// lockAndProcessBlock takes the chain lock and processes the block as
+// described for ProcessBlock, asking the node to shut down on a database
+// error.
+//
+// This function MUST be called with processLock held.
+func (b *BlockChain) lockAndProcessBlock(block *bchutil.Block, flags BehaviorFlags) (bool, bool, error) {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
+	isMainChain, isOrphan, err := b.processBlock(block, flags)
+	if isDbErr(err) {
+		b.requestDatabaseErrorShutdown(err)
+	}
+	return isMainChain, isOrphan, err
+}
+
+// processBlock processes the block as described for ProcessBlock.
+//
+// This function MUST be called with processLock and the chain state lock held
+// (for writes).
+func (b *BlockChain) processBlock(block *bchutil.Block, flags BehaviorFlags) (bool, bool, error) {
 	blockHash := block.Hash()
 	log.Tracef("Processing block %v", blockHash)
 
@@ -192,13 +289,7 @@ func (b *BlockChain) ProcessBlock(block *bchutil.Block, flags BehaviorFlags) (bo
 		block.SetHeight(prevNode.height + 1)
 	}
 
-	if block.Height() > b.chainParams.MagneticAnonomalyForkHeight {
-		flags |= BFMagneticAnomaly
-	}
-
-	if block.Height() > b.chainParams.Upgrade9ForkHeight {
-		flags |= BFUpgrade9
-	}
+	flags = b.heightFlags(block.Height(), flags)
 
 	// Perform preliminary sanity checks on the block and its transactions.
 	err := checkBlockSanity(block, b.chainParams.PowLimit, b.timeSource, flags)
@@ -212,8 +303,10 @@ func (b *BlockChain) ProcessBlock(block *bchutil.Block, flags BehaviorFlags) (bo
 		return false, false, err
 	}
 	if !prevHashExists {
-		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
-		b.addOrphanBlock(block)
+		if err := b.addOrphanBlock(block, flags); err != nil {
+			return false, false, err
+		}
+		log.Infof("Added orphan block %v with parent %v", blockHash, prevHash)
 
 		return false, true, nil
 	}

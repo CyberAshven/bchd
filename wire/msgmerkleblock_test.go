@@ -48,50 +48,28 @@ func TestMerkleBlock(t *testing.T) {
 			maxPayload, wantPayload)
 	}
 
-	// Load maxTxPerBlock hashes
+	// Fill the message up to maxTxPerBlock hashes.  The hashes share one
+	// value so the test stays small on 32-bit platforms.
 	data := make([]byte, 32)
-	for i := uint32(0); i < maxTxPerBlock(); i++ {
-		rand.Read(data)
-		hash, err := chainhash.NewHash(data)
-		if err != nil {
-			t.Errorf("NewHash failed: %v\n", err)
-			return
-		}
-
-		if err = msg.AddTxHash(hash); err != nil {
-			t.Errorf("AddTxHash failed: %v\n", err)
-			return
-		}
-	}
-
-	// Add one more Tx to test failure.
 	rand.Read(data)
 	hash, err := chainhash.NewHash(data)
 	if err != nil {
 		t.Errorf("NewHash failed: %v\n", err)
 		return
 	}
+	msg.Hashes = make([]*chainhash.Hash, maxTxPerBlock())
+	for i := range msg.Hashes {
+		msg.Hashes[i] = hash
+	}
 
+	// Add one more Tx to test failure.
 	if err = msg.AddTxHash(hash); err == nil {
 		t.Errorf("AddTxHash succeeded when it should have failed")
 		return
 	}
 
-	// Test encode with latest protocol version.
-	var buf bytes.Buffer
-	err = msg.BchEncode(&buf, pver, enc)
-	if err != nil {
-		t.Errorf("encode of MsgMerkleBlock failed %v err <%v>", msg, err)
-	}
-
-	// Test decode with latest protocol version.
-	readmsg := MsgMerkleBlock{}
-	err = readmsg.BchDecode(&buf, pver, enc)
-	if err != nil {
-		t.Errorf("decode of MsgMerkleBlock failed [%v] err <%v>", buf, err)
-	}
-
 	// Force extra hash to test maxTxPerBlock.
+	var buf bytes.Buffer
 	msg.Hashes = append(msg.Hashes, hash)
 	err = msg.BchEncode(&buf, pver, enc)
 	if err == nil {
@@ -429,4 +407,82 @@ var merkleBlockOneBytes = []byte{
 	0xcd, 0xb6, 0x06, 0xe8, 0x57, 0x23, 0x3e, 0x0e, // Hash
 	0x01, // Num flag bytes
 	0x80, // Flags
+}
+
+// TestMerkleBlockHashCountAlloc ensures the memory allocated while decoding a
+// merkle block grows with the hashes actually read rather than with the hash
+// count claimed by the message, and that messages whose hashes span several
+// allocation chunks still decode to the same values.
+func TestMerkleBlockHashCountAlloc(t *testing.T) {
+	pver := ProtocolVersion
+
+	// withHashCount returns a merkle block encoding with the given hash
+	// count and no hashes after it.
+	withHashCount := func(count uint64) []byte {
+		var buf bytes.Buffer
+		buf.Write(merkleBlockOneBytes[:84])
+		_ = WriteVarInt(&buf, pver, count)
+		return buf.Bytes()
+	}
+
+	// A merkle block with enough hashes to span three allocation chunks.
+	manyHashes := merkleBlockOne
+	manyHashes.Hashes = nil
+	for i := range 2*defaultTransactionAlloc + 1 {
+		var hash chainhash.Hash
+		hash[0], hash[1] = byte(i), byte(i>>8)
+		_ = manyHashes.AddTxHash(&hash)
+	}
+	var manyHashesBuf bytes.Buffer
+	if err := manyHashes.BchEncode(&manyHashesBuf, pver,
+		BaseEncoding); err != nil {
+
+		t.Fatalf("BchEncode: unexpected error %v", err)
+	}
+
+	tests := []struct {
+		name string          // Test description
+		buf  []byte          // Wire encoding
+		err  error           // Expected error
+		want *MsgMerkleBlock // Expected message when no error
+	}{
+		{
+			name: "count at max with no hashes",
+			buf:  withHashCount(uint64(maxTxPerBlock())),
+			err:  io.EOF,
+		},
+		{
+			name: "count one above max",
+			buf:  withHashCount(uint64(maxTxPerBlock()) + 1),
+			err:  &MessageError{},
+		},
+		{
+			name: "hashes spanning several chunks",
+			buf:  manyHashesBuf.Bytes(),
+			want: &manyHashes,
+		},
+	}
+
+	t.Logf("Running %d tests", len(tests))
+	for _, test := range tests {
+		var msg MsgMerkleBlock
+		var err error
+		r := bytes.NewReader(test.buf)
+		alloc := decodeAlloc(func() {
+			err = msg.BchDecode(r, pver, BaseEncoding)
+		})
+		if alloc > maxBoundedDecodeAlloc {
+			t.Errorf("%s: allocated %d bytes, want at most %d",
+				test.name, alloc, maxBoundedDecodeAlloc)
+		}
+		if reflect.TypeOf(err) != reflect.TypeOf(test.err) {
+			t.Errorf("%s: wrong error got: %v, want: %v", test.name,
+				err, reflect.TypeOf(test.err))
+			continue
+		}
+		if err == nil && !reflect.DeepEqual(&msg, test.want) {
+			t.Errorf("%s: decoded message does not match",
+				test.name)
+		}
+	}
 }

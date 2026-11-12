@@ -19,7 +19,7 @@ import (
 func BenchmarkBlockHeader(b *testing.B) {
 	// Start by creating a new database and populating it with the mainnet
 	// genesis block.
-	dbPath := filepath.Join(os.TempDir(), "ffldb-benchblkhdr")
+	dbPath := filepath.Join(b.TempDir(), "ffldb-benchblkhdr")
 	_ = os.RemoveAll(dbPath)
 	db, err := database.Create("ffldb", dbPath, blockDataNet)
 	if err != nil {
@@ -39,7 +39,7 @@ func BenchmarkBlockHeader(b *testing.B) {
 	b.ResetTimer()
 	err = db.View(func(tx database.Tx) error {
 		blockHash := chaincfg.MainNetParams.GenesisHash
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			_, err := tx.FetchBlockHeader(blockHash)
 			if err != nil {
 				return err
@@ -60,7 +60,7 @@ func BenchmarkBlockHeader(b *testing.B) {
 func BenchmarkBlock(b *testing.B) {
 	// Start by creating a new database and populating it with the mainnet
 	// genesis block.
-	dbPath := filepath.Join(os.TempDir(), "ffldb-benchblk")
+	dbPath := filepath.Join(b.TempDir(), "ffldb-benchblk")
 	_ = os.RemoveAll(dbPath)
 	db, err := database.Create("ffldb", dbPath, blockDataNet)
 	if err != nil {
@@ -80,7 +80,7 @@ func BenchmarkBlock(b *testing.B) {
 	b.ResetTimer()
 	err = db.View(func(tx database.Tx) error {
 		blockHash := chaincfg.MainNetParams.GenesisHash
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			_, err := tx.FetchBlock(blockHash)
 			if err != nil {
 				return err

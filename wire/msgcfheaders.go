@@ -80,10 +80,10 @@ func (msg *MsgCFHeaders) BchDecode(r io.Reader, pver uint32, _ MessageEncoding) 
 		return messageError("MsgCFHeaders.BchDecode", str)
 	}
 
-	// Create a contiguous slice of hashes to deserialize into in order to
-	// reduce the number of allocations.
-	msg.FilterHashes = make([]*chainhash.Hash, 0, count)
-	for i := uint64(0); i < count; i++ {
+	// Bound the allocation by the payload.
+	msg.FilterHashes = make([]*chainhash.Hash, 0,
+		allocCount(r, count, chainhash.HashSize, count))
+	for range count {
 		var cfh chainhash.Hash
 		err := readElement(r, &cfh)
 		if err != nil {

@@ -9,13 +9,19 @@ package integration
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/debug"
 	"testing"
 
+	"github.com/gcash/bchd/btcjson"
 	"github.com/gcash/bchd/chaincfg"
 	"github.com/gcash/bchd/integration/rpctest"
+	"github.com/gcash/bchd/txscript"
+	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchutil"
 )
 
 func testGetBestBlock(r *rpctest.Harness, t *testing.T) {
@@ -94,10 +100,192 @@ func testGetBlockHash(r *rpctest.Harness, t *testing.T) {
 	}
 }
 
+func testGetBlockVerbosity3(r *rpctest.Harness, t *testing.T) {
+	// Mine a block that holds a transaction spending a coinbase output.
+	addr, err := r.NewAddress()
+	if err != nil {
+		t.Fatalf("Unable to generate address: %v", err)
+	}
+	pkScript, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		t.Fatalf("Unable to create script: %v", err)
+	}
+	output := wire.NewTxOut(bchutil.SatoshiPerBitcoin, pkScript,
+		wire.TokenData{})
+	txid, err := r.SendOutputs([]*wire.TxOut{output}, 10)
+	if err != nil {
+		t.Fatalf("Unable to send outputs: %v", err)
+	}
+	blockHashes, err := r.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("Unable to generate block: %v", err)
+	}
+
+	// Verbosity 2 lists the transactions under "rawtx", with the fee but
+	// without the prevout fields.
+	raw, err := r.Node.RawRequest("getblock", []json.RawMessage{
+		json.RawMessage(`"` + blockHashes[0].String() + `"`),
+		json.RawMessage("2"),
+	})
+	if err != nil {
+		t.Fatalf("Call to `getblock` failed: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("Unable to unmarshal block: %v", err)
+	}
+	_, hasRawTx := fields["rawtx"]
+	_, hasTx := fields["tx"]
+	if !hasRawTx || hasTx || bytes.Contains(raw, []byte(`"prevout"`)) ||
+		!bytes.Contains(raw, []byte(`"fee"`)) {
+
+		t.Fatalf("Unexpected verbosity 2 block: %s", raw)
+	}
+
+	toAmount := func(value float64) bchutil.Amount {
+		amount, err := bchutil.NewAmount(value)
+		if err != nil {
+			t.Fatalf("Invalid amount %v: %v", value, err)
+		}
+		return amount
+	}
+
+	// Verbosity 4 is treated as 3.
+	for _, verbosity := range []string{"3", "4"} {
+		raw, err := r.Node.RawRequest("getblock", []json.RawMessage{
+			json.RawMessage(`"` + blockHashes[0].String() + `"`),
+			json.RawMessage(verbosity),
+		})
+		if err != nil {
+			t.Fatalf("Call to `getblock` failed: %v", err)
+		}
+		var block btcjson.GetBlockVerboseTxResult
+		if err := json.Unmarshal(raw, &block); err != nil {
+			t.Fatalf("Unable to unmarshal block: %v", err)
+		}
+		if len(block.Tx) != 2 || block.Tx[1].Txid != txid.String() ||
+			block.Tx[0].Fee != nil || block.Tx[1].Fee == nil {
+
+			t.Fatalf("Unexpected transactions in block: %s", raw)
+		}
+
+		// The fee is the value of the spent outputs minus the value of
+		// the outputs.
+		tx := block.Tx[1]
+		var fee bchutil.Amount
+		for _, vin := range tx.Vin {
+			if vin.PrevOut == nil {
+				t.Fatalf("Missing prevout: %s", raw)
+			}
+			if !vin.PrevOut.Generated || vin.PrevOut.Height <= 0 {
+				t.Fatalf("Unexpected prevout: %s", raw)
+			}
+			fee += toAmount(vin.PrevOut.Value)
+		}
+		for _, vout := range tx.Vout {
+			fee -= toAmount(vout.Value)
+		}
+		if toAmount(*tx.Fee) != fee {
+			t.Fatalf("Unexpected fee %v, want %v", *tx.Fee, fee)
+		}
+	}
+}
+
+func testMempoolAcceptAndSend(r *rpctest.Harness, t *testing.T) {
+	addr, err := r.NewAddress()
+	if err != nil {
+		t.Fatalf("Unable to generate address: %v", err)
+	}
+	pkScript, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		t.Fatalf("Unable to create script: %v", err)
+	}
+	newTx := func(feeRate bchutil.Amount) (*wire.MsgTx, string) {
+		output := wire.NewTxOut(bchutil.SatoshiPerBitcoin, pkScript,
+			wire.TokenData{})
+		tx, err := r.CreateTransaction([]*wire.TxOut{output}, feeRate,
+			true)
+		if err != nil {
+			t.Fatalf("Unable to create transaction: %v", err)
+		}
+		var buf bytes.Buffer
+		if err := tx.Serialize(&buf); err != nil {
+			t.Fatalf("Unable to serialize transaction: %v", err)
+		}
+		return tx, hex.EncodeToString(buf.Bytes())
+	}
+	testAccept := func(txHex string, allowHighFees bool) btcjson.TestMempoolAcceptResult {
+		raw, err := r.Node.RawRequest("testmempoolaccept", []json.RawMessage{
+			json.RawMessage(`["` + txHex + `"]`),
+			json.RawMessage(fmt.Sprint(allowHighFees)),
+		})
+		if err != nil {
+			t.Fatalf("Call to `testmempoolaccept` failed: %v", err)
+		}
+		var results []btcjson.TestMempoolAcceptResult
+		if err := json.Unmarshal(raw, &results); err != nil ||
+			len(results) != 1 {
+
+			t.Fatalf("Unexpected testmempoolaccept result: %s", raw)
+		}
+		return results[0]
+	}
+
+	// A transaction is allowed until it is in the mempool, and sending it
+	// again returns its hash.
+	tx, txHex := newTx(10)
+	result := testAccept(txHex, false)
+	if !result.Allowed || result.Txid != tx.TxHash().String() ||
+		result.Size != int64(tx.SerializeSize()) || result.Fees == nil {
+
+		t.Fatalf("Unexpected result for a valid transaction: %+v", result)
+	}
+	for range 2 {
+		txid, err := r.Node.SendRawTransaction(tx, false)
+		if err != nil || *txid != tx.TxHash() {
+			t.Fatalf("Call to `sendrawtransaction` returned %v, %v",
+				txid, err)
+		}
+	}
+	result = testAccept(txHex, false)
+	if result.Allowed || result.RejectReason != "18: txn-already-in-mempool" ||
+		result.RejectDetails != "txn-already-in-mempool, already have "+
+			"transaction "+result.Txid {
+
+		t.Fatalf("Unexpected result for a transaction in the "+
+			"mempool: %+v", result)
+	}
+
+	// A fee above the 0.1 BCH default maximum needs allowhighfees.
+	tx, txHex = newTx(100000)
+	result = testAccept(txHex, false)
+	if result.Allowed || result.RejectReason != "256: absurdly-high-fee" {
+		t.Fatalf("Unexpected result for a high fee: %+v", result)
+	}
+	if result = testAccept(txHex, true); !result.Allowed {
+		t.Fatalf("Unexpected result for an allowed high fee: %+v",
+			result)
+	}
+	_, err = r.Node.SendRawTransaction(tx, false)
+	rpcErr, ok := err.(*btcjson.RPCError)
+	if !ok || rpcErr.Code != btcjson.ErrRPCTxRejected {
+		t.Fatalf("Unexpected error for a high fee: %v", err)
+	}
+	if _, err := r.Node.SendRawTransaction(tx, true); err != nil {
+		t.Fatalf("Call to `sendrawtransaction` failed: %v", err)
+	}
+
+	if _, err := r.Node.Generate(1); err != nil {
+		t.Fatalf("Unable to generate block: %v", err)
+	}
+}
+
 var rpcTestCases = []rpctest.HarnessTestCase{
 	testGetBestBlock,
 	testGetBlockCount,
 	testGetBlockHash,
+	testGetBlockVerbosity3,
+	testMempoolAcceptAndSend,
 }
 
 var primaryHarness *rpctest.Harness

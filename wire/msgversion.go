@@ -46,7 +46,7 @@ type MsgVersion struct {
 	// connections.
 	Nonce uint64
 
-	// The user agent that generated messsage.  This is a encoded as a varString
+	// The user agent that generated message.  This is a encoded as a varString
 	// on the wire.  This has a max length of MaxUserAgentLen.
 	UserAgent string
 
@@ -110,7 +110,11 @@ func (msg *MsgVersion) BchDecode(r io.Reader, pver uint32, enc MessageEncoding) 
 		}
 	}
 	if buf.Len() > 0 {
-		userAgent, err := ReadVarString(buf, pver)
+		// Bound the length by MaxUserAgentLen before reading so an
+		// oversized length is rejected without allocating memory for
+		// it.
+		userAgent, err := readVarStringLimit(buf, pver,
+			MaxUserAgentLen, "user agent")
 		if err != nil {
 			return err
 		}
