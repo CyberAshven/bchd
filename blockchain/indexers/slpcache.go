@@ -5,6 +5,7 @@
 package indexers
 
 import (
+	"maps"
 	"sync"
 
 	"github.com/bluele/gcache"
@@ -13,23 +14,28 @@ import (
 )
 
 // SlpCache to manage slp index mempool inventory and recently queried slp index entries and
-// token metadata items. The RWMutex lock is held for mempoolSlpTxEntries operations since
-// gcache.Cache holds its own locks.
+// token metadata items. The RWMutex lock is held for mempoolSlpTxEntries and
+// mempoolTokenMetadata operations since gcache.Cache holds its own locks.
 type SlpCache struct {
 	sync.RWMutex
 	maxEntries          int
 	mempoolSlpTxEntries map[chainhash.Hash]*SlpTxEntry
 	slpTxEntries        gcache.Cache
 	tokenMetadata       gcache.Cache
+
+	// mempoolTokenMetadata maps the token ID of each token whose cached
+	// metadata a memory pool transaction set to that transaction.
+	mempoolTokenMetadata map[chainhash.Hash]chainhash.Hash
 }
 
 // InitSlpCache creates a new instance of SlpCache
 func InitSlpCache(maxEntries int) *SlpCache {
 	return &SlpCache{
-		maxEntries:          maxEntries,
-		mempoolSlpTxEntries: make(map[chainhash.Hash]*SlpTxEntry),
-		slpTxEntries:        gcache.New(maxEntries).LRU().Build(),
-		tokenMetadata:       gcache.New(maxEntries).LRU().Build(),
+		maxEntries:           maxEntries,
+		mempoolSlpTxEntries:  make(map[chainhash.Hash]*SlpTxEntry),
+		slpTxEntries:         gcache.New(maxEntries).LRU().Build(),
+		tokenMetadata:        gcache.New(maxEntries).LRU().Build(),
+		mempoolTokenMetadata: make(map[chainhash.Hash]chainhash.Hash),
 	}
 }
 
@@ -38,16 +44,37 @@ func (s *SlpCache) AddSlpTxEntry(hash *chainhash.Hash, item SlpTxEntry) error {
 	return s.slpTxEntries.Set(*hash, &item)
 }
 
-// AddMempoolSlpTxEntry puts new items in the mempool cache
+// AddMempoolSlpTxEntry puts new items in the mempool cache.  A transaction
+// whose entry only the LRU holds, as one back in the memory pool, is put there
+// too, as the LRU could otherwise evict the entry while the transaction is in
+// the pool.
 func (s *SlpCache) AddMempoolSlpTxEntry(hash *chainhash.Hash, item SlpTxEntry) {
-	if _, ok := s.GetSlpTxEntry(hash); ok {
-		return
-	}
-
 	s.Lock()
 	defer s.Unlock()
+
+	if _, ok := s.mempoolSlpTxEntries[*hash]; ok {
+		return
+	}
 	s.mempoolSlpTxEntries[*hash] = &item
 	_ = s.slpTxEntries.Set(*hash, &item)
+}
+
+// AddDisconnectedSlpTxEntry puts the entry of a transaction of a block that a
+// reorg disconnects with the memory pool's entries, and in the LRU in place of
+// the index's, as the reorg puts the transaction back in the memory pool if
+// the pool takes it, without the check a new memory pool transaction gets.
+// It is valid slp until RemoveMempoolSlpTxsNotIn finds whether the memory
+// pool holds it.
+func (s *SlpCache) AddDisconnectedSlpTxEntry(hash *chainhash.Hash, item SlpTxEntry) {
+	s.Lock()
+	defer s.Unlock()
+
+	entry, ok := s.mempoolSlpTxEntries[*hash]
+	if !ok {
+		entry = &item
+		s.mempoolSlpTxEntries[*hash] = entry
+	}
+	_ = s.slpTxEntries.Set(*hash, entry)
 }
 
 // GetSlpTxEntry gets tx entry items from the cache
@@ -70,35 +97,142 @@ func (s *SlpCache) GetSlpTxEntry(hash *chainhash.Hash) (SlpTxEntry, bool) {
 	return SlpTxEntry{}, false
 }
 
-// AddTempTokenMetadata puts token metadata into cache with a limited size
-func (s *SlpCache) AddTempTokenMetadata(item TokenMetadata) error {
-	return s.tokenMetadata.Set(*item.TokenID, &item)
+// cachedTokenMetadata is token metadata in the cache.  Metadata read from the
+// database holds the slp index tip of the snapshot it was read from, and is
+// only served to readers of a snapshot with the same tip, as a block that
+// moved a mint baton may have committed since.  Metadata from transactions in
+// the memory pool holds none.
+type cachedTokenMetadata struct {
+	tm  TokenMetadata
+	tip *chainhash.Hash
 }
 
-// GetTokenMetadata gets token metadata from the cache
-func (s *SlpCache) GetTokenMetadata(hash *chainhash.Hash) (TokenMetadata, bool) {
+// AddTempTokenMetadata puts token metadata that the memory pool transaction
+// from set into cache with a limited size.  It is removed once the
+// transaction leaves the memory pool.
+func (s *SlpCache) AddTempTokenMetadata(item TokenMetadata, from chainhash.Hash) error {
+	s.Lock()
+	defer s.Unlock()
+
+	s.mempoolTokenMetadata[*item.TokenID] = from
+	return s.tokenMetadata.Set(*item.TokenID, &cachedTokenMetadata{tm: item})
+}
+
+// AddTokenMetadataAt puts token metadata read from a database snapshot whose
+// slp index tip is tip into the cache.
+func (s *SlpCache) AddTokenMetadataAt(item TokenMetadata, tip chainhash.Hash) error {
+	return s.tokenMetadata.Set(*item.TokenID,
+		&cachedTokenMetadata{tm: item, tip: &tip})
+}
+
+// GetTokenMetadata gets token metadata from the cache for a reader of a
+// database snapshot whose slp index tip is tip, or nil if not known.  Metadata
+// read from a snapshot with another tip is not returned.
+func (s *SlpCache) GetTokenMetadata(hash *chainhash.Hash, tip *chainhash.Hash) (TokenMetadata, bool) {
 	if entry, err := s.tokenMetadata.Get(*hash); err == nil {
-		if val, ok := entry.(*TokenMetadata); ok {
-			return *val, true
+		if val, ok := entry.(*cachedTokenMetadata); ok &&
+			(val.tip == nil || (tip != nil && *val.tip == *tip)) {
+
+			return val.tm, true
 		}
 	}
 	return TokenMetadata{}, false
 }
 
-// RemoveTokenMetadata removes a token metadata item from cache
-func (s *SlpCache) RemoveTokenMetadata(hash chainhash.Hash) {
+// RemoveTokenMetadata removes the cached metadata of the token hash as a block
+// confirms mint, a MINT of the token, unless another memory pool transaction
+// set it.  That is a later MINT spending the confirmed one's mint baton, whose
+// metadata stays while it is in the memory pool, or one no longer in the pool
+// once the block is connected, whose metadata RemoveMempoolSlpTxsNotIn removes
+// at the block's event.
+func (s *SlpCache) RemoveTokenMetadata(hash, mint chainhash.Hash) {
+	s.Lock()
+	defer s.Unlock()
+
+	if from, ok := s.mempoolTokenMetadata[hash]; ok && from != mint {
+		return
+	}
+	delete(s.mempoolTokenMetadata, hash)
 	s.tokenMetadata.Remove(hash)
 }
 
-// RemoveMempoolSlpTxItems is called on block events to remove mempool transaction items and
-// also we clear the tempTokenMetadata to avoid corrupt mint baton state from double spends
+// RemoveMempoolSlpTxItems is called on block events to remove the mempool
+// transaction items of the block's transactions, and the token metadata they
+// set in the memory pool, which the index now has.
 func (s *SlpCache) RemoveMempoolSlpTxItems(txs []*bchutil.Tx) {
 	s.Lock()
 	defer s.Unlock()
 
 	for _, tx := range txs {
-		hash := tx.MsgTx().TxHash()
-		delete(s.mempoolSlpTxEntries, hash)
+		hash := tx.Hash()
+		entry, ok := s.mempoolSlpTxEntries[*hash]
+		if !ok {
+			continue
+		}
+		delete(s.mempoolSlpTxEntries, *hash)
+		if from, ok := s.mempoolTokenMetadata[entry.TokenIDHash]; ok &&
+			from == *hash {
+
+			delete(s.mempoolTokenMetadata, entry.TokenIDHash)
+			s.tokenMetadata.Remove(entry.TokenIDHash)
+		}
+	}
+}
+
+// RemoveMempoolSlpTxsNotIn removes the mempool transaction items, and the
+// token metadata, of the transactions that inPool reports are no longer in the
+// memory pool.  A transaction that left it without being confirmed, as when a
+// conflicting one was, or that a reorg disconnected and the memory pool did
+// not take back, is not valid slp, and may have put a mint baton on an output
+// that does not exist.
+//
+// inPool is called with no cache lock held.  It takes the memory pool's lock,
+// whose holder may be waiting for the chain lock, which block connection holds
+// while it takes the cache lock, so holding the cache lock while waiting for
+// the memory pool could deadlock all three.
+func (s *SlpCache) RemoveMempoolSlpTxsNotIn(inPool func(*chainhash.Hash) bool) {
+	s.RLock()
+	entries := maps.Clone(s.mempoolSlpTxEntries)
+	sources := maps.Clone(s.mempoolTokenMetadata)
+	s.RUnlock()
+
+	// Leave in the copies only what transactions that left the memory pool
+	// put there.
+	for hash := range entries {
+		if inPool(&hash) {
+			delete(entries, hash)
+		}
+	}
+	for tokenID, from := range sources {
+		if inPool(&from) {
+			delete(sources, tokenID)
+		}
+	}
+
+	// Remove them, but not an entry or token metadata that was replaced
+	// while the memory pool was asked, as that is not the one it was asked
+	// about.
+	s.Lock()
+	defer s.Unlock()
+
+	for hash, entry := range entries {
+		if s.mempoolSlpTxEntries[hash] == entry {
+			delete(s.mempoolSlpTxEntries, hash)
+
+			// The LRU's entry goes too, unless the index's entry of a
+			// block confirming the transaction replaced it.  One the
+			// index sets meanwhile may go as well, as the LRU could
+			// evict it.
+			if cached, err := s.slpTxEntries.Get(hash); err == nil && cached == entry {
+				s.slpTxEntries.Remove(hash)
+			}
+		}
+	}
+	for tokenID, from := range sources {
+		if current, ok := s.mempoolTokenMetadata[tokenID]; ok && current == from {
+			delete(s.mempoolTokenMetadata, tokenID)
+			s.tokenMetadata.Remove(tokenID)
+		}
 	}
 }
 

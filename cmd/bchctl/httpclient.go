@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -11,28 +12,22 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/btcsuite/go-socks/socks"
 	"github.com/gcash/bchd/btcjson"
+	"github.com/gcash/bchd/internal/socks"
 )
 
 // newHTTPClient returns a new HTTP client that is configured according to the
 // proxy and TLS settings in the associated connection configuration.
 func newHTTPClient(cfg *config) (*http.Client, error) {
 	// Configure proxy if needed.
-	var dial func(network, addr string) (net.Conn, error)
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	if cfg.Proxy != "" {
 		proxy := &socks.Proxy{
 			Addr:     cfg.Proxy,
 			Username: cfg.ProxyUser,
 			Password: cfg.ProxyPass,
 		}
-		dial = func(network, addr string) (net.Conn, error) {
-			c, err := proxy.Dial(network, addr)
-			if err != nil {
-				return nil, err
-			}
-			return c, nil
-		}
+		dialContext = proxy.DialContext
 	}
 
 	// Configure TLS if needed.
@@ -55,7 +50,7 @@ func newHTTPClient(cfg *config) (*http.Client, error) {
 	// proxy and TLS.
 	client := http.Client{
 		Transport: &http.Transport{
-			Dial:            dial,
+			DialContext:     dialContext,
 			TLSClientConfig: tlsConfig,
 		},
 	}

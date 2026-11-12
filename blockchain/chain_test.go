@@ -136,7 +136,7 @@ func TestCalcSequenceLock(t *testing.T) {
 	node := chain.bestChain.Tip()
 	blockTime := node.Header().Timestamp
 	numBlocksToActivate := (netParams.MinerConfirmationWindow * 3)
-	for i := uint32(0); i < numBlocksToActivate; i++ {
+	for range numBlocksToActivate {
 		blockTime = blockTime.Add(time.Second)
 		node = newFakeNode(node, blockVersion, 0, blockTime)
 		chain.index.AddNode(node)
@@ -318,6 +318,38 @@ func TestCalcSequenceLock(t *testing.T) {
 				BlockHeight: prevUtxoHeight + 2,
 			},
 		},
+		// The same input in a transaction whose version is negative as
+		// a signed number.  BIP68 and BCHN read the version as
+		// unsigned, so it is at least 2 and the sequence lock applies.
+		{
+			tx: &wire.MsgTx{
+				Version: -1,
+				TxIn: []*wire.TxIn{{
+					PreviousOutPoint: utxo,
+					Sequence:         LockTimeToSequence(false, 3),
+				}},
+			},
+			view: utxoView,
+			want: &SequenceLock{
+				Seconds:     -1,
+				BlockHeight: prevUtxoHeight + 2,
+			},
+		},
+		// A transaction of version zero has sequence locks disabled.
+		{
+			tx: &wire.MsgTx{
+				Version: 0,
+				TxIn: []*wire.TxIn{{
+					PreviousOutPoint: utxo,
+					Sequence:         LockTimeToSequence(false, 3),
+				}},
+			},
+			view: utxoView,
+			want: &SequenceLock{
+				Seconds:     -1,
+				BlockHeight: -1,
+			},
+		},
 		// A transaction with two inputs with lock times expressed in
 		// seconds.  The selected sequence lock value for seconds should
 		// be the time further in the future.
@@ -442,6 +474,53 @@ func TestCalcSequenceLock(t *testing.T) {
 			t.Fatalf("test #%d got height of %v want height of %v ",
 				i, seqLock.BlockHeight, test.want.BlockHeight)
 		}
+	}
+}
+
+// TestNextBlockSequenceLock ensures the sequence locks of a block template are
+// computed from the block it extends, also when the tip has moved back below
+// that block, and that computing them from a tip below an input fails rather
+// than panics.
+func TestNextBlockSequenceLock(t *testing.T) {
+	chain := newFakeChain(&chaincfg.SimNetParams)
+	node := chain.bestChain.Tip()
+	blockTime := node.Header().Timestamp
+	for range 10 {
+		blockTime = blockTime.Add(time.Second)
+		node = newFakeNode(node, 1, 0, blockTime)
+		chain.index.AddNode(node)
+		chain.bestChain.SetTip(node)
+	}
+	parent := node
+
+	// An output created in a template on the parent, spent by a version 2
+	// transaction with a relative time lock.
+	parentTx := bchutil.NewTx(&wire.MsgTx{
+		TxOut: []*wire.TxOut{{Value: 10}},
+	})
+	view := NewUtxoViewpoint()
+	view.AddTxOuts(parentTx, parent.height+1)
+	tx := bchutil.NewTx(&wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: *parentTx.Hash()},
+			Sequence:         LockTimeToSequence(true, 512),
+		}},
+	})
+	wantSeconds := parent.CalcPastMedianTime().Unix() + 511
+
+	// The tip moves back below the parent.
+	chain.bestChain.SetTip(parent.parent)
+	if _, err := chain.CalcSequenceLock(tx, view, true); err == nil {
+		t.Fatal("no error for an input above the tip")
+	}
+	lock, err := chain.NextBlockSequenceLock(&parent.hash, tx, view)
+	if err != nil {
+		t.Fatalf("unable to calc sequence lock: %v", err)
+	}
+	if lock.Seconds != wantSeconds || lock.BlockHeight != -1 {
+		t.Fatalf("got %d seconds and height %d, want %d seconds and "+
+			"height -1", lock.Seconds, lock.BlockHeight, wantSeconds)
 	}
 }
 
@@ -968,5 +1047,49 @@ func TestIntervalBlockHashes(t *testing.T) {
 			t.Errorf("%s: unxpected hashes -- got %v, want %v",
 				test.name, hashes, test.hashes)
 		}
+	}
+}
+
+// fixedTimeSource is a MedianTimeSource whose time the test sets.
+type fixedTimeSource struct {
+	now time.Time
+}
+
+func (s *fixedTimeSource) AdjustedTime() time.Time { return s.now }
+
+func (s *fixedTimeSource) AddTimeSample(string, time.Time) {}
+
+func (s *fixedTimeSource) Offset() time.Duration { return 0 }
+
+// TestIsInitialBlockDownload ensures the chain is in its initial block
+// download until it is current, and stays out of it once it has been current.
+func TestIsInitialBlockDownload(t *testing.T) {
+	chain, teardownFunc, err := chainSetup("isinitialblockdownload",
+		&chaincfg.RegressionNetParams)
+	if err != nil {
+		t.Fatalf("Failed to setup chain instance: %v", err)
+	}
+	defer teardownFunc()
+
+	genesisTime := chaincfg.RegressionNetParams.GenesisBlock.Header.Timestamp
+	clock := &fixedTimeSource{now: genesisTime.Add(48 * time.Hour)}
+	chain.timeSource = clock
+
+	if !chain.IsInitialBlockDownload() {
+		t.Fatal("a tip 48 hours old is not in initial block download")
+	}
+
+	clock.now = genesisTime.Add(time.Hour)
+	if chain.IsInitialBlockDownload() {
+		t.Fatal("a tip an hour old is still in initial block download")
+	}
+
+	clock.now = genesisTime.Add(48 * time.Hour)
+	if chain.IsCurrent() {
+		t.Fatal("a tip 48 hours old is current")
+	}
+	if chain.IsInitialBlockDownload() {
+		t.Fatal("a chain that has been current went back into initial " +
+			"block download")
 	}
 }

@@ -5,6 +5,9 @@
 package blockchain
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -201,9 +204,9 @@ func setValidMerkleRoot(b *wire.MsgBlock) {
 //nolint:unused // retained for future tests
 func repeatScript(n int, newBytes ...byte) []byte {
 	script := make([]byte, n*len(newBytes))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		offset := i * len(newBytes)
-		for j := 0; j < len(newBytes); j++ {
+		for j := range newBytes {
 			script[offset+j] = newBytes[j]
 		}
 	}
@@ -228,6 +231,55 @@ func TestCheckBlockSanity(t *testing.T) {
 	err = CheckBlockSanity(block, powLimit, timeSource, true, false)
 	if err == nil {
 		t.Errorf("CheckBlockSanity: error is nil when it shouldn't be")
+	}
+}
+
+// TestCheckHeaderProofOfWork tests the CheckHeaderProofOfWork function to
+// ensure it accepts a valid header and rejects headers with a hash above the
+// target, a target above the proof of work limit, or a zero target.
+func TestCheckHeaderProofOfWork(t *testing.T) {
+	powLimit := chaincfg.MainNetParams.PowLimit
+	valid := Block100000.Header
+
+	tests := []struct {
+		name    string
+		mutate  func(h *wire.BlockHeader)
+		wantErr ErrorCode
+		valid   bool
+	}{{
+		name:   "valid header",
+		mutate: func(h *wire.BlockHeader) {},
+		valid:  true,
+	}, {
+		name:    "hash above target",
+		mutate:  func(h *wire.BlockHeader) { h.Nonce++ },
+		wantErr: ErrHighHash,
+	}, {
+		name:    "target above pow limit",
+		mutate:  func(h *wire.BlockHeader) { h.Bits = 0x207fffff },
+		wantErr: ErrUnexpectedDifficulty,
+	}, {
+		name:    "zero target",
+		mutate:  func(h *wire.BlockHeader) { h.Bits = 0 },
+		wantErr: ErrUnexpectedDifficulty,
+	}}
+
+	for _, test := range tests {
+		header := valid
+		test.mutate(&header)
+		err := CheckHeaderProofOfWork(&header, powLimit)
+		if test.valid {
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", test.name,
+					err)
+			}
+			continue
+		}
+		var rerr RuleError
+		if !errors.As(err, &rerr) || rerr.ErrorCode != test.wantErr {
+			t.Errorf("%s: got error %v, want error code %v",
+				test.name, err, test.wantErr)
+		}
 	}
 }
 
@@ -294,6 +346,199 @@ func TestCheckSerializedHeight(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestCheckSerializedHeightMinimal ensures the coinbase signature script must
+// start with the minimal push of the block height.
+func TestCheckSerializedHeightMinimal(t *testing.T) {
+	type vector struct {
+		height  int32
+		minimal []byte
+		bad     [][]byte
+	}
+	vectors := []vector{
+		{0, []byte{0x00}, [][]byte{{0x01, 0x00}, {0x02, 0x00, 0x00}}},
+		{17, []byte{0x01, 0x11}, [][]byte{{0x02, 0x11, 0x00}}},
+		{127, []byte{0x01, 0x7f}, [][]byte{{0x02, 0x7f, 0x00}}},
+		{128, []byte{0x02, 0x80, 0x00}, [][]byte{{0x01, 0x80},
+			{0x04, 0x80, 0x00, 0x00, 0x00}}},
+		{255, []byte{0x02, 0xff, 0x00}, [][]byte{{0x01, 0xff},
+			{0x03, 0xff, 0x00, 0x00}}},
+		{256, []byte{0x02, 0x00, 0x01}, [][]byte{{0x03, 0x00, 0x01, 0x00}}},
+		{32767, []byte{0x02, 0xff, 0x7f}, [][]byte{{0x03, 0xff, 0x7f, 0x00}}},
+		{32768, []byte{0x03, 0x00, 0x80, 0x00}, [][]byte{{0x02, 0x00, 0x80},
+			{0x04, 0x00, 0x80, 0x00, 0x00}}},
+		{8388607, []byte{0x03, 0xff, 0xff, 0x7f}, [][]byte{
+			{0x04, 0xff, 0xff, 0x7f, 0x00}}},
+		{8388608, []byte{0x04, 0x00, 0x00, 0x80, 0x00}, [][]byte{
+			{0x03, 0x00, 0x00, 0x80}}},
+		{950000, []byte{0x03, 0xf0, 0x7e, 0x0e}, [][]byte{
+			{0x04, 0xf0, 0x7e, 0x0e, 0x00},
+			{0x08, 0xf0, 0x7e, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00},
+			{txscript.OP_PUSHDATA1, 0x03, 0xf0, 0x7e, 0x0e},
+		}},
+	}
+	// Heights 1 to 16 must use OP_1 to OP_16, not a data push.
+	for h := int32(1); h <= 16; h++ {
+		vectors = append(vectors, vector{h,
+			[]byte{byte(txscript.OP_1 - 1 + h)},
+			[][]byte{{0x01, byte(h)}, {0x02, byte(h), 0x00}}})
+	}
+
+	check := func(sigScript []byte, height int32) error {
+		msgTx := wire.NewMsgTx(1)
+		msgTx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{},
+			math.MaxUint32), sigScript))
+		return checkSerializedHeight(bchutil.NewTx(msgTx), height)
+	}
+	for _, v := range vectors {
+		if err := check(v.minimal, v.height); err != nil {
+			t.Errorf("height %d: minimal %x rejected: %v", v.height,
+				v.minimal, err)
+		}
+		// Data after the height push is allowed.
+		extra := append(append([]byte{}, v.minimal...), 0x04, 1, 2, 3, 4)
+		if err := check(extra, v.height); err != nil {
+			t.Errorf("height %d: %x rejected: %v", v.height, extra, err)
+		}
+		if err := check(v.minimal, v.height+1); err == nil {
+			t.Errorf("height %d: %x accepted for height %d",
+				v.height, v.minimal, v.height+1)
+		}
+		for _, bad := range v.bad {
+			err := check(bad, v.height)
+			rerr, ok := err.(RuleError)
+			if !ok || (rerr.ErrorCode != ErrBadCoinbaseHeight &&
+				rerr.ErrorCode != ErrMissingCoinbaseHeight) {
+
+				t.Errorf("height %d: non-minimal %x: got %v, want "+
+					"%v", v.height, bad, err, ErrBadCoinbaseHeight)
+			}
+		}
+	}
+}
+
+// TestTxVersionRule ensures the transaction version range is enforced for
+// every transaction in a block, the coinbase included, from the first block
+// after the Upgrade9 fork height.
+func TestTxVersionRule(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Upgrade9ForkHeight = 2
+	chain, teardownFunc, err := chainSetup("txversionrule", &params)
+	if err != nil {
+		t.Fatalf("Failed to setup chain instance: %v", err)
+	}
+	defer teardownFunc()
+	chain.TstSetCoinbaseMaturity(1)
+
+	// Pad transactions above the minimum transaction size.
+	padding := wire.NewTxOut(0, append([]byte{txscript.OP_RETURN, 64},
+		make([]byte, 64)...), wire.TokenData{})
+
+	tip := params.GenesisBlock
+	newCoinbase := func(height int32, version int32) *wire.MsgTx {
+		cb := wire.NewMsgTx(version)
+		cb.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Index: math.MaxUint32},
+			SignatureScript:  []byte{txscript.OP_DATA_2, byte(height), 0},
+			Sequence:         wire.MaxTxInSequenceNum,
+		})
+		cb.AddTxOut(wire.NewTxOut(CalcBlockSubsidy(height, &params),
+			[]byte{txscript.OP_TRUE}, wire.TokenData{}))
+		cb.AddTxOut(padding)
+		return cb
+	}
+	newBlock := func(txs ...*wire.MsgTx) *bchutil.Block {
+		height := chain.BestSnapshot().Height + 1
+		ts := tip.Header.Timestamp.Add(10 * time.Minute)
+		bits, err := chain.CalcNextRequiredDifficulty(ts)
+		if err != nil {
+			t.Fatalf("CalcNextRequiredDifficulty: %v", err)
+		}
+		msgBlock := &wire.MsgBlock{
+			Header: wire.BlockHeader{
+				Version:   4,
+				PrevBlock: tip.BlockHash(),
+				Timestamp: ts,
+				Bits:      bits,
+			},
+			Transactions: txs,
+		}
+		utxs := make([]*bchutil.Tx, 0, len(txs))
+		for _, tx := range txs {
+			utxs = append(utxs, bchutil.NewTx(tx))
+		}
+		merkles := BuildMerkleTreeStore(utxs)
+		msgBlock.Header.MerkleRoot = *merkles[len(merkles)-1]
+		target := CompactToBig(bits)
+		for {
+			hash := msgBlock.Header.BlockHash()
+			if HashToBig(&hash).Cmp(target) <= 0 {
+				break
+			}
+			msgBlock.Header.Nonce++
+		}
+		block := bchutil.NewBlock(msgBlock)
+		block.SetHeight(height)
+		return block
+	}
+	process := func(block *bchutil.Block) error {
+		_, _, err := chain.ProcessBlock(block, BFNone)
+		if err == nil {
+			tip = block.MsgBlock()
+		}
+		return err
+	}
+	mustAccept := func(desc string, block *bchutil.Block) {
+		t.Helper()
+		if err := process(block); err != nil {
+			t.Fatalf("%s: block at height %d rejected: %v", desc,
+				block.Height(), err)
+		}
+	}
+	mustReject := func(desc string, block *bchutil.Block) {
+		t.Helper()
+		err := process(block)
+		rerr, ok := err.(RuleError)
+		if !ok || rerr.ErrorCode != ErrBadTxVersion {
+			t.Fatalf("%s: block at height %d: got %v, want %v",
+				desc, block.Height(), err, ErrBadTxVersion)
+		}
+	}
+	spend := func(prev *wire.MsgTx, version int32) *wire.MsgTx {
+		tx := wire.NewMsgTx(version)
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash()},
+			Sequence:         wire.MaxTxInSequenceNum,
+		})
+		tx.AddTxOut(wire.NewTxOut(prev.TxOut[0].Value-1000,
+			[]byte{txscript.OP_TRUE}, wire.TokenData{}))
+		tx.AddTxOut(padding)
+		return tx
+	}
+
+	badVersions := []int32{0, 3, -1, math.MaxInt32, math.MinInt32}
+
+	// Block 1 provides an output to spend.
+	cb1 := newCoinbase(1, 1)
+	mustAccept("block 1", newBlock(cb1))
+
+	// Block 2 is at the fork height, so the rule is not active yet.
+	cb2 := newCoinbase(2, 3)
+	mustAccept("coinbase version 3 before activation",
+		newBlock(cb2, spend(cb1, 3)))
+
+	// From block 3 every transaction must have version 1 or 2.
+	for _, version := range badVersions {
+		desc := fmt.Sprintf("coinbase version %d", version)
+		mustReject(desc, newBlock(newCoinbase(3, version)))
+
+		desc = fmt.Sprintf("transaction version %d", version)
+		mustReject(desc, newBlock(newCoinbase(3, 1), spend(cb2, version)))
+	}
+	mustAccept("coinbase version 2", newBlock(newCoinbase(3, 2),
+		spend(cb2, 1)))
+	mustAccept("coinbase version 1", newBlock(newCoinbase(4, 1)))
 }
 
 // Block100000 defines block 100,000 of the block chain.  It is used to
@@ -546,4 +791,369 @@ var Block100000 = wire.MsgBlock{
 			LockTime: 0,
 		},
 	},
+}
+
+// TestCoinbaseTokenRule ensures a coinbase output with a token prefix is
+// accepted at the Upgrade9 fork height and rejected after it.
+func TestCoinbaseTokenRule(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Upgrade9ForkHeight = 2
+	chain, teardownFunc, err := chainSetup("coinbasetokenrule", &params)
+	if err != nil {
+		t.Fatalf("Failed to setup chain instance: %v", err)
+	}
+	defer teardownFunc()
+
+	// Pad transactions above the minimum transaction size.
+	padding := wire.NewTxOut(0, append([]byte{txscript.OP_RETURN, 64},
+		make([]byte, 64)...), wire.TokenData{})
+
+	tip := params.GenesisBlock
+	newCoinbase := func(height int32, extra *wire.TxOut) *wire.MsgTx {
+		cb := wire.NewMsgTx(1)
+		cb.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Index: math.MaxUint32},
+			SignatureScript:  []byte{txscript.OP_DATA_2, byte(height), 0},
+			Sequence:         wire.MaxTxInSequenceNum,
+		})
+		cb.AddTxOut(wire.NewTxOut(CalcBlockSubsidy(height, &params),
+			[]byte{txscript.OP_TRUE}, wire.TokenData{}))
+		cb.AddTxOut(padding)
+		if extra != nil {
+			cb.AddTxOut(extra)
+		}
+		return cb
+	}
+	newBlock := func(cb *wire.MsgTx) *bchutil.Block {
+		height := chain.BestSnapshot().Height + 1
+		ts := tip.Header.Timestamp.Add(10 * time.Minute)
+		bits, err := chain.CalcNextRequiredDifficulty(ts)
+		if err != nil {
+			t.Fatalf("CalcNextRequiredDifficulty: %v", err)
+		}
+		msgBlock := &wire.MsgBlock{
+			Header: wire.BlockHeader{
+				Version:    4,
+				PrevBlock:  tip.BlockHash(),
+				MerkleRoot: cb.TxHash(),
+				Timestamp:  ts,
+				Bits:       bits,
+			},
+			Transactions: []*wire.MsgTx{cb},
+		}
+		target := CompactToBig(bits)
+		for {
+			hash := msgBlock.Header.BlockHash()
+			if HashToBig(&hash).Cmp(target) <= 0 {
+				break
+			}
+			msgBlock.Header.Nonce++
+		}
+		block := bchutil.NewBlock(msgBlock)
+		block.SetHeight(height)
+		return block
+	}
+	process := func(block *bchutil.Block) error {
+		_, _, err := chain.ProcessBlock(block, BFNone)
+		if err == nil {
+			tip = block.MsgBlock()
+		}
+		return err
+	}
+	mustAccept := func(desc string, block *bchutil.Block) {
+		t.Helper()
+		if err := process(block); err != nil {
+			t.Fatalf("%s: block at height %d rejected: %v", desc,
+				block.Height(), err)
+		}
+	}
+	mustReject := func(desc string, block *bchutil.Block) {
+		t.Helper()
+		err := process(block)
+		rerr, ok := err.(RuleError)
+		if !ok || rerr.ErrorCode != ErrCoinbaseHasTokens {
+			t.Fatalf("%s: block at height %d: got %v, want %v",
+				desc, block.Height(), err, ErrCoinbaseHasTokens)
+		}
+	}
+
+	amount := uint64(1000)
+	tokenData, err := wire.NewTokenData([32]byte{1}, &amount, nil, nil)
+	if err != nil {
+		t.Fatalf("NewTokenData: %v", err)
+	}
+	tokenOutput := wire.NewTxOut(0, []byte{txscript.OP_TRUE}, *tokenData)
+	// A token prefix byte that does not start valid token data.
+	badPrefixOutput := wire.NewTxOut(0,
+		[]byte{wire.PREFIX_BYTE, txscript.OP_TRUE}, wire.TokenData{})
+
+	mustAccept("block 1", newBlock(newCoinbase(1, nil)))
+
+	// Block 2 is at the fork height, so the rule is not active yet.
+	mustAccept("token output before activation",
+		newBlock(newCoinbase(2, tokenOutput)))
+
+	// From block 3 the coinbase must not have a token prefix.
+	mustReject("token output", newBlock(newCoinbase(3, tokenOutput)))
+	mustReject("invalid token prefix",
+		newBlock(newCoinbase(3, badPrefixOutput)))
+	mustAccept("no token output", newBlock(newCoinbase(3, nil)))
+}
+
+// TestTokenValidityFailureMarksBlockInvalid ensures a block with a transaction
+// that fails the token validity algorithm is rejected with
+// ErrCashTokensValidation and marked invalid, so it is known to be invalid
+// when it arrives again.
+func TestTokenValidityFailureMarksBlockInvalid(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.MagneticAnonomalyForkHeight = 0
+	params.Upgrade9ForkHeight = 0
+	m := newRuleTestMiner(t, &params)
+
+	b1 := m.build(nil)
+	m.mustAccept(b1)
+	cb := b1.MsgBlock().Transactions[0]
+	prevOut := wire.OutPoint{Hash: cb.TxHash(), Index: 0}
+
+	// An NFT of a category that no input creates or carries.
+	capability := byte(wire.NONE)
+	nft, err := wire.NewTokenData([32]byte{1}, nil, nil, &capability)
+	if err != nil {
+		t.Fatalf("NewTokenData: %v", err)
+	}
+	tx := ruleTestSpend(prevOut, cb.TxOut[0].Value-1000, 1)
+	tx.TxOut[0].TokenData = *nft
+
+	block := m.build(nil, tx)
+	err = m.accept(block)
+	requireRuleError(t, err, ErrCashTokensValidation)
+	known, _, invalid := m.chain.BlockValidity(block.Hash())
+	if !known || !invalid {
+		t.Fatalf("block known %v, invalid %v, want both", known, invalid)
+	}
+}
+
+// TestRegtestP2SHBeforeActivationTime ensures that on regtest, where the
+// Magnetic Anomaly rules apply from the first block, the pay-to-script-hash
+// rules are enforced in blocks timestamped before txscript.Bip16Activation,
+// so a redeem script that evaluates to false is rejected while one that
+// evaluates to true is accepted.
+func TestRegtestP2SHBeforeActivationTime(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	m := newRuleTestMiner(t, &params)
+
+	// build returns a block like the miner's with a timestamp ten minutes
+	// after the tip, which on regtest is before the activation time.
+	build := func(txs ...*wire.MsgTx) *bchutil.Block {
+		blk := m.build(nil, txs...).MsgBlock()
+		blk.Header.Timestamp = m.tip.Header.Timestamp.Add(10 * time.Minute)
+		if !blk.Header.Timestamp.Before(txscript.Bip16Activation) {
+			t.Fatalf("block timestamp %v is not before %v",
+				blk.Header.Timestamp, txscript.Bip16Activation)
+		}
+		return m.solve(blk, m.height+1)
+	}
+
+	b1 := build()
+	m.mustAccept(b1)
+	cb := b1.MsgBlock().Transactions[0]
+	value := cb.TxOut[0].Value - 1000
+
+	// Pay to two script hashes, one of a redeem script that leaves false
+	// on the stack and one of a redeem script that leaves true.
+	falseRedeem := []byte{txscript.OP_FALSE}
+	trueRedeem := []byte{txscript.OP_TRUE}
+	p2sh := func(redeem []byte) []byte {
+		script, err := txscript.NewScriptBuilder().AddOp(txscript.OP_HASH160).
+			AddData(bchutil.Hash160(redeem)).AddOp(txscript.OP_EQUAL).Script()
+		if err != nil {
+			t.Fatalf("failed to build script: %v", err)
+		}
+		return script
+	}
+	fund := ruleTestSpend(wire.OutPoint{Hash: cb.TxHash(), Index: 0}, value/2, 1)
+	fund.TxOut[0].PkScript = p2sh(falseRedeem)
+	fund.AddTxOut(wire.NewTxOut(value/2, p2sh(trueRedeem), wire.TokenData{}))
+	m.mustAccept(build(fund))
+
+	spend := func(index uint32, redeem []byte, tag byte) *wire.MsgTx {
+		sigScript, err := txscript.NewScriptBuilder().AddData(redeem).Script()
+		if err != nil {
+			t.Fatalf("failed to build script: %v", err)
+		}
+		prevOut := wire.OutPoint{Hash: fund.TxHash(), Index: index}
+		tx := ruleTestSpend(prevOut, value/2-1000, tag)
+		tx.TxIn[0].SignatureScript = sigScript
+		return tx
+	}
+	err := m.accept(build(spend(0, falseRedeem, 2)))
+	requireRuleError(t, err, ErrScriptValidation)
+	m.mustAccept(build(spend(2, trueRedeem, 3)))
+}
+
+// TestCheckBlockHeaderContextParent ensures a header is checked against its
+// own parent, which must be known and not known to be invalid.
+func TestCheckBlockHeaderContextParent(t *testing.T) {
+	params := &chaincfg.RegressionNetParams
+	chain := newFakeChain(params)
+	invalid := newFakeNode(chain.bestChain.Tip(), 1, params.PowLimitBits,
+		time.Now())
+	chain.index.AddNode(invalid)
+	chain.index.SetStatusFlags(invalid, statusValidateFailed)
+
+	header := func(prev chainhash.Hash) *wire.BlockHeader {
+		header := &wire.BlockHeader{
+			Version:   1,
+			PrevBlock: prev,
+			Bits:      params.PowLimitBits,
+			Timestamp: time.Unix(time.Now().Unix(), 0),
+		}
+		for CheckHeaderProofOfWork(header, params.PowLimit) != nil {
+			header.Nonce++
+		}
+		return header
+	}
+	tests := []struct {
+		name string
+		prev chainhash.Hash
+		want ErrorCode
+	}{
+		{"unknown parent", chainhash.Hash{1}, ErrPreviousBlockUnknown},
+		{"invalid parent", invalid.hash, ErrInvalidAncestorBlock},
+	}
+	for _, test := range tests {
+		err := chain.CheckBlockHeaderContext(header(test.prev))
+		var rerr RuleError
+		if !errors.As(err, &rerr) || rerr.ErrorCode != test.want {
+			t.Errorf("%s: got %v, want %v", test.name, err, test.want)
+		}
+	}
+}
+
+// TestCheckBlockForRelay ensures the checks a compact block passes before it
+// is relayed need its parent and include the sanity checks.
+func TestCheckBlockForRelay(t *testing.T) {
+	params := &chaincfg.RegressionNetParams
+	chain := newFakeChain(params)
+
+	// A block holding no transactions fails the sanity checks.
+	header := wire.BlockHeader{
+		PrevBlock: *params.GenesisHash,
+		Bits:      params.PowLimitBits,
+		Timestamp: time.Unix(time.Now().Unix(), 0),
+	}
+	for CheckHeaderProofOfWork(&header, params.PowLimit) != nil {
+		header.Nonce++
+	}
+	block := bchutil.NewBlock(&wire.MsgBlock{Header: header})
+	var rerr RuleError
+	if err := chain.CheckBlockForRelay(block); !errors.As(err, &rerr) ||
+		rerr.ErrorCode != ErrNoTransactions {
+
+		t.Errorf("block without transactions: got %v, want %v", err,
+			ErrNoTransactions)
+	}
+
+	// A block that passes the sanity checks but is timed no later than
+	// its parent's median time fails the context checks.
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{},
+		math.MaxUint32), make([]byte, 60)))
+	coinbase.AddTxOut(wire.NewTxOut(1, make([]byte, 25), wire.TokenData{}))
+	msgBlock := wire.MsgBlock{
+		Header: wire.BlockHeader{
+			PrevBlock: *params.GenesisHash,
+			Bits:      params.PowLimitBits,
+			Timestamp: params.GenesisBlock.Header.Timestamp,
+		},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+	merkles := BuildMerkleTreeStore(bchutil.NewBlock(&msgBlock).Transactions())
+	msgBlock.Header.MerkleRoot = *merkles[len(merkles)-1]
+	for CheckHeaderProofOfWork(&msgBlock.Header, params.PowLimit) != nil {
+		msgBlock.Header.Nonce++
+	}
+	if err := chain.CheckBlockForRelay(bchutil.NewBlock(&msgBlock)); !errors.As(err, &rerr) ||
+		rerr.ErrorCode != ErrTimeTooOld {
+
+		t.Errorf("block timed too early: got %v, want %v", err, ErrTimeTooOld)
+	}
+
+	orphan := bchutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{
+		PrevBlock: chainhash.Hash{1},
+	}})
+	if err := chain.CheckBlockForRelay(orphan); !errors.As(err, &rerr) ||
+		rerr.ErrorCode != ErrPreviousBlockUnknown {
+
+		t.Errorf("unknown parent: got %v, want %v", err,
+			ErrPreviousBlockUnknown)
+	}
+}
+
+// TestTxValueErrorCodes ensures each check of the values of a transaction's
+// outputs, and of the outputs it spends, returns its own error code, as Bitcoin
+// Cash Node gives each its own reason.
+func TestTxValueErrorCodes(t *testing.T) {
+	// The script is long enough for the transactions to pass the minimum
+	// transaction size.
+	script := append(bytes.Repeat([]byte{txscript.OP_NOP}, 10), txscript.OP_TRUE)
+	spendingTx := func(numInputs int, values ...int64) *bchutil.Tx {
+		tx := wire.NewMsgTx(1)
+		for i := range numInputs {
+			tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+				Hash:  chainhash.Hash{1},
+				Index: uint32(i),
+			}, nil))
+		}
+		for _, value := range values {
+			tx.AddTxOut(wire.NewTxOut(value, script, wire.TokenData{}))
+		}
+		return bchutil.NewTx(tx)
+	}
+	checkCode := func(what string, err error, want ErrorCode) {
+		t.Helper()
+		var rerr RuleError
+		if !errors.As(err, &rerr) || rerr.ErrorCode != want {
+			t.Errorf("%s: got %v, want %v", what, err, want)
+		}
+	}
+
+	sanity := []struct {
+		name   string
+		values []int64
+		want   ErrorCode
+	}{
+		{"negative output", []int64{-1}, ErrTxOutValueNegative},
+		{"output above the supply", []int64{bchutil.MaxSatoshi + 1},
+			ErrTxOutValueTooHigh},
+		{"outputs above the supply", []int64{bchutil.MaxSatoshi, 1},
+			ErrTxOutTotalTooHigh},
+	}
+	for _, test := range sanity {
+		err := CheckTransactionSanity(spendingTx(1, test.values...), true,
+			true, txscript.StandardVerifyFlags)
+		checkCode(test.name, err, test.want)
+	}
+
+	inputs := []struct {
+		name  string
+		spent []int64
+	}{
+		{"negative spent output", []int64{-1}},
+		{"spent output above the supply", []int64{bchutil.MaxSatoshi + 1}},
+		{"spent outputs above the supply",
+			[]int64{bchutil.MaxSatoshi, bchutil.MaxSatoshi}},
+	}
+	for _, test := range inputs {
+		tx := spendingTx(len(test.spent), 1)
+		view := NewUtxoViewpoint()
+		for i, value := range test.spent {
+			view.Entries()[tx.MsgTx().TxIn[i].PreviousOutPoint] =
+				NewUtxoEntry(wire.NewTxOut(value, script,
+					wire.TokenData{}), 1, false)
+		}
+		_, err := CheckTransactionInputs(tx, 1000, view,
+			&chaincfg.RegressionNetParams)
+		checkCode(test.name, err, ErrTxInValueOutOfRange)
+	}
 }

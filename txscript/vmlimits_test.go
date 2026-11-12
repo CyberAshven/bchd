@@ -146,7 +146,7 @@ func TestVMlimitsAndBigInt2023Standard(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -297,7 +297,7 @@ func TestVMlimitsAndBigInt2023NonStandard(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -449,7 +449,7 @@ func TestVMlimitsAndBigInt2023Invalid(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -495,9 +495,7 @@ func TestVMlimitsAndBigInt2023Invalid(t *testing.T) {
 				// fatalf(t, err.Error(), test, i)
 			}
 
-			if err == nil {
-				t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
-			}
+			t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
 		}
 	}
 }
@@ -612,7 +610,7 @@ func TestVMlimitsAndBigInt2025Standard(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -671,10 +669,27 @@ func TestVMlimitsAndBigInt2025Standard(t *testing.T) {
 				fatalf(t, "operation cost did not match. "+str, test, i)
 			}
 
-			if vm.GetMetrics().GetHashDigestIterations() != densityControl {
-				if err != nil {
-					fatalf(t, "number of hash digest iterations did not match", test, i)
-				}
+			// CHIP-2021-05 maximum hashing density: an input's hash digest
+			// iteration budget is (41 + scriptSigSize) / 2, with a 7x bonus for
+			// non-standard (block) transactions.  Fixture field [0] is exactly
+			// 41 + scriptSigSize, so the expected limit follows from it.
+			hashIterBonus := int64(txscript.HashIterBonusForNonStandardTxns)
+			if flags.HasFlag(txscript.ScriptAllowMay2025StandardOnly) {
+				hashIterBonus = 1
+			}
+			expectedHashIterLimit := (densityControl * hashIterBonus) / 2
+
+			if vm.GetMetrics().GetMaxDigestIterationLimit() != expectedHashIterLimit {
+				str := fmt.Sprintf("test hash iteration limit: %d, script hash iteration limit: %d",
+					expectedHashIterLimit,
+					vm.GetMetrics().GetMaxDigestIterationLimit())
+				fatalf(t, "hash digest iteration limit did not match. "+str, test, i)
+			}
+
+			if vm.GetMetrics().GetHashDigestIterations() > expectedHashIterLimit {
+				str := fmt.Sprintf("hash iterations: %d, limit: %d",
+					vm.GetMetrics().GetHashDigestIterations(), expectedHashIterLimit)
+				fatalf(t, "hash digest iterations exceeded the limit. "+str, test, i)
 			}
 
 			if vm.GetMetrics().GetMaxOpCostLimit() != maximumOperationCost {
@@ -790,7 +805,7 @@ func TestVMlimitsAndBigInt2025NonStandard(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -804,6 +819,7 @@ func TestVMlimitsAndBigInt2025NonStandard(t *testing.T) {
 
 			flags := txscript.StandardVerifyFlags | txscript.ScriptAllowCashTokens | txscript.ScriptAllowMay2025
 			flags ^= txscript.ScriptDiscourageUpgradableNops
+			flags &^= txscript.ScriptVerifyInputSigChecks
 
 			err = blockchain.CheckTransactionSanity(bchutilTx, true, true, flags)
 			if err != nil { // Failed TX, move to the next one
@@ -846,10 +862,27 @@ func TestVMlimitsAndBigInt2025NonStandard(t *testing.T) {
 				fatalf(t, "operation cost did not match. "+str, test, i)
 			}
 
-			if vm.GetMetrics().GetHashDigestIterations() != densityControl {
-				if err != nil {
-					fatalf(t, "number of hash digest iterations did not match", test, i)
-				}
+			// CHIP-2021-05 maximum hashing density: an input's hash digest
+			// iteration budget is (41 + scriptSigSize) / 2, with a 7x bonus for
+			// non-standard (block) transactions.  Fixture field [0] is exactly
+			// 41 + scriptSigSize, so the expected limit follows from it.
+			hashIterBonus := int64(txscript.HashIterBonusForNonStandardTxns)
+			if flags.HasFlag(txscript.ScriptAllowMay2025StandardOnly) {
+				hashIterBonus = 1
+			}
+			expectedHashIterLimit := (densityControl * hashIterBonus) / 2
+
+			if vm.GetMetrics().GetMaxDigestIterationLimit() != expectedHashIterLimit {
+				str := fmt.Sprintf("test hash iteration limit: %d, script hash iteration limit: %d",
+					expectedHashIterLimit,
+					vm.GetMetrics().GetMaxDigestIterationLimit())
+				fatalf(t, "hash digest iteration limit did not match. "+str, test, i)
+			}
+
+			if vm.GetMetrics().GetHashDigestIterations() > expectedHashIterLimit {
+				str := fmt.Sprintf("hash iterations: %d, limit: %d",
+					vm.GetMetrics().GetHashDigestIterations(), expectedHashIterLimit)
+				fatalf(t, "hash digest iterations exceeded the limit. "+str, test, i)
 			}
 
 			if vm.GetMetrics().GetMaxOpCostLimit() != maximumOperationCost {
@@ -958,7 +991,7 @@ func TestVMlimitsAndBigInt2025Invalid(t *testing.T) {
 
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -1004,32 +1037,10 @@ func TestVMlimitsAndBigInt2025Invalid(t *testing.T) {
 				// fatalf(t, err.Error(), test, i)
 			}
 
-			if testLimits[test[0].(string)] != nil {
-				densityControl := int64(testLimits[test[0].(string)].([]interface{})[0].(float64))
-				maximumOperationCost := int64(testLimits[test[0].(string)].([]interface{})[1].(float64))
-				operationCost := int64(testLimits[test[0].(string)].([]interface{})[2].(float64))
-
-				if vm.GetMetrics().GetCompositeOPCost(true) != operationCost {
-					continue
-					// fatalf(t, "operation cost did not match", test, i)
-				}
-
-				if vm.GetMetrics().GetHashDigestIterations() != densityControl {
-					if err != nil {
-						continue
-						// fatalf(t, "number of hash digest iterations did not match", test, i)
-					}
-				}
-
-				if vm.GetMetrics().GetMaxOpCostLimit() != maximumOperationCost {
-					continue
-					// fatalf(t, "max operation cost limit did not match", test, i)
-				}
-			}
-
-			if err == nil {
-				t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
-			}
+			// The vector asserts this script is invalid, so reaching here --
+			// execution succeeded -- is a failure.  Metric mismatches must not
+			// excuse it: they can only mask a real divergence, never catch one.
+			t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
 		}
 	}
 }

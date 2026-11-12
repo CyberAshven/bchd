@@ -1,0 +1,1017 @@
+// Copyright (c) 2026 The bchd developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gcash/bchd/blockchain"
+	"github.com/gcash/bchd/btcjson"
+	"github.com/gcash/bchd/chaincfg"
+	"github.com/gcash/bchd/chaincfg/chainhash"
+	"github.com/gcash/bchd/txscript"
+	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchutil"
+)
+
+// txHexWithTrailingBytes returns the hex encoding of a minimal but otherwise
+// valid transaction with an extra byte appended to it.  The result decodes to a
+// complete transaction without consuming all of the provided input, which is
+// exactly the case both raw transaction RPCs must reject.
+func txHexWithTrailingBytes(t *testing.T) string {
+	t.Helper()
+
+	tx := wire.NewMsgTx(1)
+	tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0), nil))
+	tx.AddTxOut(wire.NewTxOut(0, nil, wire.TokenData{}))
+
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		t.Fatalf("unable to serialize test transaction: %v", err)
+	}
+
+	return hex.EncodeToString(append(buf.Bytes(), 0x00))
+}
+
+// assertDeserializationError ensures the provided error is an RPC
+// deserialization error.
+func assertDeserializationError(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatal("expected trailing bytes to be rejected, got no error")
+	}
+
+	rpcErr, ok := err.(*btcjson.RPCError)
+	if !ok {
+		t.Fatalf("expected *btcjson.RPCError, got %T: %v", err, err)
+	}
+
+	if rpcErr.Code != btcjson.ErrRPCDeserialization {
+		t.Fatalf("expected error code %v, got %v (%v)",
+			btcjson.ErrRPCDeserialization, rpcErr.Code, rpcErr.Message)
+	}
+}
+
+// TestHandleDecodeRawTransactionTrailingBytes ensures decoderawtransaction
+// rejects a transaction that is followed by trailing bytes rather than
+// silently ignoring them and reporting success.
+func TestHandleDecodeRawTransactionTrailingBytes(t *testing.T) {
+	cmd := &btcjson.DecodeRawTransactionCmd{
+		HexTx: txHexWithTrailingBytes(t),
+	}
+
+	// The handler decodes its input before it touches the server, so a nil
+	// server is sufficient to exercise the rejection path.
+	_, err := handleDecodeRawTransaction(nil, cmd, nil)
+	assertDeserializationError(t, err)
+}
+
+// TestHandleSendRawTransactionTrailingBytes ensures sendrawtransaction rejects
+// a transaction that is followed by trailing bytes rather than accepting and
+// relaying it.
+func TestHandleSendRawTransactionTrailingBytes(t *testing.T) {
+	allowHighFees := false
+	cmd := &btcjson.SendRawTransactionCmd{
+		HexTx:         txHexWithTrailingBytes(t),
+		AllowHighFees: &allowHighFees,
+	}
+
+	// As above, the decode happens before the mempool is reached, so a nil
+	// server is sufficient.  Without the trailing byte check this panics on
+	// the nil server instead of returning, which is the symptom this test
+	// guards against.
+	_, err := handleSendRawTransaction(nil, cmd, nil)
+	assertDeserializationError(t, err)
+}
+
+// tokenTestP2PKHScript is the pay-to-pubkey-hash script that follows the token
+// prefix in the outputs used by the CashTokens output tests.
+const tokenTestP2PKHScript = "76a914ea132286328cfc819457b9dec386c4b5c84faa5c88ac"
+
+// tokenDataTests are CashTokens outputs paired with the token data that Bitcoin
+// Cash Node reports for them.  The prefixes and the expected JSON objects are
+// taken verbatim from the token_tests_prefix_valid.json test vectors of Bitcoin
+// Cash Node, except for the no-token output, which Bitcoin Cash Node reports
+// without a tokenData object.
+var tokenDataTests = []struct {
+	name     string
+	prefix   string
+	expected string
+}{
+	{
+		name:     "no token",
+		prefix:   "",
+		expected: "",
+	},
+	{
+		name:     "fungible tokens only",
+		prefix:   "ef21436587090000000000000000000000000000000000000000000090785634121001",
+		expected: `{"amount": "1", "category": "1234567890000000000000000000000000000000000000000000000987654321"}`,
+	},
+	{
+		name:     "immutable nft only",
+		prefix:   "efbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb6001cc",
+		expected: `{"amount": "0", "category": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nft": {"commitment": "cc", "capability": "none"}}`,
+	},
+	{
+		name:     "mutable nft only without commitment",
+		prefix:   "efbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb21",
+		expected: `{"amount": "0", "category": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nft": {"commitment": "", "capability": "mutable"}}`,
+	},
+	{
+		name:     "minting nft only without commitment",
+		prefix:   "efbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb22",
+		expected: `{"amount": "0", "category": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nft": {"commitment": "", "capability": "minting"}}`,
+	},
+	{
+		name:     "fungible tokens and mutable nft",
+		prefix:   "efbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb7102ccccffffffffffffffff7f",
+		expected: `{"amount": "9223372036854775807", "category": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nft": {"commitment": "cccc", "capability": "mutable"}}`,
+	},
+	{
+		name:     "fungible tokens and minting nft",
+		prefix:   "efbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb3201",
+		expected: `{"amount": "1", "category": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nft": {"commitment": "", "capability": "minting"}}`,
+	},
+}
+
+// decodeTokenTestTxOut returns the transaction output that results from
+// decoding an output whose script is the passed token prefix followed by
+// tokenTestP2PKHScript.
+func decodeTokenTestTxOut(t *testing.T, prefix string) *wire.TxOut {
+	t.Helper()
+
+	script, err := hex.DecodeString(prefix + tokenTestP2PKHScript)
+	if err != nil {
+		t.Fatalf("unable to decode test script: %v", err)
+	}
+
+	var buf bytes.Buffer
+	var value [8]byte
+	binary.LittleEndian.PutUint64(value[:], 1000)
+	buf.Write(value[:])
+	if err := wire.WriteVarBytes(&buf, 0, script); err != nil {
+		t.Fatalf("unable to serialize test output: %v", err)
+	}
+
+	var txOut wire.TxOut
+	if _, err := wire.ReadTxOut(&buf, 0, 1, &txOut); err != nil {
+		t.Fatalf("unable to deserialize test output: %v", err)
+	}
+
+	return &txOut
+}
+
+// assertTokenDataResult ensures the passed token data result matches the
+// expected JSON object, which is empty when no token data is expected.
+func assertTokenDataResult(t *testing.T, name string, result *btcjson.TokenDataResult, expected string) {
+	t.Helper()
+
+	if expected == "" {
+		if result != nil {
+			t.Errorf("%s: unexpected token data %+v", name, result)
+		}
+		return
+	}
+	if result == nil {
+		t.Errorf("%s: missing token data", name)
+		return
+	}
+
+	marshalled, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("%s: unable to marshal token data: %v", name, err)
+	}
+	var got, want interface{}
+	if err := json.Unmarshal(marshalled, &got); err != nil {
+		t.Fatalf("%s: unable to unmarshal token data: %v", name, err)
+	}
+	if err := json.Unmarshal([]byte(expected), &want); err != nil {
+		t.Fatalf("%s: unable to unmarshal expected token data: %v", name, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%s: unexpected token data - got %s, want %s", name,
+			marshalled, expected)
+	}
+}
+
+// TestCreateVoutListTokenData ensures the outputs reported by the raw
+// transaction RPCs include the CashTokens data of each output in the format
+// used by Bitcoin Cash Node, and that outputs without a token are reported
+// without a tokenData field.
+func TestCreateVoutListTokenData(t *testing.T) {
+	mtx := wire.NewMsgTx(2)
+	mtx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0), nil))
+	for _, test := range tokenDataTests {
+		mtx.AddTxOut(decodeTokenTestTxOut(t, test.prefix))
+	}
+
+	vouts := createVoutList(mtx, &chaincfg.MainNetParams, nil)
+	if len(vouts) != len(tokenDataTests) {
+		t.Fatalf("unexpected number of outputs - got %d, want %d",
+			len(vouts), len(tokenDataTests))
+	}
+	for i, test := range tokenDataTests {
+		vout := vouts[i]
+		if vout.ScriptPubKey.Hex != tokenTestP2PKHScript {
+			t.Errorf("%s: unexpected script - got %s, want %s",
+				test.name, vout.ScriptPubKey.Hex, tokenTestP2PKHScript)
+		}
+		assertTokenDataResult(t, test.name, vout.TokenData, test.expected)
+
+		marshalled, err := json.Marshal(vout)
+		if err != nil {
+			t.Fatalf("%s: unable to marshal output: %v", test.name, err)
+		}
+		hasTokenData := strings.Contains(string(marshalled), `"tokenData"`)
+		if hasTokenData != (test.expected != "") {
+			t.Errorf("%s: unexpected tokenData presence in %s",
+				test.name, marshalled)
+		}
+	}
+
+	// The tokenData object follows scriptPubKey, as it does in Bitcoin
+	// Cash Node.
+	marshalled, err := json.Marshal(vouts[5])
+	if err != nil {
+		t.Fatalf("unable to marshal output: %v", err)
+	}
+	const wantSuffix = `"type":"pubkeyhash","addresses":["qr4pxg5xx2x0eqv527uaasuxcj6usna2tsd4366h8k"]},` +
+		`"tokenData":{"category":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",` +
+		`"amount":"9223372036854775807","nft":{"capability":"mutable","commitment":"cccc"}}}`
+	if !strings.HasSuffix(string(marshalled), wantSuffix) {
+		t.Errorf("unexpected marshalled output - got %s, want suffix %s",
+			marshalled, wantSuffix)
+	}
+}
+
+// TestUtxoEntryTokenDataResult ensures the token data that gettxout reports
+// for an output in the UTXO set matches what it reports for the same output in
+// the mempool.
+func TestUtxoEntryTokenDataResult(t *testing.T) {
+	for _, test := range tokenDataTests {
+		txOut := decodeTokenTestTxOut(t, test.prefix)
+
+		// The mempool path of gettxout reads the token data from the
+		// transaction output itself.
+		assertTokenDataResult(t, test.name+" (mempool)",
+			createTokenDataResult(&txOut.TokenData), test.expected)
+
+		// The UTXO set path reads it from the UTXO entry.
+		entryTxOut := *txOut
+		entryTxOut.PkScript = append([]byte(nil), txOut.PkScript...)
+		entry := blockchain.NewUtxoEntry(&entryTxOut, 100, false)
+		tokenData := entry.TokenData()
+		assertTokenDataResult(t, test.name+" (utxo set)",
+			createTokenDataResult(&tokenData), test.expected)
+	}
+}
+
+// getBlockTestBestHeight is the height of the best chain that holds the block
+// used by the getblock tests.
+const getBlockTestBestHeight = 305
+
+// mustDecodeHex returns the bytes of the passed hex string and fails the test
+// if it is not valid hex.
+func mustDecodeHex(t *testing.T, s string) []byte {
+	t.Helper()
+
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("unable to decode hex %q: %v", s, err)
+	}
+	return b
+}
+
+// getBlockTestBlock returns the block used by the getblock tests along with its
+// spend journal.
+func getBlockTestBlock(t *testing.T) (*bchutil.Block, []blockchain.SpentTxOut) {
+	t.Helper()
+
+	p2pkh := mustDecodeHex(t, "76a914123456789012345678901234567890123456789088ac")
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{},
+		wire.MaxPrevOutIndex), mustDecodeHex(t, "022c0100")))
+	coinbase.AddTxOut(wire.NewTxOut(5000020200, p2pkh, wire.TokenData{}))
+
+	tx1 := wire.NewMsgTx(2)
+	tx1.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{0x01}, 0),
+		mustDecodeHex(t, "0151")))
+	tx1.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{0x02}, 1),
+		mustDecodeHex(t, "0152")))
+	tx1.AddTxOut(wire.NewTxOut(4999990000, p2pkh, wire.TokenData{}))
+	tx1.AddTxOut(decodeTokenTestTxOut(t, tokenDataTests[1].prefix))
+
+	tx2 := wire.NewMsgTx(2)
+	tx2.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0),
+		mustDecodeHex(t, "0153")))
+	tx2.TxIn[0].PreviousOutPoint.Hash = tx1.TxHash()
+	tx2.AddTxOut(wire.NewTxOut(4999980000,
+		mustDecodeHex(t, "a914b472a266d0bd89c13706a4132ccfb16f7c3b9fcb87"),
+		wire.TokenData{}))
+
+	prevHash, err := chainhash.NewHashFromStr(
+		"00000000000000000123456789abcdef0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("unable to decode previous block hash: %v", err)
+	}
+	msgBlock := wire.NewMsgBlock(&wire.BlockHeader{
+		Version:    0x20000000,
+		PrevBlock:  *prevHash,
+		MerkleRoot: coinbase.TxHash(),
+		Timestamp:  time.Unix(1700000000, 0),
+		Bits:       0x1d00ffff,
+		Nonce:      7,
+	})
+	msgBlock.Transactions = []*wire.MsgTx{coinbase, tx1, tx2}
+	blk := bchutil.NewBlock(msgBlock)
+	blk.SetHeight(300)
+
+	// The last entry is the first output of tx1, which tx2 spends.
+	tokenPrefix := tokenDataTests[5].prefix
+	stxos := []blockchain.SpentTxOut{{
+		Amount:     5000000000,
+		PkScript:   mustDecodeHex(t, tokenTestP2PKHScript),
+		Height:     100,
+		IsCoinBase: true,
+	}, {
+		Amount:   decodeTokenTestTxOut(t, tokenPrefix).Value,
+		PkScript: mustDecodeHex(t, tokenPrefix+tokenTestP2PKHScript),
+		Height:   200,
+	}, {
+		Amount:   4999990000,
+		PkScript: p2pkh,
+		Height:   300,
+	}}
+
+	return blk, stxos
+}
+
+// getBlockTestReply returns the getblock result for the passed block, with the
+// block fields set the same way handleGetBlock sets them.
+func getBlockTestReply(blk *bchutil.Block) btcjson.GetBlockVerboseResult {
+	blockHeader := &blk.MsgBlock().Header
+	return btcjson.GetBlockVerboseResult{
+		Hash:          blk.Hash().String(),
+		Version:       blockHeader.Version,
+		VersionHex:    fmt.Sprintf("%08x", blockHeader.Version),
+		MerkleRoot:    blockHeader.MerkleRoot.String(),
+		PreviousHash:  blockHeader.PrevBlock.String(),
+		Nonce:         blockHeader.Nonce,
+		Time:          blockHeader.Timestamp.Unix(),
+		Confirmations: int64(1 + getBlockTestBestHeight - blk.Height()),
+		Height:        int64(blk.Height()),
+		Size:          int32(blk.MsgBlock().SerializeSize()),
+		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
+		Difficulty: getDifficultyRatio(blockHeader.Bits,
+			&chaincfg.MainNetParams),
+	}
+}
+
+// getBlockTestTxns returns the raw transaction results for the passed block.
+func getBlockTestTxns(t *testing.T, blk *bchutil.Block) []btcjson.TxRawResult {
+	t.Helper()
+
+	rawTxns, err := createBlockTxRawResults(&chaincfg.MainNetParams, blk,
+		blk.Hash().String(), getBlockTestBestHeight)
+	if err != nil {
+		t.Fatalf("unable to create transaction results: %v", err)
+	}
+	return rawTxns
+}
+
+// assertGolden ensures the passed result marshals to the JSON in the named
+// file in the testdata directory, byte for byte apart from indentation.
+func assertGolden(t *testing.T, name string, result interface{}) {
+	t.Helper()
+
+	marshalled, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("%s: unable to marshal result: %v", name, err)
+	}
+	var got bytes.Buffer
+	if err := json.Indent(&got, marshalled, "", "\t"); err != nil {
+		t.Fatalf("%s: unable to indent result: %v", name, err)
+	}
+	got.WriteByte('\n')
+
+	want, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("%s: unable to read golden file: %v", name, err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Errorf("%s: result does not match golden file - got:\n%s",
+			name, got.Bytes())
+	}
+}
+
+// TestGetBlockVerbosity1And2 ensures the getblock results for verbosity 1 and
+// 2 match their golden files, generated from the results before verbosity 3
+// was added, with the fees of verbosity 2 that BCHN gives too.
+func TestGetBlockVerbosity1And2(t *testing.T) {
+	blk, stxos := getBlockTestBlock(t)
+
+	reply := getBlockTestReply(blk)
+	for _, tx := range blk.Transactions() {
+		reply.Tx = append(reply.Tx, tx.Hash().String())
+	}
+	assertGolden(t, "getblock-verbosity-1.json", reply)
+
+	reply = getBlockTestReply(blk)
+	reply.RawTx = getBlockTestTxns(t, blk)
+	err := addBlockPrevOuts(&chaincfg.MainNetParams, reply.RawTx, blk, stxos,
+		false)
+	if err != nil {
+		t.Fatalf("unable to add fees: %v", err)
+	}
+	assertGolden(t, "getblock-verbosity-2.json", reply)
+}
+
+// TestGetBlockVerbosity3 ensures getblock with verbosity 3 reports the prevout
+// of each input and the fee of each transaction.
+func TestGetBlockVerbosity3(t *testing.T) {
+	blk, stxos := getBlockTestBlock(t)
+	rawTxns := getBlockTestTxns(t, blk)
+	err := addBlockPrevOuts(&chaincfg.MainNetParams, rawTxns, blk, stxos, true)
+	if err != nil {
+		t.Fatalf("unable to add prevouts: %v", err)
+	}
+
+	reply := getBlockTestReply(blk)
+	assertGolden(t, "getblock-verbosity-3.json", btcjson.GetBlockVerboseTxResult{
+		Hash:          reply.Hash,
+		Confirmations: reply.Confirmations,
+		Size:          reply.Size,
+		Height:        reply.Height,
+		Version:       reply.Version,
+		VersionHex:    reply.VersionHex,
+		MerkleRoot:    reply.MerkleRoot,
+		Tx:            rawTxns,
+		Time:          reply.Time,
+		Nonce:         reply.Nonce,
+		Bits:          reply.Bits,
+		Difficulty:    reply.Difficulty,
+		PreviousHash:  reply.PreviousHash,
+	})
+}
+
+// TestGetBlockVerbosity2Fee ensures getblock at verbosity 2 gives the fee of
+// each transaction but the coinbase, as BCHN does, while still listing the
+// transactions under "rawtx" and without the outputs their inputs spend.
+func TestGetBlockVerbosity2Fee(t *testing.T) {
+	chain, db := newRPCTestChain(t)
+	s := &rpcServer{cfg: rpcserverConfig{
+		ChainParams: &chaincfg.RegressionNetParams,
+		Chain:       chain,
+		DB:          db,
+	}}
+	first := mineTestBlock(t, chain, nil)
+	for range chaincfg.RegressionNetParams.CoinbaseMaturity {
+		mineTestBlock(t, chain, nil)
+	}
+	value := first.MsgBlock().Transactions[0].TxOut[0].Value
+	spend := wire.NewMsgTx(1)
+	spend.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: *first.Transactions()[0].Hash()}, nil))
+	spend.AddTxOut(wire.NewTxOut(value/2, []byte{txscript.OP_TRUE}, wire.TokenData{}))
+	spend.AddTxOut(wire.NewTxOut(value/2-1000, []byte{txscript.OP_TRUE}, wire.TokenData{}))
+	block := mineTestBlock(t, chain, nil, spend)
+
+	result, err := handleGetBlock(s, btcjson.NewGetBlockCmd(block.Hash().String(),
+		btcjson.Verbositylevel(2)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Tx    json.RawMessage       `json:"tx"`
+		RawTx []btcjson.TxRawResult `json:"rawtx"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil || reply.Tx != nil ||
+		len(reply.RawTx) != 2 || bytes.Contains(raw, []byte(`"prevout"`)) {
+
+		t.Fatalf("unexpected verbosity 2 block: %s", raw)
+	}
+	if fee := reply.RawTx[0].Fee; fee != nil {
+		t.Errorf("coinbase fee %v", *fee)
+	}
+	if fee := reply.RawTx[1].Fee; fee == nil || *fee != bchutil.Amount(1000).ToBCH() {
+		t.Errorf("fee %v, want %v", fee, bchutil.Amount(1000).ToBCH())
+	}
+}
+
+// TestAddBlockPrevOutsJournalMismatch ensures the transaction results are left
+// unchanged, without prevouts or fees, when the spend journal does not hold
+// exactly one entry for each input of the block.
+func TestAddBlockPrevOutsJournalMismatch(t *testing.T) {
+	blk, stxos := getBlockTestBlock(t)
+	want, err := json.Marshal(getBlockTestTxns(t, blk))
+	if err != nil {
+		t.Fatalf("unable to marshal results: %v", err)
+	}
+
+	tests := map[string][]blockchain.SpentTxOut{
+		"empty journal": nil,
+		"missing entry": stxos[:len(stxos)-1],
+		"extra entry":   append(stxos[:len(stxos):len(stxos)], stxos[0]),
+	}
+	for name, journal := range tests {
+		rawTxns := getBlockTestTxns(t, blk)
+		err := addBlockPrevOuts(&chaincfg.MainNetParams, rawTxns, blk,
+			journal, true)
+		if err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+		got, err := json.Marshal(rawTxns)
+		if err != nil {
+			t.Fatalf("%s: unable to marshal results: %v", name, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: results were changed: %s", name, got)
+		}
+	}
+}
+
+// TestCreatePrevOutResultScripts ensures the script and token data of a prevout
+// are reported correctly.
+func TestCreatePrevOutResultScripts(t *testing.T) {
+	multisig := "51" + "21" + strings.Repeat("02", 33) + "21" +
+		strings.Repeat("03", 33) + "52ae"
+	p2pk := "21" + "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959" +
+		"f2815b16f81798" + "ac"
+
+	tests := []struct {
+		name     string
+		pkScript string
+		wantHex  string
+		wantType string
+		wantAddr string
+	}{
+		{"p2pkh", tokenTestP2PKHScript, tokenTestP2PKHScript, "pubkeyhash",
+			"qr4pxg5xx2x0eqv527uaasuxcj6usna2tsd4366h8k"},
+		{"p2pk", p2pk, p2pk, "pubkey",
+			"qp63uahgrxged4z5jswyt5dn5v3lzsem6cy4spdc2h"},
+		{"bare multisig", multisig, multisig, "multisig", ""},
+		{"token", tokenDataTests[1].prefix + tokenTestP2PKHScript,
+			tokenTestP2PKHScript, "pubkeyhash",
+			"qr4pxg5xx2x0eqv527uaasuxcj6usna2tsd4366h8k"},
+	}
+
+	for _, test := range tests {
+		stxo := blockchain.SpentTxOut{
+			Amount:   1000,
+			PkScript: mustDecodeHex(t, test.pkScript),
+			Height:   10,
+		}
+		result := createPrevOutResult(&chaincfg.MainNetParams, &stxo)
+		script := result.ScriptPubKey
+		if script.Hex != test.wantHex || script.Type != test.wantType ||
+			script.Address != test.wantAddr {
+
+			t.Errorf("%s: unexpected script %+v", test.name, script)
+		}
+		wantToken := test.name == "token"
+		if (result.TokenData != nil) != wantToken {
+			t.Errorf("%s: unexpected token data %+v", test.name,
+				result.TokenData)
+		}
+	}
+}
+
+// TestCreatePrevOutResultP2SH32Type ensures a P2SH32 prevout is reported with
+// the scripthash type.
+func TestCreatePrevOutResultP2SH32Type(t *testing.T) {
+	stxo := blockchain.SpentTxOut{
+		Amount:   1000,
+		PkScript: mustDecodeHex(t, "aa20"+strings.Repeat("ab", 32)+"87"),
+		Height:   10,
+	}
+	result := createPrevOutResult(&chaincfg.MainNetParams, &stxo)
+	if result.ScriptPubKey.Type != "scripthash" {
+		t.Errorf("unexpected type %q", result.ScriptPubKey.Type)
+	}
+}
+
+// TestHandleDecodeScriptP2SH ensures decodescript doesn't wrap a script that is
+// already pay-to-script-hash in another pay-to-script-hash address.
+func TestHandleDecodeScriptP2SH(t *testing.T) {
+	s := &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}
+	tests := []struct {
+		name     string
+		script   string
+		wantP2sh bool
+	}{
+		{"p2pkh", tokenTestP2PKHScript, true},
+		{"p2sh", "a914" + strings.Repeat("ab", 20) + "87", false},
+		{"p2sh32", "aa20" + strings.Repeat("ab", 32) + "87", false},
+	}
+
+	for _, test := range tests {
+		cmd := &btcjson.DecodeScriptCmd{HexScript: test.script}
+		result, err := handleDecodeScript(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		reply := result.(btcjson.DecodeScriptResult)
+		if (reply.P2sh != "") != test.wantP2sh {
+			t.Errorf("%s: unexpected p2sh %q", test.name, reply.P2sh)
+		}
+	}
+}
+
+// TestHandleDecodeScriptP2SH32 ensures decodescript gives the pay-to-script-
+// hash32 address of a script under p2sh_32, alongside its p2sh address, as
+// BCHN does, and gives neither for a script that is already pay-to-script-
+// hash.
+func TestHandleDecodeScriptP2SH32(t *testing.T) {
+	params := &chaincfg.MainNetParams
+	s := &rpcServer{cfg: rpcserverConfig{ChainParams: params}}
+	tests := []struct {
+		name   string
+		script string
+		wrap   bool
+	}{
+		{"p2pkh", tokenTestP2PKHScript, true},
+		{"empty", "", true},
+		{"nonstandard", "51ac6a", true},
+		{"p2sh", "a914" + strings.Repeat("ab", 20) + "87", false},
+		{"p2sh32", "aa20" + strings.Repeat("ab", 32) + "87", false},
+	}
+
+	for _, test := range tests {
+		cmd := &btcjson.DecodeScriptCmd{HexScript: test.script}
+		result, err := handleDecodeScript(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		marshalled, err := json.Marshal(result)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		var reply map[string]interface{}
+		if err := json.Unmarshal(marshalled, &reply); err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+
+		if !test.wrap {
+			if p2sh32, ok := reply["p2sh_32"]; ok {
+				t.Errorf("%s: unexpected p2sh_32 %v", test.name, p2sh32)
+			}
+			continue
+		}
+		hash := chainhash.DoubleHashB(mustDecodeHex(t, test.script))
+		addr, err := bchutil.NewAddressScriptHash32FromHash(hash, params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := reply["p2sh_32"]; got != addr.EncodeAddress() {
+			t.Errorf("%s: p2sh_32 %v, want %s", test.name, got,
+				addr.EncodeAddress())
+		}
+		if _, ok := reply["p2sh"]; !ok {
+			t.Errorf("%s: no p2sh", test.name)
+		}
+	}
+}
+
+// publicKeyTestScripts returns a pay-to-pubkey script for the first of two
+// public keys, a 1-of-2 bare multisig script for both, and what each key is
+// shown as on the network: the cashaddr of its public key hash.
+func publicKeyTestScripts(t *testing.T, params *chaincfg.Params) (p2pk, multisig []byte, addrs []string) {
+	t.Helper()
+	keys := [][]byte{
+		mustDecodeHex(t, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
+		mustDecodeHex(t, "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"),
+	}
+	for _, key := range keys {
+		addr, err := bchutil.NewAddressPubKeyHash(bchutil.Hash160(key), params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, addr.EncodeAddress())
+	}
+	p2pk, err := txscript.NewScriptBuilder().AddData(keys[0]).
+		AddOp(txscript.OP_CHECKSIG).Script()
+	if err != nil {
+		t.Fatal(err)
+	}
+	multisig, err = txscript.NewScriptBuilder().AddOp(txscript.OP_1).
+		AddData(keys[0]).AddData(keys[1]).AddOp(txscript.OP_2).
+		AddOp(txscript.OP_CHECKMULTISIG).Script()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p2pk, multisig, addrs
+}
+
+// TestPublicKeyScriptAddresses ensures the public keys of pay-to-pubkey and
+// bare multisig scripts are shown as the cashaddr of their public key hash,
+// as BCHN does, rather than as legacy addresses, in transaction outputs, in
+// their address filter and in decodescript.
+func TestPublicKeyScriptAddresses(t *testing.T) {
+	params := &chaincfg.MainNetParams
+	p2pk, multisig, addrs := publicKeyTestScripts(t, params)
+	tests := []struct {
+		name   string
+		script []byte
+		want   []string
+	}{
+		{"p2pk", p2pk, addrs[:1]},
+		{"multisig", multisig, addrs},
+	}
+	mtx := wire.NewMsgTx(2)
+	mtx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0), nil))
+	for _, test := range tests {
+		mtx.AddTxOut(wire.NewTxOut(1000, test.script, wire.TokenData{}))
+	}
+	vouts := createVoutList(mtx, params, nil)
+	filtered := createVoutList(mtx, params, map[string]struct{}{addrs[0]: {}})
+	if len(vouts) != len(tests) || len(filtered) != len(tests) {
+		t.Fatalf("%d outputs, %d filtered by %s, want %d", len(vouts),
+			len(filtered), addrs[0], len(tests))
+	}
+
+	s := &rpcServer{cfg: rpcserverConfig{ChainParams: params}}
+	for i, test := range tests {
+		if got := vouts[i].ScriptPubKey.Addresses; !slices.Equal(got, test.want) {
+			t.Errorf("%s: vout addresses %v, want %v", test.name, got, test.want)
+		}
+		cmd := &btcjson.DecodeScriptCmd{HexScript: hex.EncodeToString(test.script)}
+		result, err := handleDecodeScript(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		if got := result.(btcjson.DecodeScriptResult).Addresses; !slices.Equal(got, test.want) {
+			t.Errorf("%s: decodescript addresses %v, want %v", test.name,
+				got, test.want)
+		}
+	}
+}
+
+// TestVinPrevOutPublicKeyAddress ensures searchrawtransactions shows the
+// public key of a pay-to-pubkey output an input spends as the cashaddr of its
+// public key hash, as BCHN does.
+func TestVinPrevOutPublicKeyAddress(t *testing.T) {
+	h := newMempoolTestHarness(t, 1)
+	params := &chaincfg.MainNetParams
+	p2pk, _, addrs := publicKeyTestScripts(t, params)
+	origin := wire.NewMsgTx(wire.TxVersion)
+	origin.AddTxIn(&wire.TxIn{PreviousOutPoint: h.outputs[0],
+		Sequence: wire.MaxTxInSequenceNum})
+	origin.AddTxOut(wire.NewTxOut(mempoolTestOutputValue-1000, p2pk, wire.TokenData{}))
+	signTestInput(t, h, origin, mempoolTestOutputValue)
+	if _, err := h.server.cfg.TxMemPool.ProcessTransaction(bchutil.NewTx(origin), false, 0); err != nil {
+		t.Fatal(err)
+	}
+	spend := wire.NewMsgTx(wire.TxVersion)
+	spend.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: origin.TxHash()}})
+	spend.AddTxOut(wire.NewTxOut(1000, h.pkScript, wire.TokenData{}))
+
+	vins, err := createVinListPrevOut(h.server, spend, params, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vins) != 1 || vins[0].PrevOut == nil ||
+		!slices.Equal(vins[0].PrevOut.Addresses, addrs[:1]) {
+
+		t.Fatalf("prevout %+v, want addresses %v", vins[0].PrevOut, addrs[:1])
+	}
+}
+
+// TestScriptTypeNames ensures the raw transaction, decodescript and getblock
+// results name scripts as Bitcoin Cash Node does, and that the raw
+// transaction and decodescript results only list addresses for the pubkey and
+// multisig forms it matches.
+func TestScriptTypeNames(t *testing.T) {
+	pubKey := "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959" +
+		"f2815b16f81798"
+	tests := []struct {
+		name      string
+		script    string
+		wantType  string
+		wantAddrs int
+	}{
+		{"p2pkh", tokenTestP2PKHScript, "pubkeyhash", 1},
+		{"p2pk", "21" + pubKey + "ac", "pubkey", 1},
+		{"p2pk with a non-minimal push", "4c21" + pubKey + "ac", "script",
+			0},
+		{"multisig", "5121" + pubKey + "51ae", "multisig", 1},
+		{"multisig with a non-minimal push", "514c21" + pubKey + "51ae",
+			"script", 0},
+		{"bare script", "51935287", "script", 0},
+		{"does not parse", "0501", "script", 0},
+		{"long nulldata", "6a4d2c01" + strings.Repeat("00", 300),
+			"nulldata", 0},
+		{"long script", strings.Repeat("51", 202), "nonstandard", 0},
+	}
+
+	mtx := wire.NewMsgTx(2)
+	mtx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0), nil))
+	for _, test := range tests {
+		mtx.AddTxOut(wire.NewTxOut(1000, mustDecodeHex(t, test.script),
+			wire.TokenData{}))
+	}
+	vouts := createVoutList(mtx, &chaincfg.MainNetParams, nil)
+
+	s := &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}
+	for i, test := range tests {
+		if got := vouts[i].ScriptPubKey.Type; got != test.wantType {
+			t.Errorf("%s: vout type %q, want %q", test.name, got,
+				test.wantType)
+		}
+		if got := len(vouts[i].ScriptPubKey.Addresses); got != test.wantAddrs {
+			t.Errorf("%s: vout lists %d addresses, want %d", test.name,
+				got, test.wantAddrs)
+		}
+
+		cmd := &btcjson.DecodeScriptCmd{HexScript: test.script}
+		result, err := handleDecodeScript(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		decoded := result.(btcjson.DecodeScriptResult)
+		if got := len(decoded.Addresses); got != test.wantAddrs {
+			t.Errorf("%s: decodescript lists %d addresses, want %d",
+				test.name, got, test.wantAddrs)
+		}
+		if got := decoded.Type; got != test.wantType {
+			t.Errorf("%s: decodescript type %q, want %q", test.name,
+				got, test.wantType)
+		}
+
+		stxo := blockchain.SpentTxOut{
+			Amount:   1000,
+			PkScript: mustDecodeHex(t, test.script),
+			Height:   10,
+		}
+		prevOut := createPrevOutResult(&chaincfg.MainNetParams, &stxo)
+		if got := prevOut.ScriptPubKey.Type; got != test.wantType {
+			t.Errorf("%s: prevout type %q, want %q", test.name, got,
+				test.wantType)
+		}
+	}
+}
+
+// TestHandleValidateAddressTokenAware ensures validateaddress returns a
+// cashaddr in the form it was given and reports whether it is token-aware.
+func TestHandleValidateAddressTokenAware(t *testing.T) {
+	params := &chaincfg.MainNetParams
+	hash := bytes.Repeat([]byte{0x07}, 20)
+	p2pkh, err := bchutil.NewAddressPubKeyHash(hash, params)
+	if err != nil {
+		t.Fatalf("unable to create p2pkh address: %v", err)
+	}
+	p2sh, err := bchutil.NewAddressScriptHashFromHash(hash, params)
+	if err != nil {
+		t.Fatalf("unable to create p2sh address: %v", err)
+	}
+	p2sh32, err := bchutil.NewAddressScriptHash32FromHash(
+		bytes.Repeat([]byte{0x07}, 32), params)
+	if err != nil {
+		t.Fatalf("unable to create p2sh32 address: %v", err)
+	}
+	legacy, err := bchutil.NewLegacyAddressPubKeyHash(hash, params)
+	if err != nil {
+		t.Fatalf("unable to create legacy address: %v", err)
+	}
+	slp, err := bchutil.NewSlpAddressPubKeyHash(hash, params)
+	if err != nil {
+		t.Fatalf("unable to create slp address: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		address        string
+		wantAddress    string
+		wantTokenAware bool
+	}{
+		{"p2pkh", p2pkh.EncodeCashAddress(false),
+			p2pkh.EncodeCashAddress(false), false},
+		{"token-aware p2pkh", p2pkh.EncodeCashAddress(true),
+			p2pkh.EncodeCashAddress(true), true},
+		{"token-aware p2pkh with prefix",
+			params.CashAddressPrefix + ":" + p2pkh.EncodeCashAddress(true),
+			p2pkh.EncodeCashAddress(true), true},
+		{"p2sh", p2sh.EncodeCashAddress(false),
+			p2sh.EncodeCashAddress(false), false},
+		{"token-aware p2sh", p2sh.EncodeCashAddress(true),
+			p2sh.EncodeCashAddress(true), true},
+		{"token-aware p2sh32", p2sh32.EncodeCashAddress(true),
+			p2sh32.EncodeCashAddress(true), true},
+		{"legacy", legacy.EncodeAddress(), p2pkh.EncodeCashAddress(false),
+			false},
+		{"slp", params.SlpAddressPrefix + ":" + slp.EncodeAddress(),
+			slp.EncodeAddress(), false},
+	}
+
+	s := &rpcServer{cfg: rpcserverConfig{ChainParams: params}}
+	for _, test := range tests {
+		cmd := &btcjson.ValidateAddressCmd{Address: test.address}
+		result, err := handleValidateAddress(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		reply := result.(btcjson.ValidateAddressChainResult)
+		if !reply.IsValid {
+			t.Errorf("%s: address is not valid", test.name)
+			continue
+		}
+		if reply.Address != test.wantAddress {
+			t.Errorf("%s: address %s, want %s", test.name,
+				reply.Address, test.wantAddress)
+		}
+		if reply.IsTokenAware == nil ||
+			*reply.IsTokenAware != test.wantTokenAware {
+			t.Errorf("%s: istokenaware %v, want %v", test.name,
+				reply.IsTokenAware, test.wantTokenAware)
+		}
+	}
+
+	// An invalid address, or a legacy address for another network, only
+	// reports that it is not valid.
+	testnetLegacy, err := bchutil.NewLegacyAddressPubKeyHash(hash,
+		&chaincfg.TestNet3Params)
+	if err != nil {
+		t.Fatalf("unable to create testnet address: %v", err)
+	}
+	invalid := []string{"notanaddress", testnetLegacy.EncodeAddress()}
+	for _, address := range invalid {
+		cmd := &btcjson.ValidateAddressCmd{Address: address}
+		result, err := handleValidateAddress(s, cmd, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", address, err)
+		}
+		reply := result.(btcjson.ValidateAddressChainResult)
+		if reply.IsValid || reply.Address != "" ||
+			reply.IsTokenAware != nil {
+
+			t.Errorf("%s: unexpected result %+v", address, reply)
+		}
+	}
+}
+
+// TestIsTestNet ensures getinfo and getmininginfo report testnet on the public
+// test networks only.
+func TestIsTestNet(t *testing.T) {
+	tests := []struct {
+		params *chaincfg.Params
+		want   bool
+	}{
+		{&chaincfg.MainNetParams, false},
+		{&chaincfg.RegressionNetParams, false},
+		{&chaincfg.TestNet3Params, true},
+		{&chaincfg.TestNet4Params, true},
+		{&chaincfg.ChipNetParams, true},
+		{&chaincfg.SimNetParams, false},
+	}
+	for _, test := range tests {
+		if got := isTestNet(test.params); got != test.want {
+			t.Errorf("%s: got %v, want %v", test.params.Name, got, test.want)
+		}
+	}
+}
+
+// TestEstimatePriorityMethodNotFound ensures estimatepriority, which has no
+// use without transaction priority, is reported as an unknown method rather
+// than one that is not implemented yet, whatever its parameters, as in BCHN.
+func TestEstimatePriorityMethodNotFound(t *testing.T) {
+	for _, params := range [][]json.RawMessage{
+		{json.RawMessage("6")},
+		nil,
+		{json.RawMessage(`"x"`)},
+	} {
+		cmd := parseCmd(&btcjson.Request{
+			Jsonrpc: "1.0",
+			Method:  "estimatepriority",
+			Params:  params,
+			ID:      1,
+		})
+		var err error
+		if cmd.err != nil {
+			err = cmd.err
+		} else {
+			_, err = (&rpcServer{}).standardCmdResult(cmd, nil)
+		}
+		if err != btcjson.ErrRPCMethodNotFound {
+			t.Errorf("params %s: got %v, want %v", params, err,
+				btcjson.ErrRPCMethodNotFound)
+		}
+	}
+}

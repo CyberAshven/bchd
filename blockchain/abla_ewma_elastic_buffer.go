@@ -99,7 +99,9 @@ func (config *ABLAConfig) SetMax() {
 		config.betaMax = config.beta0
 	}
 
-	fmt.Fprintf(os.Stderr, "[INFO] Auto-configured epsilonMax: %d, betaMax: %d\n", config.epsilonMax, config.betaMax)
+	// Bitcoin Cash Node logs this in its ABLA debug category.
+	log.Debugf("Auto-configured ABLA epsilonMax: %d, betaMax: %d",
+		config.epsilonMax, config.betaMax)
 }
 
 func (config *ABLAConfig) IsValid() (errs *strings.Builder) {
@@ -136,7 +138,7 @@ func (config *ABLAConfig) IsValid() (errs *strings.Builder) {
 	if config.epsilon0 < muldiv(config.gammaReciprocal, B7, config.zetaXB7-B7) {
 		// Required due to truncation of integer ops.
 		// With this we ensure that the control size can be adjusted for at least 1 byte.
-		// Also, with this we ensure that divisior bytesMax in calculateNextABLAState() can't be 0.
+		// Also, with this we ensure that divisor bytesMax in calculateNextABLAState() can't be 0.
 		errs = new(strings.Builder)
 		errs.WriteString("Error, epsilon0 sanity check failed. Too low relative to gamma and zeta.")
 		return errs
@@ -184,7 +186,7 @@ func (state *ABLAState) getBlockSizeLimit() uint64 {
 // Returns the limit for block with current+N height, assuming all blocks 100% full.
 func (state *ABLAState) lookaheadState(config *ABLAConfig, count uint) ABLAState {
 	lookaheadState := *state
-	for i := uint(0); i < count; i++ {
+	for range count {
 		maxSize := lookaheadState.getBlockSizeLimit()
 		lookaheadState = lookaheadState.nextABLAState(config, maxSize)
 	}

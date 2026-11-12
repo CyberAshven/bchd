@@ -15,7 +15,7 @@ import (
 // genRandomSig returns a random message, a signature of the message under the
 // public key and the public key. This function is used to generate randomized
 // test data.
-func genRandomSig() (*chainhash.Hash, *bchec.Signature, *bchec.PublicKey, error) {
+func genRandomSig() (*chainhash.Hash, []byte, []byte, error) {
 	privKey, err := bchec.NewPrivateKey(bchec.S256())
 	if err != nil {
 		return nil, nil, nil, err
@@ -31,7 +31,7 @@ func genRandomSig() (*chainhash.Hash, *bchec.Signature, *bchec.PublicKey, error)
 		return nil, nil, nil, err
 	}
 
-	return &msgHash, sig, privKey.PubKey(), nil
+	return &msgHash, sig.Serialize(), privKey.PubKey().SerializeCompressed(), nil
 }
 
 // TestSigCacheAddExists tests the ability to add, and later check the
@@ -46,13 +46,44 @@ func TestSigCacheAddExists(t *testing.T) {
 	}
 
 	// Add the triplet to the signature cache.
-	sigCache.Add(*msg1, sig1, key1)
+	sigCache.Add(*msg1, sig1, key1, false)
 
 	// The previously added triplet should now be found within the sigcache.
-	sig1Copy, _ := bchec.ParseBERSignature(sig1.Serialize(), bchec.S256())
-	key1Copy, _ := bchec.ParsePubKey(key1.SerializeCompressed(), bchec.S256())
-	if !sigCache.Exists(*msg1, sig1Copy, key1Copy) {
+	if !sigCache.Exists(*msg1, sig1, key1, false) {
 		t.Errorf("previously added item not found in signature cache")
+	}
+}
+
+// TestSigCacheKey ensures an entry is only found for the exact signature,
+// signature type and public key bytes it was added with.
+func TestSigCacheKey(t *testing.T) {
+	sigCache := NewSigCache(10)
+	msg, sig, key, err := genRandomSig()
+	if err != nil {
+		t.Fatalf("unable to generate random signature test data")
+	}
+	sigCache.Add(*msg, sig, key, false)
+
+	other := *msg
+	other[0] ^= 1
+	tests := []struct {
+		name    string
+		msg     chainhash.Hash
+		sig     []byte
+		key     []byte
+		schnorr bool
+	}{
+		{"other message", other, sig, key, false},
+		{"schnorr", *msg, sig, key, true},
+		{"truncated signature", *msg, sig[:len(sig)-1], key, false},
+		{"bytes moved to key", *msg, sig[:len(sig)-1],
+			append([]byte{sig[len(sig)-1]}, key...), false},
+	}
+	for _, test := range tests {
+		if sigCache.Exists(test.msg, test.sig, test.key, test.schnorr) {
+			t.Errorf("%s: unexpectedly found in signature cache",
+				test.name)
+		}
 	}
 }
 
@@ -65,17 +96,15 @@ func TestSigCacheAddEvictEntry(t *testing.T) {
 	sigCache := NewSigCache(sigCacheSize)
 
 	// Fill the sigcache up with some random sig triplets.
-	for i := uint(0); i < sigCacheSize; i++ {
+	for range sigCacheSize {
 		msg, sig, key, err := genRandomSig()
 		if err != nil {
 			t.Fatalf("unable to generate random signature test data")
 		}
 
-		sigCache.Add(*msg, sig, key)
+		sigCache.Add(*msg, sig, key, false)
 
-		sigCopy, _ := bchec.ParseBERSignature(sig.Serialize(), bchec.S256())
-		keyCopy, _ := bchec.ParsePubKey(key.SerializeCompressed(), bchec.S256())
-		if !sigCache.Exists(*msg, sigCopy, keyCopy) {
+		if !sigCache.Exists(*msg, sig, key, false) {
 			t.Errorf("previously added item not found in signature" +
 				"cache")
 		}
@@ -93,7 +122,7 @@ func TestSigCacheAddEvictEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to generate random signature test data")
 	}
-	sigCache.Add(*msgNew, sigNew, keyNew)
+	sigCache.Add(*msgNew, sigNew, keyNew, false)
 
 	// The sigcache should still have sigCache entries.
 	if uint(len(sigCache.validSigs)) != sigCacheSize {
@@ -102,9 +131,7 @@ func TestSigCacheAddEvictEntry(t *testing.T) {
 	}
 
 	// The entry added above should be found within the sigcache.
-	sigNewCopy, _ := bchec.ParseBERSignature(sigNew.Serialize(), bchec.S256())
-	keyNewCopy, _ := bchec.ParsePubKey(keyNew.SerializeCompressed(), bchec.S256())
-	if !sigCache.Exists(*msgNew, sigNewCopy, keyNewCopy) {
+	if !sigCache.Exists(*msgNew, sigNew, keyNew, false) {
 		t.Fatalf("previously added item not found in signature cache")
 	}
 }
@@ -122,12 +149,10 @@ func TestSigCacheAddMaxEntriesZeroOrNegative(t *testing.T) {
 	}
 
 	// Add the triplet to the signature cache.
-	sigCache.Add(*msg1, sig1, key1)
+	sigCache.Add(*msg1, sig1, key1, false)
 
 	// The generated triplet should not be found.
-	sig1Copy, _ := bchec.ParseBERSignature(sig1.Serialize(), bchec.S256())
-	key1Copy, _ := bchec.ParsePubKey(key1.SerializeCompressed(), bchec.S256())
-	if sigCache.Exists(*msg1, sig1Copy, key1Copy) {
+	if sigCache.Exists(*msg1, sig1, key1, false) {
 		t.Errorf("previously added signature found in sigcache, but" +
 			"shouldn't have been")
 	}
@@ -136,5 +161,41 @@ func TestSigCacheAddMaxEntriesZeroOrNegative(t *testing.T) {
 	if len(sigCache.validSigs) != 0 {
 		t.Errorf("%v items found in sigcache, no items should have"+
 			"been added", len(sigCache.validSigs))
+	}
+}
+
+// TestSigCacheLongEntry ensures entries larger than the key's stack buffer
+// are found, and only with their full bytes.
+func TestSigCacheLongEntry(t *testing.T) {
+	sigCache := NewSigCache(10)
+	var msg chainhash.Hash
+	sig := make([]byte, 300)
+	key := make([]byte, 65)
+	for i := range sig {
+		sig[i] = byte(i)
+	}
+	sigCache.Add(msg, sig, key, false)
+	if !sigCache.Exists(msg, sig, key, false) {
+		t.Fatal("long entry not found")
+	}
+	if sigCache.Exists(msg, sig[:299], key, false) {
+		t.Fatal("truncated signature found")
+	}
+}
+
+// BenchmarkSigCacheExists benchmarks a signature cache hit, the path a block
+// takes for transactions the mempool already checked.
+func BenchmarkSigCacheExists(b *testing.B) {
+	sigCache := NewSigCache(10)
+	msg, sig, key, err := genRandomSig()
+	if err != nil {
+		b.Fatal(err)
+	}
+	sigCache.Add(*msg, sig, key, false)
+	b.ReportAllocs()
+	for b.Loop() {
+		if !sigCache.Exists(*msg, sig, key, false) {
+			b.Fatal("entry not found")
+		}
 	}
 }

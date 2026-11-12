@@ -33,7 +33,16 @@ func (msg *MsgBlockTxns) BchDecode(r io.Reader, pver uint32, enc MessageEncoding
 		return err
 	}
 
-	for i := uint64(0); i < txCount; i++ {
+	// Prevent more transactions than could possibly fit in a block.  The
+	// transactions are appended as they are read, so memory use grows with
+	// the data actually received rather than with this count.
+	if txCount > uint64(maxTxPerBlock()) {
+		str := fmt.Sprintf("too many transactions for message "+
+			"[count %d, max %d]", txCount, maxTxPerBlock())
+		return messageError("MsgBlockTxns.BchDecode", str)
+	}
+
+	for range txCount {
 		tx := MsgTx{}
 		err = tx.BchDecode(r, pver, enc)
 		if err != nil {
@@ -78,9 +87,9 @@ func (msg *MsgBlockTxns) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgBlockTxns) MaxPayloadLength(_ uint32) uint32 {
-	// In practice this will always be less than the payload but the number
-	// of txs in a block can vary so we really don't know the real max.
-	return maxMessagePayload()
+	// The transactions are some of a block's, and the block hash and their
+	// count take less space than the block's header and count.
+	return MaxBlockPayload()
 }
 
 // AbsoluteIndexes takes in the requested differential indexes from a MsgGetBlockTxns
