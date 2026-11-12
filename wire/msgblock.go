@@ -22,9 +22,11 @@ const defaultTransactionAlloc = 2048
 // MaxBlocksPerMsg is the maximum number of blocks allowed per message.
 const MaxBlocksPerMsg = 500
 
-// MaxBlockPayload returns the maximum bytes a block message can be in bytes.
+// MaxBlockPayload returns the maximum bytes a block message can be in bytes:
+// the limit SetLimits sets, or the one SetMaxBlockSizeLookAhead sets when that
+// is larger.
 func MaxBlockPayload() uint32 {
-	return ebs
+	return max(blockPayloadFloor.Load(), blockPayloadLookAhead.Load())
 }
 
 // maxTxPerBlock returns the maximum number of transactions that could
@@ -65,12 +67,20 @@ func (msg *MsgBlock) ClearTransactions() {
 // See Deserialize for decoding blocks stored to disk, such as in a database, as
 // opposed to decoding blocks from the wire.
 func (msg *MsgBlock) BchDecode(r io.Reader, pver uint32, enc MessageEncoding) error {
-	err := readBlockHeader(r, pver, &msg.Header)
+	buf := binarySerializer.Borrow()
+	defer binarySerializer.Return(buf)
+	return msg.bchDecode(r, pver, buf)
+}
+
+// bchDecode decodes r into the receiver like BchDecode using the provided
+// scratch buffer for the header and every transaction.
+func (msg *MsgBlock) bchDecode(r io.Reader, pver uint32, buf []byte) error {
+	err := readBlockHeaderBuf(r, &msg.Header, buf)
 	if err != nil {
 		return err
 	}
 
-	txCount, err := ReadVarInt(r, pver)
+	txCount, err := ReadVarIntBuf(r, pver, buf)
 	if err != nil {
 		return err
 	}
@@ -84,10 +94,13 @@ func (msg *MsgBlock) BchDecode(r io.Reader, pver uint32, enc MessageEncoding) er
 		return messageError("MsgBlock.BchDecode", str)
 	}
 
-	msg.Transactions = make([]*MsgTx, 0, txCount)
-	for i := uint64(0); i < txCount; i++ {
+	// The count has not been backed by any data yet, so limit the initial
+	// capacity and let the slice grow as transactions are decoded.
+	msg.Transactions = make([]*MsgTx, 0,
+		min(txCount, uint64(defaultTransactionAlloc)))
+	for range txCount {
 		tx := MsgTx{}
-		err := tx.BchDecode(r, pver, enc)
+		err := tx.bchDecode(r, pver, buf)
 		if err != nil {
 			return err
 		}
@@ -123,12 +136,15 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 	// At the current time, there is no difference between the wire encoding
 	// at protocol version 0 and the stable long-term storage format.  As
 	// a result, make use of existing wire protocol functions.
-	err := readBlockHeader(r, 0, &msg.Header)
+	buf := binarySerializer.Borrow()
+	defer binarySerializer.Return(buf)
+
+	err := readBlockHeaderBuf(r, &msg.Header, buf)
 	if err != nil {
 		return nil, err
 	}
 
-	txCount, err := ReadVarInt(r, 0)
+	txCount, err := ReadVarIntBuf(r, 0, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -143,18 +159,140 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 	}
 
 	// Deserialize each transaction while keeping track of its location
-	// within the byte stream.
-	msg.Transactions = make([]*MsgTx, 0, txCount)
-	txLocs := make([]TxLoc, txCount)
-	for i := uint64(0); i < txCount; i++ {
-		txLocs[i].TxStart = fullLen - r.Len()
+	// within the byte stream.  The count has not been backed by any data
+	// yet, so limit the initial capacity and let the slices grow as
+	// transactions are decoded.
+	initialCap := min(txCount, uint64(defaultTransactionAlloc))
+	msg.Transactions = make([]*MsgTx, 0, initialCap)
+	txLocs := make([]TxLoc, 0, initialCap)
+	for range txCount {
+		txStart := fullLen - r.Len()
 		tx := MsgTx{}
-		err := tx.Deserialize(r)
+		err := tx.bchDecode(r, 0, buf)
 		if err != nil {
 			return nil, err
 		}
 		msg.Transactions = append(msg.Transactions, &tx)
-		txLocs[i].TxLen = (fullLen - r.Len()) - txLocs[i].TxStart
+		txLocs = append(txLocs, TxLoc{
+			TxStart: txStart,
+			TxLen:   (fullLen - r.Len()) - txStart,
+		})
+	}
+
+	return txLocs, nil
+}
+
+// BlockTxLocs returns the start and length of each transaction within the
+// passed serialized block.  It returns the same locations DeserializeTxLoc
+// does, but it reads only the counts and lengths that frame the transactions
+// and skips everything else, so it doesn't decode a copy of the block.
+func BlockTxLocs(serialized []byte) ([]TxLoc, error) {
+	r := bytes.NewReader(serialized)
+
+	// skip moves past the next n bytes, or fails if there are fewer left.
+	skip := func(n uint64) error {
+		if n > uint64(r.Len()) {
+			return io.ErrUnexpectedEOF
+		}
+		_, err := r.Seek(int64(n), io.SeekCurrent)
+		return err
+	}
+
+	// skipScript moves past a script and its length, failing as readScript
+	// does when the script is longer than maxAllowed.
+	skipScript := func(maxAllowed uint32, fieldName string) error {
+		count, err := ReadVarInt(r, 0)
+		if err != nil {
+			return err
+		}
+		if count > uint64(maxAllowed) {
+			str := fmt.Sprintf("%s is larger than the max allowed size "+
+				"[count %d, max %d]", fieldName, count, maxAllowed)
+			return messageError("BlockTxLocs", str)
+		}
+		return skip(count)
+	}
+
+	if err := skip(MaxBlockHeaderPayload); err != nil {
+		return nil, err
+	}
+	txCount, err := ReadVarInt(r, 0)
+	if err != nil {
+		return nil, err
+	}
+	if txCount > uint64(maxTxPerBlock()) {
+		str := fmt.Sprintf("too many transactions to fit into a block "+
+			"[count %d, max %d]", txCount, maxTxPerBlock())
+		return nil, messageError("BlockTxLocs", str)
+	}
+
+	txLocs := make([]TxLoc, 0, min(txCount, uint64(defaultTransactionAlloc)))
+	for range txCount {
+		txStart := len(serialized) - r.Len()
+
+		// The version.
+		if err := skip(4); err != nil {
+			return nil, err
+		}
+
+		// The inputs, each an outpoint, a signature script and a
+		// sequence number.
+		count, err := ReadVarInt(r, 0)
+		if err != nil {
+			return nil, err
+		}
+		if count > uint64(maxTxInPerMessage()) {
+			str := fmt.Sprintf("too many input transactions to fit into "+
+				"max message size [count %d, max %d]", count,
+				maxTxInPerMessage())
+			return nil, messageError("BlockTxLocs", str)
+		}
+		for range count {
+			if err := skip(chainhash.HashSize + 4); err != nil {
+				return nil, err
+			}
+			err := skipScript(maxTxInPerMessage(),
+				"transaction input signature script")
+			if err != nil {
+				return nil, err
+			}
+			if err := skip(4); err != nil {
+				return nil, err
+			}
+		}
+
+		// The outputs, each a value and a public key script, which
+		// holds any token data.
+		count, err = ReadVarInt(r, 0)
+		if err != nil {
+			return nil, err
+		}
+		if count > uint64(maxTxOutPerMessage()) {
+			str := fmt.Sprintf("too many output transactions to fit into "+
+				"max message size [count %d, max %d]", count,
+				maxTxOutPerMessage())
+			return nil, messageError("BlockTxLocs", str)
+		}
+		for range count {
+			if err := skip(8); err != nil {
+				return nil, err
+			}
+			err := skipScript(maxMessagePayload(), "transaction output "+
+				"public key script and possible token data")
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// The lock time.
+		if err := skip(4); err != nil {
+			return nil, err
+		}
+
+		txLocs = append(txLocs, TxLoc{
+			TxStart: txStart,
+			TxLen:   len(serialized) - r.Len() - txStart,
+		})
 	}
 
 	return txLocs, nil
@@ -165,18 +303,21 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 // See Serialize for encoding blocks to be stored to disk, such as in a
 // database, as opposed to encoding blocks for the wire.
 func (msg *MsgBlock) BchEncode(w io.Writer, pver uint32, enc MessageEncoding) error {
-	err := writeBlockHeader(w, pver, &msg.Header)
+	buf := binarySerializer.Borrow()
+	defer binarySerializer.Return(buf)
+
+	err := writeBlockHeaderBuf(w, &msg.Header, buf)
 	if err != nil {
 		return err
 	}
 
-	err = WriteVarInt(w, pver, uint64(len(msg.Transactions)))
+	err = WriteVarIntBuf(w, pver, uint64(len(msg.Transactions)), buf)
 	if err != nil {
 		return err
 	}
 
 	for _, tx := range msg.Transactions {
-		err = tx.BchEncode(w, pver, enc)
+		err = tx.bchEncode(w, pver, buf)
 		if err != nil {
 			return err
 		}

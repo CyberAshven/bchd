@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/txscript"
@@ -82,14 +83,10 @@ func (view *UtxoViewpoint) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut, i
 	pkScript := make([]byte, len(txOut.PkScript))
 	copy(pkScript, txOut.PkScript)
 
-	if !txOut.TokenData.IsEmpty() {
-		entry.tokenData = txOut.TokenData
-	}
-
 	entry.amount = txOut.Value
 	entry.pkScript = pkScript
+	entry.tokenData = txOut.TokenData
 	entry.blockHeight = blockHeight
-	entry.pkScript, _ = entry.tokenData.SeparateTokenDataFromPKScriptIfExists(pkScript, 0)
 	entry.packedFlags = tfModified
 	if isCoinBase {
 		entry.packedFlags |= tfCoinBase
@@ -136,9 +133,11 @@ func (view *UtxoViewpoint) AddTxOuts(tx *bchutil.Tx, blockHeight int32) {
 }
 
 // addInputUtxos adds the unspent transaction outputs for the inputs referenced
-// by the transactions in the given block to the view.  In particular, referenced
-// entries that are earlier in the block are added to the view and entries that
-// are already in the view are not modified.
+// by the transactions in the given block to the view.  Entries from the source
+// that are already in the view are not modified.  With ignoreOutOfOrder, the
+// outputs of the transactions in the block that its inputs spend are added as
+// well.  Without it, the caller adds them as it connects each transaction, so
+// that a spend placed before the transaction it spends from fails.
 func (view *UtxoViewpoint) addInputUtxos(source utxoView, block *bchutil.Block, ignoreOutOfOrder bool) error {
 	// Build a map of in-flight transactions because some of the inputs in
 	// this block could be referencing other transactions earlier in this
@@ -149,15 +148,22 @@ func (view *UtxoViewpoint) addInputUtxos(source utxoView, block *bchutil.Block, 
 		txInFlight[*tx.Hash()] = i
 	}
 
+	// Each in-flight parent's outputs only need to be added once.
+	added := make([]bool, len(transactions))
+
 	// Loop through all of the transaction inputs (except for the coinbase
 	// which has no inputs).
-	for i, tx := range block.Transactions()[1:] {
+	for _, tx := range block.Transactions()[1:] {
 		for _, txIn := range tx.MsgTx().TxIn {
 			originHash := &txIn.PreviousOutPoint.Hash
-			if inFlightIndex, ok := txInFlight[*originHash]; ok &&
-				(i >= inFlightIndex || ignoreOutOfOrder) {
-				originTx := transactions[inFlightIndex]
-				view.AddTxOuts(originTx, block.Height())
+			if inFlightIndex, ok := txInFlight[*originHash]; ok {
+				// Adding the outputs of a parent before it connects
+				// would also let a transaction placed before it spend
+				// them, so do it only when the order is ignored.
+				if ignoreOutOfOrder && !added[inFlightIndex] {
+					added[inFlightIndex] = true
+					view.AddTxOuts(transactions[inFlightIndex], block.Height())
+				}
 				continue
 			}
 
@@ -165,9 +171,13 @@ func (view *UtxoViewpoint) addInputUtxos(source utxoView, block *bchutil.Block, 
 			if _, ok := view.entries[txIn.PreviousOutPoint]; ok {
 				continue
 			}
-			// Add the entry from the source.
+			// Add the entry from the source.  A failed read is
+			// returned instead of being treated as a missing input.
 			entry, err := source.getEntry(txIn.PreviousOutPoint)
-			if err == nil && entry != nil {
+			if err != nil {
+				return err
+			}
+			if entry != nil {
 				view.entries[txIn.PreviousOutPoint] = entry.Clone()
 			}
 		}
@@ -190,7 +200,6 @@ func addTxOuts(view utxoView, tx *bchutil.Tx, blockHeight int32, overwrite bool)
 		// Create a new entry from the output.
 		pkScript := make([]byte, len(txOut.PkScript))
 		copy(pkScript, txOut.PkScript)
-		pkScript, _ = txOut.TokenData.SeparateTokenDataFromPKScriptIfExists(pkScript, 0)
 
 		entry := &UtxoEntry{
 			amount:      txOut.Value,
@@ -349,16 +358,18 @@ func disconnectTransactions(view utxoView, block *bchutil.Block, stxos []SpentTx
 			stxo := &stxos[stxoIdx]
 			stxoIdx--
 
-			pkScript := make([]byte, len(stxo.PkScript))
-			copy(pkScript, stxo.PkScript)
+			// The spend journal stores token data in front of the
+			// script.  Copy only the script.
+			tokenData, pkScript := wire.SplitPkScript(stxo.PkScript)
+			pkScript = slices.Clone(pkScript)
 
 			entry := &UtxoEntry{
 				amount:      stxo.Amount,
 				pkScript:    pkScript,
+				tokenData:   tokenData,
 				blockHeight: stxo.Height,
 				packedFlags: tfModified,
 			}
-			entry.pkScript, _ = entry.tokenData.SeparateTokenDataFromPKScriptIfExists(entry.pkScript, 0)
 			if stxo.IsCoinBase {
 				entry.packedFlags |= tfCoinBase
 			}
@@ -400,7 +411,7 @@ func disconnectTransactions(view utxoView, block *bchutil.Block, stxos []SpentTx
 
 			pkScript := make([]byte, len(txOut.PkScript))
 			copy(pkScript, txOut.PkScript)
-			pkScript, _ = txOut.TokenData.SeparateTokenDataFromPKScriptIfExists(pkScript, 0)
+
 			// Mark the entry as spent.  To make sure the view has the entry,
 			// create one to pass along.
 			entry := &UtxoEntry{

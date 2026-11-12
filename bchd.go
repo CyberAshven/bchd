@@ -6,7 +6,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -50,6 +49,14 @@ func bchdMain(serverChan chan<- *server) error {
 		return err
 	}
 	cfg = tcfg
+
+	// The GC percent trades memory for CPU time: at 50 the heap grows to
+	// 1.5 times the live data between collections, and at 10 collection
+	// took most of the CPU of a sync with indexes.  GOGC takes precedence.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(cfg.GCPercent)
+	}
+
 	defer func() {
 		if logRotator != nil {
 			bchdLog.Infof("Closing: logRotator")
@@ -58,8 +65,10 @@ func bchdMain(serverChan chan<- *server) error {
 		}
 	}()
 
-	// Do required one-time initialization on wire
-	wire.SetLimits(cfg.ExcessiveBlockSize)
+	// Do required one-time initialization on wire.  The message limits
+	// allow for blocks of at least 32 MB on every network, since ABLA can
+	// raise the limit of a network with a smaller default block size.
+	wire.SetLimits(max(cfg.ExcessiveBlockSize, minMessageLimitsBlockSize))
 
 	// Get a channel that will be closed when a shutdown signal has been
 	// triggered either from an OS signal such as SIGINT (Ctrl+C) or from
@@ -73,7 +82,7 @@ func bchdMain(serverChan chan<- *server) error {
 	// Enable http profiling server if requested.
 	if cfg.Profile != "" {
 		go func() {
-			listenAddr := net.JoinHostPort("", cfg.Profile)
+			listenAddr := cfg.Profile
 			bchdLog.Infof("Profile server listening on %s", listenAddr)
 			profileRedirect := http.RedirectHandler("/debug/pprof",
 				http.StatusSeeOther)
@@ -153,6 +162,22 @@ func bchdMain(serverChan chan<- *server) error {
 	}
 	if cfg.DropSlpIndex {
 		if err := indexers.DropSlpIndex(db, interrupt); err != nil {
+			bchdLog.Errorf("%v", err)
+			return err
+		}
+
+		return nil
+	}
+	if cfg.DropBcmrIndex {
+		if err := indexers.DropBcmrIndex(db, interrupt); err != nil {
+			bchdLog.Errorf("%v", err)
+			return err
+		}
+
+		return nil
+	}
+	if cfg.DropScriptFilterIndex {
+		if err := indexers.DropScriptFilterIndex(db, interrupt); err != nil {
 			bchdLog.Errorf("%v", err)
 			return err
 		}
@@ -320,15 +345,6 @@ func loadBlockDB() (database.DB, error) {
 }
 
 func main() {
-	// Use all processor cores.
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	// Block and transaction processing can cause bursty allocations.  This
-	// limits the garbage collector from excessively overallocating during
-	// bursts.  This value was arrived at with the help of profiling live
-	// usage.
-	debug.SetGCPercent(10)
-
 	// Up some limits.
 	if err := limits.SetLimits(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to set limits: %v\n", err)

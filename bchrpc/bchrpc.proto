@@ -85,6 +85,21 @@ service bchrpc {
     // **Requires TxIndex**
     rpc GetMerkleProof(GetMerkleProofRequest) returns (GetMerkleProofResponse) {}
 
+    // GetBcmrIdentity returns what the BCMR index knows of an identity, as
+    // CHIP-BCMR defines it, a token's or that of any transaction of an
+    // authchain the index tracks, with the links of its authchain in the
+    // mempool: the authhead, the BCMR publication to read and a token's
+    // genesis supply, and on request the authchain itself, in pages, with a
+    // merkle proof of the newest confirmed link. The index tracks every
+    // token's authchain and, from where it begins, every authchain that holds
+    // a publication, unless more than 100,000 transactions it doesn't
+    // otherwise track are behind the publication; it finds the transactions
+    // behind a publication in the background, once the publication's block is
+    // connected.
+    //
+    // **Requires BcmrIndex**
+    rpc GetBcmrIdentity(GetBcmrIdentityRequest) returns (GetBcmrIdentityResponse) {}
+
     // GetSlpTokenMetadata return slp token metadata for one or more tokens.
     //
     // **Requires SlpIndex**
@@ -135,6 +150,25 @@ service bchrpc {
     // SubscribeBlocks creates a subscription for notifications of new blocks being
     // connected to the blockchain or blocks being disconnected.
     rpc SubscribeBlocks(SubscribeBlocksRequest) returns (stream BlockNotification) {}
+
+    // GetDoubleSpendProof returns a double spend proof, looked up by its hash, by the
+    // double spent output, or by a mempool transaction, in which case the transaction's
+    // unconfirmed ancestors are searched as well.
+    //
+    // A double spend proof shows that a pay-to-pubkey-hash output spent by a mempool
+    // transaction was also spent by another, differently signed transaction.
+    rpc GetDoubleSpendProof(GetDoubleSpendProofRequest) returns (GetDoubleSpendProofResponse) {}
+
+    // GetDoubleSpendProofs returns the double spend proofs for mempool transactions.
+    rpc GetDoubleSpendProofs(GetDoubleSpendProofsRequest) returns (GetDoubleSpendProofsResponse) {}
+
+    // GetDoubleSpendProofScore returns how far a mempool transaction can be trusted not
+    // to be double spent.
+    rpc GetDoubleSpendProofScore(GetDoubleSpendProofScoreRequest) returns (GetDoubleSpendProofScoreResponse) {}
+
+    // SubscribeDoubleSpendProofs creates a subscription for notifications of double spend
+    // proofs as they become associated with mempool transactions.
+    rpc SubscribeDoubleSpendProofs(SubscribeDoubleSpendProofsRequest) returns (stream DoubleSpendProofNotification) {}
 }
 
 
@@ -187,6 +221,8 @@ message GetBlockchainInfoResponse {
         SIMNET   = 3;
         // Latest Testnet.
         TESTNET4 = 4;
+        // The public network for testing upcoming upgrades.
+        CHIPNET  = 5;
     }
 
     // Which network the node is operating on.
@@ -211,6 +247,9 @@ message GetBlockchainInfoResponse {
     bool slp_index = 8;
     // When `slp_graphsearch` is true, the node is able to handle calls to slp graph search
     bool slp_graphsearch = 9;
+    // When `bcmr_index` is true, the node has the BCMR index enabled and may
+    // be used with GetBcmrIdentity.
+    bool bcmr_index = 10;
 }
 
 message GetBlockInfoRequest {
@@ -330,16 +369,19 @@ message GetAddressTransactionsRequest {
     // The network prefix is optional (i.e. "cashaddress:").
     string address = 1;
 
-    // The number of confirmed transactions to skip, starting with the oldest first.
+    // The number of confirmed transactions to skip, starting with the newest.
     // Does not affect results of unconfirmed transactions.
     uint32 nb_skip = 2;
-    // Specify the number of transactions to fetch.
+    // Specify the number of confirmed transactions to fetch, 100 if 0.  A
+    // request for more than 10,000 fails.  Does not affect results of
+    // unconfirmed transactions.
     uint32 nb_fetch = 3;
 
 
     oneof start_block {
         // Recommended. Only get transactions after (or within) a
-        // starting block identified by hash, little-endian.
+        // starting block identified by hash, little-endian.  A hash of no
+        // block of the main chain is taken for the genesis block.
         bytes hash = 4;
         // Recommended. Only get transactions after (or within) a
         // starting block identified by block number.
@@ -351,6 +393,11 @@ message GetAddressTransactionsResponse {
     repeated Transaction confirmed_transactions = 1;
     // Transactions in mempool which have not been included in a block.
     repeated MempoolTransaction unconfirmed_transactions = 2;
+    // The number of confirmed transactions of the address, whatever the
+    // skip, fetch and start block of the request.  Nodes that predate it
+    // leave it 0, so a reply with confirmed transactions and a count of 0 is
+    // from such a node.
+    uint32 confirmed_count = 3;
 }
 
 // Get encoded transactions related to a specific address.
@@ -373,18 +420,21 @@ message GetRawAddressTransactionsRequest {
     // The network prefix is optional (i.e. "cashaddress:").
     string address = 1;
 
-    // The number of confirmed transactions to skip, starting with the oldest first.
+    // The number of confirmed transactions to skip, starting with the newest.
     // Does not affect results of unconfirmed transactions.
     uint32 nb_skip = 2;
-    // Specify the number of transactions to fetch.
+    // Specify the number of confirmed transactions to fetch, 100 if 0.  A
+    // request for more than 10,000 fails.  Does not affect results of
+    // unconfirmed transactions.
     uint32 nb_fetch = 3;
 
     oneof start_block {
-        // Recommended. Only return transactions after some starting block
-        // identified by hash, little-endian.
+        // Recommended. Only return transactions in or after some starting
+        // block identified by hash, little-endian.  A hash of no block of
+        // the main chain is taken for the genesis block.
         bytes hash = 4;
-        // Recommended. Only return transactions after some starting block
-        // identified by block number.
+        // Recommended. Only return transactions in or after some starting
+        // block identified by block number.
         int32 height = 5;
     }
 }
@@ -393,6 +443,11 @@ message GetRawAddressTransactionsResponse {
     repeated bytes confirmed_transactions = 1;
     // Transactions in mempool which have not been included in a block.
     repeated bytes unconfirmed_transactions = 2;
+    // The number of confirmed transactions of the address, whatever the
+    // skip, fetch and start block of the request.  Nodes that predate it
+    // leave it 0, so a reply with confirmed transactions and a count of 0 is
+    // from such a node.
+    uint32 confirmed_count = 3;
 }
 
 message GetAddressUnspentOutputsRequest {
@@ -550,6 +605,63 @@ message SubscribeBlocksRequest {
     bool serialize_block = 3;
 }
 
+message GetDoubleSpendProofRequest {
+    oneof query {
+        // The hash of the proof, little-endian.
+        bytes proof_hash = 1;
+        // The hash of a mempool transaction, little-endian.
+        bytes transaction_hash = 2;
+        // The double spent output.
+        Transaction.Input.Outpoint outpoint = 3;
+    }
+
+    // When looking up by transaction_hash, only return a proof for that transaction,
+    // without searching its unconfirmed ancestors. Default is false. The search is
+    // depth first, and one past 1000 ancestors fails with ResourceExhausted.
+    bool exclude_ancestors = 4;
+}
+
+message GetDoubleSpendProofResponse {
+    DoubleSpendProof proof = 1;
+    // When looking up by transaction_hash with the ancestors searched, the
+    // transactions from the one looked up to the one the proof is for,
+    // little-endian.
+    repeated bytes path = 2;
+    // The transaction the proof is for and its mempool descendants, at most the 1000
+    // nearest, little-endian.
+    // Empty for an orphan proof.
+    repeated bytes descendants = 3;
+}
+
+message GetDoubleSpendProofsRequest {
+    // When include_orphans is true, proofs whose transaction is not in the mempool are
+    // included. Default is false.
+    bool include_orphans = 1;
+}
+
+message GetDoubleSpendProofsResponse {
+    repeated DoubleSpendProof proofs = 1;
+}
+
+message GetDoubleSpendProofScoreRequest {
+    // The hash of a mempool transaction, little-endian.
+    bytes transaction_hash = 1;
+}
+
+message GetDoubleSpendProofScoreResponse {
+    // 1 when neither the transaction nor an unconfirmed ancestor has a proof and a
+    // proof is possible for all of them, 0 when one of them has a proof or spends an
+    // output no proof is possible for (not pay-to-pubkey-hash), and 0.25 when an input
+    // of one of them does not sign all inputs and outputs or there are too many
+    // unconfirmed ancestors to check.
+    double score = 1;
+}
+
+message SubscribeDoubleSpendProofsRequest {
+    // When include_mempool is true, the proofs already in the mempool are sent first.
+    bool include_mempool = 1;
+}
+
 message GetSlpTokenMetadataRequest {
     repeated bytes token_ids = 1;
 }
@@ -655,8 +767,49 @@ message TransactionNotification {
     }
 }
 
+message DoubleSpendProofNotification {
+    DoubleSpendProof proof = 1;
+}
+
 
 // DATA MESSAGES
+
+// A proof that two differently signed inputs spend the same pay-to-pubkey-hash
+// output, as relayed in dsproof-beta messages.
+message DoubleSpendProof {
+    // The parts of the signature preimage of one of the two inputs.
+    message Spender {
+        // The transaction version.
+        uint32 version = 1;
+        // The input sequence number.
+        uint32 sequence = 2;
+        // The transaction lock time.
+        uint32 lock_time = 3;
+        // The hash of the outpoints spent by the transaction, or zero when the
+        // signature does not commit to them.
+        bytes hash_prev_outputs = 4;
+        // The hash of the input sequence numbers, or zero when the signature
+        // does not commit to them.
+        bytes hash_sequence = 5;
+        // The hash of the outputs the signature commits to, or zero.
+        bytes hash_outputs = 6;
+        // The data the input pushed: its signature.
+        repeated bytes push_data = 7;
+    }
+
+    // The hash of the serialized proof, little-endian.
+    bytes hash = 1;
+    // The mempool transaction spending the double spent output, little-endian,
+    // or empty when no mempool transaction spends it. Orphan proofs, those
+    // returned by GetDoubleSpendProofs with include_orphans, always have it empty.
+    bytes transaction_hash = 2;
+    // The double spent output.
+    Transaction.Input.Outpoint outpoint = 3;
+    Spender first_spender = 4;
+    Spender double_spender = 5;
+    // The proof serialized as in the dsproof-beta message.
+    bytes serialized_proof = 6;
+}
 
 // Metadata for identifying and validating a block
 message BlockInfo {
@@ -751,7 +904,10 @@ message Transaction {
         bytes pubkey_script = 3;
         // The bitcoin addresses associated with this output.
         string address = 4;
-        // The type of script.
+        // The type of script: pubkey, pubkeyhash, scripthash (for both the
+        // 20 and the 32 byte hash forms), multisig, datacarrier (OP_RETURN
+        // followed only by pushes), script (any other script of at most 201
+        // bytes) or nonstandard.
         string script_class = 5;
         // The script expressed in Bitcoin Cash Script.
         string disassembled_script = 6;
@@ -800,7 +956,7 @@ message MempoolTransaction {
     int64 fee = 4;
     // The fee in satoshi per kilobyte the transaction pays.
     int64 fee_per_kb = 5;
-    // The priority of the transaction when it was added to the pool.
+    // Deprecated, always 0.
     double starting_priority = 6;
 }
 
@@ -1015,4 +1171,112 @@ message SlpRequiredBurn {
         uint64 amount = 4 [jstype = JS_STRING];
         uint32 mint_baton_vout = 5;
     }
+}
+
+message GetBcmrIdentityRequest {
+    // The identity's authbase, little-endian: a token's category ID, or any
+    // transaction of an authchain the index tracks.
+    bytes authbase = 1;
+    // Also return the authchain's transactions, from the authbase, or from
+    // the link after the one in after.
+    bool include_authchain = 2;
+    // A link of the authchain, little-endian, which the client knows the
+    // authchain up to, to return the links after it. Only with
+    // include_authchain.
+    bytes after = 3;
+    // The most links to return, up to 1000, which 0 also means. An answer
+    // also holds no more after the link that takes its transactions to
+    // 1 MB. Only with include_authchain.
+    uint32 limit = 4;
+}
+
+// GetBcmrIdentityResponse is what the BCMR index knows of an identity.
+//
+// WARNING: Some languages (e.g., JavaScript) may not properly handle the 'uint64'
+// for large amounts. For this reason, an annotation has been added for JS to
+// return a string for the genesis_supply field instead of casting uint64 to the
+// JS 'number' type. Other languages may require similar treatment.
+message GetBcmrIdentityResponse {
+    enum Status {
+        // The authchain goes on.
+        ACTIVE = 0;
+        // The authhead spent the identity output to a data-carrier output,
+        // which ends the authchain.
+        BURNED = 1;
+    }
+
+    // A BCMR publication output, as CHIP-BCMR defines it.
+    message Publication {
+        // The index of the output.
+        uint32 output = 1;
+        // The output starts with the publication prefix but is malformed,
+        // and hash and uris are empty.
+        bool malformed = 2;
+        // The SHA-256 of the registry in the byte order it was pushed in,
+        // which SHA-256 tools print, unlike the little-endian hashes of
+        // transactions and blocks.
+        bytes hash = 3;
+        // The URIs pushed after the hash, as they are.
+        repeated string uris = 4;
+    }
+
+    // A link of the authchain.
+    message Link {
+        // The link's transaction hash, little-endian.
+        bytes hash = 1;
+        // The height of the link's block, or 0 while it is in the mempool.
+        int32 height = 2;
+        // The hash of the link's block, little-endian, or empty while it is
+        // in the mempool.
+        bytes block_hash = 3;
+        // The link's BCMR publication output, if it has one.
+        Publication publication = 4;
+        // The serialized transaction, for the links in authchain.
+        bytes transaction = 5;
+    }
+
+    // A merkle proof of a link of the authchain.
+    message Proof {
+        // The index of the link in the authchain.
+        uint32 index = 1;
+        // The link's block, and the proof's hashes and flags, as in
+        // GetMerkleProofResponse.
+        BlockInfo block = 2;
+        repeated bytes hashes = 3;
+        bytes flags = 4;
+        // The number of transactions in the block, which the proof's tree
+        // needs.
+        uint32 transactions = 5;
+    }
+
+    // The identity's authbase, little-endian.
+    bytes authbase = 1;
+    Status status = 2;
+    // The authhead, the newest link of the authchain, confirmed or in the
+    // mempool.
+    Link head = 3;
+    // The link with the publication to read: the authhead, when it has a
+    // well-formed publication and publication_current is set, or else the
+    // newest earlier link with one. Unset if no link has one.
+    Link publication = 4;
+    bool publication_current = 5;
+    // The number of fungible tokens the token's genesis created, when
+    // has_genesis_supply is set, for a token's identity.
+    uint64 genesis_supply = 6 [jstype = JS_STRING];
+    bool has_genesis_supply = 12;
+    // The CashTokens data of the authhead's identity output, output 0, as it
+    // is, if it carries a token.
+    CashToken identity_output = 7;
+    // The index of the first link in authchain, counted from the authbase
+    // as 0.
+    uint32 first_index = 8;
+    // The links of the authchain, with include_authchain, in the order of
+    // CHIP-BCMR's authchain extension.
+    repeated Link authchain = 9;
+    // Later links didn't fit; ask again with after set to the last one.
+    bool more = 10;
+    // A merkle proof of the newest confirmed link, which proves the earlier
+    // links too, since each spends the one before. Set when the links
+    // returned reach the authhead and a link is confirmed.
+    Proof proof = 11;
 }

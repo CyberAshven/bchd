@@ -63,6 +63,9 @@ http:
   - selector: pb.bchrpc.GetMerkleProof
     post: /v1/GetMerkleProof
     body: "*"
+  - selector: pb.bchrpc.GetBcmrIdentity
+    post: /v1/GetBcmrIdentity
+    body: "*"
   - selector: pb.bchrpc.SubmitTransaction
     post: /v1/SubmitTransaction
     body: "*"
@@ -74,4 +77,16 @@ http:
     body: "*"
   - selector: pb.bchrpc.SubscribeBlocks
     post: /v1/SubscribeBlocks
+    body: "*"
+  - selector: pb.bchrpc.GetDoubleSpendProof
+    post: /v1/GetDoubleSpendProof
+    body: "*"
+  - selector: pb.bchrpc.GetDoubleSpendProofs
+    post: /v1/GetDoubleSpendProofs
+    body: "*"
+  - selector: pb.bchrpc.GetDoubleSpendProofScore
+    post: /v1/GetDoubleSpendProofScore
+    body: "*"
+  - selector: pb.bchrpc.SubscribeDoubleSpendProofs
+    post: /v1/SubscribeDoubleSpendProofs
     body: "*"

@@ -1,0 +1,343 @@
+// Copyright (c) 2026 The bchd developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package netsync
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gcash/bchd/blockchain"
+	"github.com/gcash/bchd/chaincfg"
+	peerpkg "github.com/gcash/bchd/peer"
+	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchutil"
+)
+
+// returnsWithin fails the test unless fn returns within a few seconds.
+func returnsWithin(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not return", what)
+	}
+}
+
+// TestCallsAfterStop ensures IsCurrent, SyncHeight, SyncPeerID, ProcessBlock,
+// Pause and NewPeer return once the sync manager has stopped, rather than wait
+// for the block handler that is gone.  The server, the RPC server and the CPU
+// miner make these calls from goroutines that may outlive the sync manager.
+func TestCallsAfterStop(t *testing.T) {
+	h := newRequestTestHarness(t)
+	p := h.peer(1)
+	h.sm.Start()
+	if err := h.sm.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	returnsWithin(t, "IsCurrent", func() {
+		if h.sm.IsCurrent() {
+			t.Error("stopped sync manager is current")
+		}
+	})
+	returnsWithin(t, "SyncHeight", func() {
+		if height := h.sm.SyncHeight(); height != 0 {
+			t.Errorf("stopped sync manager has sync height %d", height)
+		}
+	})
+	returnsWithin(t, "SyncPeerID", func() {
+		if id := h.sm.SyncPeerID(); id != 0 {
+			t.Errorf("stopped sync manager has sync peer %d", id)
+		}
+	})
+	returnsWithin(t, "ProcessBlock", func() {
+		_, err := h.sm.ProcessBlock(bchutil.NewBlock(h.tip),
+			blockchain.BFNone)
+		if !errors.Is(err, errStopped) {
+			t.Errorf("stopped sync manager processed a block: %v", err)
+		}
+	})
+	returnsWithin(t, "Pause", func() { close(h.sm.Pause()) })
+	returnsWithin(t, "NewPeer", func() { h.sm.NewPeer(p, nil) })
+	returnsWithin(t, "DonePeer", func() { h.sm.DonePeer(p, nil) })
+}
+
+// TestCallsGiveUpOnStop ensures IsCurrent, SyncHeight and NewPeer stop
+// waiting for the block handler to take their message when the sync manager
+// stops, and that the block handler can still answer an IsCurrent or a
+// SyncHeight that gave up.
+func TestCallsGiveUpOnStop(t *testing.T) {
+	h := newRequestTestHarness(t)
+	p := h.peer(1)
+
+	// Nothing takes the messages.
+	sm := &SyncManager{msgChan: make(chan interface{}),
+		quit: make(chan struct{})}
+	current := make(chan bool, 1)
+	go func() { current <- sm.IsCurrent() }()
+	height := make(chan uint64, 1)
+	go func() { height <- sm.SyncHeight() }()
+	added := make(chan struct{})
+	go func() {
+		sm.NewPeer(p, nil)
+		close(added)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(sm.quit)
+	returnsWithin(t, "IsCurrent", func() {
+		if <-current {
+			t.Error("stopping sync manager is current")
+		}
+	})
+	returnsWithin(t, "SyncHeight", func() {
+		if got := <-height; got != 0 {
+			t.Errorf("stopping sync manager has sync height %d", got)
+		}
+	})
+	returnsWithin(t, "NewPeer", func() { <-added })
+
+	// The block handler takes the message, but the sync manager stops
+	// before it answers.
+	sm = &SyncManager{msgChan: make(chan interface{}, 1),
+		quit: make(chan struct{})}
+	go func() { current <- sm.IsCurrent() }()
+	msg := (<-sm.msgChan).(isCurrentMsg)
+	go func() { height <- sm.SyncHeight() }()
+	heightMsg := (<-sm.msgChan).(getSyncHeightMsg)
+	close(sm.quit)
+	returnsWithin(t, "IsCurrent", func() { <-current })
+	returnsWithin(t, "SyncHeight", func() {
+		if got := <-height; got != 0 {
+			t.Errorf("stopping sync manager has sync height %d", got)
+		}
+	})
+	returnsWithin(t, "the answer to an IsCurrent that gave up", func() {
+		msg.reply <- true
+	})
+	returnsWithin(t, "the answer to a SyncHeight that gave up", func() {
+		heightMsg.reply <- 5
+	})
+}
+
+// TestRPCCallsGiveUpOnStop ensures SyncPeerID, ProcessBlock and Pause, which
+// the RPC server and the CPU miner call, stop waiting for the block handler to
+// take their message when the sync manager stops, and that the block handler
+// can still answer a SyncPeerID or a ProcessBlock that gave up.  They waited
+// for good for a block handler that was gone.
+func TestRPCCallsGiveUpOnStop(t *testing.T) {
+	block := bchutil.NewBlock(chaincfg.RegressionNetParams.GenesisBlock)
+	processBlock := func(sm *SyncManager, processed chan<- error) {
+		_, err := sm.ProcessBlock(block, blockchain.BFNone)
+		processed <- err
+	}
+	stopped := func(processed <-chan error) func() {
+		return func() {
+			if err := <-processed; !errors.Is(err, errStopped) {
+				t.Errorf("stopping sync manager processed a block: %v",
+					err)
+			}
+		}
+	}
+
+	// Nothing takes the messages.
+	sm := &SyncManager{msgChan: make(chan interface{}),
+		quit: make(chan struct{})}
+	peerID := make(chan int32, 1)
+	go func() { peerID <- sm.SyncPeerID() }()
+	processed := make(chan error, 1)
+	go processBlock(sm, processed)
+	paused := make(chan struct{})
+	go func() {
+		close(sm.Pause())
+		close(paused)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(sm.quit)
+	returnsWithin(t, "SyncPeerID", func() {
+		if id := <-peerID; id != 0 {
+			t.Errorf("stopping sync manager has sync peer %d", id)
+		}
+	})
+	returnsWithin(t, "ProcessBlock", stopped(processed))
+	returnsWithin(t, "Pause", func() { <-paused })
+
+	// The block handler takes the messages, but the sync manager stops
+	// before it answers.
+	sm = &SyncManager{msgChan: make(chan interface{}, 1),
+		quit: make(chan struct{})}
+	go func() { peerID <- sm.SyncPeerID() }()
+	peerMsg := (<-sm.msgChan).(getSyncPeerMsg)
+	go processBlock(sm, processed)
+	processMsg := (<-sm.msgChan).(processBlockMsg)
+	close(sm.quit)
+	returnsWithin(t, "SyncPeerID", func() {
+		if id := <-peerID; id != 0 {
+			t.Errorf("stopping sync manager has sync peer %d", id)
+		}
+	})
+	returnsWithin(t, "ProcessBlock", stopped(processed))
+	returnsWithin(t, "the answer to a SyncPeerID that gave up", func() {
+		peerMsg.reply <- 1
+	})
+	returnsWithin(t, "the answer to a ProcessBlock that gave up", func() {
+		processMsg.reply <- processBlockResponse{}
+	})
+}
+
+// TestQueueGivesUpOnStop ensures the calls that queue a peer's messages stop
+// waiting for the block handler to take them when the sync manager stops, as
+// it then takes no more, and signal a done channel passed to them.  A full
+// queue made them wait for good.
+func TestQueueGivesUpOnStop(t *testing.T) {
+	p := peerpkg.NewInboundPeer(&peerpkg.Config{})
+	block := bchutil.NewBlock(chaincfg.RegressionNetParams.GenesisBlock)
+	tx := block.Transactions()[0]
+
+	// Nothing takes the messages.
+	sm := &SyncManager{msgChan: make(chan interface{}),
+		quit: make(chan struct{})}
+	calls := []struct {
+		name string
+		fn   func(done chan struct{})
+	}{
+		{"QueueTx", func(done chan struct{}) { sm.QueueTx(tx, p, done) }},
+		{"QueueBlock", func(done chan struct{}) {
+			sm.QueueBlock(block, p, done)
+		}},
+		{"QueueBlockError", func(chan struct{}) {
+			sm.QueueBlockError(block.Hash(), p)
+		}},
+		{"QueueNotFound", func(chan struct{}) {
+			sm.QueueNotFound(wire.NewMsgNotFound(), p)
+		}},
+		{"QueueInv", func(chan struct{}) { sm.QueueInv(wire.NewMsgInv(), p) }},
+		{"QueueHeaders", func(chan struct{}) {
+			sm.QueueHeaders(wire.NewMsgHeaders(), p)
+		}},
+		{"DonePeer", func(chan struct{}) { sm.DonePeer(p, nil) }},
+	}
+	returned := make([]chan struct{}, len(calls))
+	dones := make([]chan struct{}, len(calls))
+	for i, call := range calls {
+		returned[i] = make(chan struct{})
+		dones[i] = make(chan struct{}, 1)
+		go func() {
+			call.fn(dones[i])
+			close(returned[i])
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(sm.quit)
+	for i, call := range calls {
+		returnsWithin(t, call.name, func() { <-returned[i] })
+	}
+	returnsWithin(t, "QueueTx's done", func() { <-dones[0] })
+	returnsWithin(t, "QueueBlock's done", func() { <-dones[1] })
+}
+
+// TestQueuedAnsweredOnStop ensures the block handler answers the messages
+// still queued when it stops, as their senders wait for the answer: a peer's
+// input handler waits for each block and transaction it queued.  It took
+// either a queued message or its quit, at random, so a block queued when a
+// sync was stopped was left unanswered about half the time.
+func TestQueuedAnsweredOnStop(t *testing.T) {
+	h := newRequestTestHarness(t)
+	connected := h.peer(1)
+	p := peerpkg.NewInboundPeer(&peerpkg.Config{})
+	block := bchutil.NewBlock(h.tip)
+	h.sm.Start()
+
+	// The paused block handler takes no message until the sync manager
+	// is stopping.
+	const queued = 20
+	unpause := h.sm.Pause()
+	dones := make([]chan struct{}, queued)
+	for i := range dones {
+		dones[i] = make(chan struct{}, 1)
+		switch i % 4 {
+		case 0:
+			h.sm.QueueBlock(block, p, dones[i])
+		case 1:
+			h.sm.QueueTx(block.Transactions()[0], p, dones[i])
+		case 2:
+			h.sm.NewPeer(connected, dones[i])
+		case 3:
+			h.sm.DonePeer(p, dones[i])
+		}
+	}
+	stopped := make(chan struct{})
+	go func() {
+		_ = h.sm.Stop()
+		close(stopped)
+	}()
+	<-h.sm.quit
+	close(unpause)
+	returnsWithin(t, "Stop", func() { <-stopped })
+
+	answered := 0
+	for _, done := range dones {
+		select {
+		case <-done:
+			answered++
+		default:
+		}
+	}
+	if answered != queued {
+		t.Fatalf("%d of %d queued messages answered", answered, queued)
+	}
+}
+
+// TestStopWhilePaused ensures that the sync manager stops while it is paused,
+// as when the websocket client that paused it can't finish.
+func TestStopWhilePaused(t *testing.T) {
+	h := newRequestTestHarness(t)
+	h.sm.Start()
+	unpause := h.sm.Pause()
+	defer close(unpause)
+
+	// Give the sync manager the time to take the pause, which a slow
+	// machine only makes this test pass without it.
+	time.Sleep(100 * time.Millisecond)
+	stopped := make(chan struct{})
+	go func() {
+		_ = h.sm.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Minute):
+		t.Fatal("the sync manager didn't stop while it was paused")
+	}
+}
+
+// TestPauseWaitsForHandler ensures Pause returns only once the handler has
+// paused, not when its message is queued, as the caller counts on nothing
+// changing from then on.
+func TestPauseWaitsForHandler(t *testing.T) {
+	sm := &SyncManager{
+		msgChan: make(chan interface{}, 1),
+		quit:    make(chan struct{}),
+	}
+	returned := make(chan struct{})
+	go func() {
+		sm.Pause()
+		close(returned)
+	}()
+
+	msg := (<-sm.msgChan).(pauseMsg)
+	select {
+	case <-returned:
+		t.Fatal("Pause returned before the handler paused")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(msg.paused)
+	returnsWithin(t, "Pause", func() { <-returned })
+}

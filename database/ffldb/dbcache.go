@@ -6,14 +6,16 @@ package ffldb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/btcsuite/goleveldb/leveldb"
-	"github.com/btcsuite/goleveldb/leveldb/iterator"
-	"github.com/btcsuite/goleveldb/leveldb/util"
+	"github.com/gcash/bchd/database"
 	"github.com/gcash/bchd/database/internal/treap"
+	"github.com/gcash/goleveldb/leveldb"
+	"github.com/gcash/goleveldb/leveldb/iterator"
+	"github.com/gcash/goleveldb/leveldb/util"
 )
 
 const (
@@ -291,6 +293,32 @@ type dbCacheSnapshot struct {
 	dbSnapshot    *leveldb.Snapshot
 	pendingKeys   *treap.Immutable
 	pendingRemove *treap.Immutable
+
+	// readErr is the first error reading from the database, which fails
+	// the transaction using the snapshot.  A read that fails returns
+	// nothing, as for a missing key.
+	readErrMtx sync.Mutex
+	readErr    error
+}
+
+// noteReadErr records err, from reading the database, unless it only says
+// the key is missing.
+func (snap *dbCacheSnapshot) noteReadErr(err error) {
+	if err == leveldb.ErrNotFound {
+		return
+	}
+	snap.readErrMtx.Lock()
+	if snap.readErr == nil {
+		snap.readErr = err
+	}
+	snap.readErrMtx.Unlock()
+}
+
+// readError returns the first error reading from the database, if any.
+func (snap *dbCacheSnapshot) readError() error {
+	snap.readErrMtx.Lock()
+	defer snap.readErrMtx.Unlock()
+	return snap.readErr
 }
 
 // Has returns whether or not the passed key exists.
@@ -304,7 +332,10 @@ func (snap *dbCacheSnapshot) Has(key []byte) bool {
 	}
 
 	// Consult the database.
-	hasKey, _ := snap.dbSnapshot.Has(key, nil)
+	hasKey, err := snap.dbSnapshot.Has(key, nil)
+	if err != nil {
+		snap.noteReadErr(err)
+	}
 	return hasKey
 }
 
@@ -322,6 +353,7 @@ func (snap *dbCacheSnapshot) Get(key []byte) []byte {
 	// Consult the database.
 	value, err := snap.dbSnapshot.Get(key, nil)
 	if err != nil {
+		snap.noteReadErr(err)
 		return nil
 	}
 	return value
@@ -377,11 +409,17 @@ type dbCache struct {
 	// lastFlush is the time the cache was last flushed.  It is used in
 	// conjunction with the current time and the flush interval.
 	//
+	// writesStopped is the error of the write after which leveldb stopped
+	// taking writes, which it does until it is reopened.  Every later
+	// commit fails with it rather than going to the cache, which could
+	// then never be written.
+	//
 	// NOTE: These flush related fields are protected by the database write
 	// lock.
 	maxSize       uint64
 	flushInterval time.Duration
 	lastFlush     time.Time
+	writesStopped error
 
 	// The following fields hold the keys that need to be stored or deleted
 	// from the underlying database once the cache is full, enough time has
@@ -437,6 +475,9 @@ func (c *dbCache) updateDB(fn func(ldbTx *leveldb.Transaction) error) error {
 
 	// Commit the leveldb transaction and convert any errors as needed.
 	if err := ldbTx.Commit(); err != nil {
+		// The transaction holds the leveldb write lock until it is
+		// committed or discarded.
+		ldbTx.Discard()
 		return convertErr("failed to commit leveldb transaction", err)
 	}
 	return nil
@@ -489,7 +530,9 @@ func (c *dbCache) commitTreaps(pendingKeys, pendingRemove TreapForEacher) error 
 //
 // This function MUST be called with the database write lock held.
 func (c *dbCache) flush() error {
-	c.lastFlush = time.Now()
+	if c.writesStopped != nil {
+		return c.writesStopped
+	}
 
 	// Sync the current write file associated with the block store.  This is
 	// necessary before writing the metadata to prevent the case where the
@@ -509,11 +552,15 @@ func (c *dbCache) flush() error {
 
 	// Nothing to do if there is no data to flush.
 	if cachedKeys.Len() == 0 && cachedRemove.Len() == 0 {
+		c.lastFlush = time.Now()
 		return nil
 	}
 
-	// Perform all leveldb updates using an atomic transaction.
+	// Perform all leveldb updates using an atomic transaction.  The flush
+	// time is only updated once it succeeds, so a failed flush is retried
+	// by the next commit.
 	if err := c.commitTreaps(cachedKeys, cachedRemove); err != nil {
+		c.noteWriteError(err)
 		return err
 	}
 
@@ -523,7 +570,21 @@ func (c *dbCache) flush() error {
 	c.cachedRemove = treap.NewImmutable()
 	c.cacheLock.Unlock()
 
+	c.lastFlush = time.Now()
 	return nil
+}
+
+// noteWriteError records err if it is leveldb's error for writes it stopped
+// taking, after which every commit fails with it.
+//
+// This function MUST be called with the database write lock held.
+func (c *dbCache) noteWriteError(err error) {
+	var dbErr database.Error
+	if errors.Is(err, leveldb.ErrWritesStopped) ||
+		(errors.As(err, &dbErr) && errors.Is(dbErr.Err, leveldb.ErrWritesStopped)) {
+
+		c.writesStopped = err
+	}
 }
 
 // needsFlush returns whether or not the database cache needs to be flushed to
@@ -565,26 +626,40 @@ func (c *dbCache) needsFlush(tx *transaction) bool {
 // database even if the transaction fails to apply, but it will only be the
 // state of the cache without the transaction applied.
 //
+// When it fails, the returned bool reports whether the transaction's keys may
+// have been stored anyway.  They may when the leveldb transaction that writes
+// them directly fails with writes stopped, as its MANIFEST commit can fail
+// after the record reached the disk, and the next open keeps the record then
+// (see leveldb.Transaction.Commit).
+//
 // This function MUST be called during a database write transaction which in
 // turn implies the database write lock will be held.
-func (c *dbCache) commitTx(tx *transaction) error {
+func (c *dbCache) commitTx(tx *transaction) (bool, error) {
+	if c.writesStopped != nil {
+		return false, c.writesStopped
+	}
+
 	// Flush the cache and write the current transaction directly to the
 	// database if a flush is needed.
 	if c.needsFlush(tx) {
 		if err := c.flush(); err != nil {
-			return err
+			return false, err
 		}
 
-		// Perform all leveldb updates using an atomic transaction.
+		// Perform all leveldb updates using an atomic transaction.  When
+		// it fails with writes stopped, which noteWriteError records, its
+		// MANIFEST commit may have failed after the record reached the
+		// disk, so the keys may be stored.
 		err := c.commitTreaps(tx.pendingKeys, tx.pendingRemove)
 		if err != nil {
-			return err
+			c.noteWriteError(err)
+			return c.writesStopped != nil, err
 		}
 
 		// Clear the transaction entries since they have been committed.
 		tx.pendingKeys = nil
 		tx.pendingRemove = nil
-		return nil
+		return false, nil
 	}
 
 	// At this point a database flush is not needed, so atomically commit
@@ -592,24 +667,26 @@ func (c *dbCache) commitTx(tx *transaction) error {
 
 	// Since the cached keys to be added and removed use an immutable treap,
 	// a snapshot is simply obtaining the root of the tree under the lock
-	// which is used to atomically swap the root.
+	// which is used to atomically swap the root.  The changes are applied
+	// in batches, which copy each node of the treaps at most once instead
+	// of once for every key below it.
 	c.cacheLock.RLock()
-	newCachedKeys := c.cachedKeys
-	newCachedRemove := c.cachedRemove
+	newCachedKeys := c.cachedKeys.Batch()
+	newCachedRemove := c.cachedRemove.Batch()
 	c.cacheLock.RUnlock()
 
 	// Apply every key to add in the database transaction to the cache.
 	tx.pendingKeys.ForEach(func(k, v []byte) bool {
-		newCachedRemove = newCachedRemove.Delete(k)
-		newCachedKeys = newCachedKeys.Put(k, v)
+		newCachedRemove.Delete(k)
+		newCachedKeys.Put(k, v)
 		return true
 	})
 	tx.pendingKeys = nil
 
 	// Apply every key to remove in the database transaction to the cache.
 	tx.pendingRemove.ForEach(func(k, _ []byte) bool {
-		newCachedKeys = newCachedKeys.Delete(k)
-		newCachedRemove = newCachedRemove.Put(k, nil)
+		newCachedKeys.Delete(k)
+		newCachedRemove.Put(k, nil)
 		return true
 	})
 	tx.pendingRemove = nil
@@ -617,10 +694,10 @@ func (c *dbCache) commitTx(tx *transaction) error {
 	// Atomically replace the immutable treaps which hold the cached keys to
 	// add and delete.
 	c.cacheLock.Lock()
-	c.cachedKeys = newCachedKeys
-	c.cachedRemove = newCachedRemove
+	c.cachedKeys = newCachedKeys.Immutable()
+	c.cachedRemove = newCachedRemove.Immutable()
 	c.cacheLock.Unlock()
-	return nil
+	return false, nil
 }
 
 // Close cleanly shuts down the database cache by syncing all data and closing

@@ -151,8 +151,9 @@ out:
 }
 
 // submitBlock submits the passed block to network after ensuring it passes all
-// of the consensus validation rules.
-func (m *CPUMiner) submitBlock(block *bchutil.Block) bool {
+// of the consensus validation rules.  It returns whether the block was
+// accepted, and an error when it was rejected rather than stale or an orphan.
+func (m *CPUMiner) submitBlock(block *bchutil.Block) (bool, error) {
 	m.submitBlockLock.Lock()
 	defer m.submitBlockLock.Unlock()
 
@@ -165,7 +166,7 @@ func (m *CPUMiner) submitBlock(block *bchutil.Block) bool {
 	if !msgBlock.Header.PrevBlock.IsEqual(&m.g.BestSnapshot().Hash) {
 		log.Debugf("Block submitted via CPU miner with previous "+
 			"block %s is stale", msgBlock.Header.PrevBlock)
-		return false
+		return false, nil
 	}
 
 	// Process this block using the same rules as blocks coming from other
@@ -177,22 +178,22 @@ func (m *CPUMiner) submitBlock(block *bchutil.Block) bool {
 		if _, ok := err.(blockchain.RuleError); !ok {
 			log.Errorf("Unexpected error while processing "+
 				"block submitted via CPU miner: %v", err)
-			return false
+			return false, err
 		}
 
 		log.Debugf("Block submitted via CPU miner rejected: %v", err)
-		return false
+		return false, err
 	}
 	if isOrphan {
 		log.Debugf("Block submitted via CPU miner is an orphan")
-		return false
+		return false, nil
 	}
 
 	// The block was accepted.
 	coinbaseTx := block.MsgBlock().Transactions[0].TxOut[0]
 	log.Infof("Block submitted via CPU miner accepted (hash %s, "+
 		"amount %v)", block.Hash(), bchutil.Amount(coinbaseTx.Value))
-	return true
+	return true, nil
 }
 
 // solveBlock attempts to find some combination of a nonce, extra nonce, and
@@ -228,7 +229,7 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 	// Note that the entire extra nonce range is iterated and the offset is
 	// added relying on the fact that overflow will wrap around 0 as
 	// provided by the Go spec.
-	for extraNonce := uint64(0); extraNonce < maxExtraNonce; extraNonce++ {
+	for extraNonce := range maxExtraNonce {
 		// Update the extra nonce in the block template with the
 		// new value by regenerating the coinbase script and
 		// setting the merkle root to the new value.
@@ -346,6 +347,14 @@ out:
 			errStr := fmt.Sprintf("Failed to create new block "+
 				"template: %v", err)
 			log.Errorf("%s", errStr)
+
+			// Wait before retrying so a persistent error does not
+			// spin.
+			select {
+			case <-quit:
+				break out
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 
@@ -353,9 +362,9 @@ out:
 		// with false when conditions that trigger a stale block, so
 		// a new block template can be generated.  When the return is
 		// true a solution was found, so submit the solved block.
-		if m.solveBlock(template.Block, curHeight+1, ticker, quit) {
+		if m.solveBlock(template.Block, template.Height, ticker, quit) {
 			block := bchutil.NewBlock(template.Block)
-			m.submitBlock(block)
+			_, _ = m.submitBlock(block)
 		}
 	}
 
@@ -373,7 +382,7 @@ func (m *CPUMiner) miningWorkerController() {
 	// workers for generating blocks.
 	var runningWorkers []chan struct{}
 	launchWorkers := func(numWorkers uint32) {
-		for i := uint32(0); i < numWorkers; i++ {
+		for range numWorkers {
 			quit := make(chan struct{})
 			runningWorkers = append(runningWorkers, quit)
 
@@ -585,7 +594,6 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 		// be changing and this would otherwise end up building a new block
 		// template on a block that is in the process of becoming stale.
 		m.submitBlockLock.Lock()
-		curHeight := m.g.BestSnapshot().Height
 
 		// Choose a payment address at random.
 		payToAddr := m.cfg.MiningAddrs[rand.Intn(len(m.cfg.MiningAddrs))]
@@ -596,33 +604,55 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 		template, err := m.g.NewBlockTemplate(payToAddr)
 		m.submitBlockLock.Unlock()
 		if err != nil {
-			errStr := fmt.Sprintf("Failed to create new block "+
-				"template: %v", err)
-			log.Errorf("%s", errStr)
-			continue
+			// Retry when the tip moved while the template was built.
+			var ruleErr blockchain.RuleError
+			if errors.As(err, &ruleErr) &&
+				ruleErr.ErrorCode == blockchain.ErrPrevBlockNotBest {
+
+				continue
+			}
+			m.stopDiscreteMining()
+			return nil, fmt.Errorf("failed to create new block "+
+				"template: %w", err)
 		}
 
 		// Attempt to solve the block.  The function will exit early
 		// with false when conditions that trigger a stale block, so
 		// a new block template can be generated.  When the return is
 		// true a solution was found, so submit the solved block.
-		if m.solveBlock(template.Block, curHeight+1, ticker, nil) {
+		// Only an accepted block counts; a stale block or an orphan
+		// is retried and a rejected one ends the run.
+		if m.solveBlock(template.Block, template.Height, ticker, nil) {
 			block := bchutil.NewBlock(template.Block)
-			m.submitBlock(block)
+			accepted, err := m.submitBlock(block)
+			if err != nil {
+				m.stopDiscreteMining()
+				return nil, fmt.Errorf("block %v rejected: %w",
+					block.Hash(), err)
+			}
+			if !accepted {
+				continue
+			}
 			blockHashes[i] = block.Hash()
 			i++
 			if i == n {
 				log.Tracef("Generated %d blocks", i)
-				m.Lock()
-				close(m.speedMonitorQuit)
-				m.wg.Wait()
-				m.started = false
-				m.discreteMining = false
-				m.Unlock()
+				m.stopDiscreteMining()
 				return blockHashes, nil
 			}
 		}
 	}
+}
+
+// stopDiscreteMining stops the speed monitor started by GenerateNBlocks and
+// marks the miner as stopped.
+func (m *CPUMiner) stopDiscreteMining() {
+	m.Lock()
+	close(m.speedMonitorQuit)
+	m.wg.Wait()
+	m.started = false
+	m.discreteMining = false
+	m.Unlock()
 }
 
 // New returns a new instance of a CPU miner for the provided configuration.

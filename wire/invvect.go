@@ -30,6 +30,7 @@ const (
 	InvTypeBlock         InvType = 2
 	InvTypeFilteredBlock InvType = 3
 	InvTypeCmpctBlock    InvType = 4
+	InvTypeDSProof       InvType = 0x94a0
 )
 
 // Map of service flags back to their constant names for pretty printing.
@@ -39,6 +40,7 @@ var ivStrings = map[InvType]string{
 	InvTypeBlock:         "MSG_BLOCK",
 	InvTypeFilteredBlock: "MSG_FILTERED_BLOCK",
 	InvTypeCmpctBlock:    "MSG_CMPCT_BLOCK",
+	InvTypeDSProof:       "MSG_DOUBLESPENDPROOF",
 }
 
 // String returns the InvType in human-readable form.
@@ -69,10 +71,34 @@ func NewInvVect(typ InvType, hash *chainhash.Hash) *InvVect {
 // readInvVect reads an encoded InvVect from r depending on the protocol
 // version.
 func readInvVect(r io.Reader, pver uint32, iv *InvVect) error {
-	return readElements(r, &iv.Type, &iv.Hash)
+	buf := binarySerializer.Borrow()
+	defer binarySerializer.Return(buf)
+	return readInvVectBuf(r, iv, buf)
+}
+
+// readInvVectBuf reads an InvVect from r using the provided scratch buffer.
+func readInvVectBuf(r io.Reader, iv *InvVect, buf []byte) error {
+	if _, err := io.ReadFull(r, buf[:4]); err != nil {
+		return err
+	}
+	iv.Type = InvType(littleEndian.Uint32(buf[:4]))
+	_, err := io.ReadFull(r, iv.Hash[:])
+	return err
 }
 
 // writeInvVect serializes an InvVect to w depending on the protocol version.
 func writeInvVect(w io.Writer, pver uint32, iv *InvVect) error {
-	return writeElements(w, iv.Type, &iv.Hash)
+	buf := binarySerializer.Borrow()
+	defer binarySerializer.Return(buf)
+	return writeInvVectBuf(w, iv, buf)
+}
+
+// writeInvVectBuf writes iv to w using the provided scratch buffer.
+func writeInvVectBuf(w io.Writer, iv *InvVect, buf []byte) error {
+	littleEndian.PutUint32(buf[:4], uint32(iv.Type))
+	if _, err := w.Write(buf[:4]); err != nil {
+		return err
+	}
+	_, err := w.Write(iv.Hash[:])
+	return err
 }

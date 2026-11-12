@@ -114,7 +114,7 @@ func TestStack(t *testing.T) {
 			"pop everything",
 			[][]byte{{1}, {2}, {3}, {4}, {5}},
 			func(s *stack) error {
-				for i := 0; i < 5; i++ {
+				for range 5 {
 					_, err := s.PopByteArray()
 					if err != nil {
 						return err
@@ -129,7 +129,7 @@ func TestStack(t *testing.T) {
 			"pop underflow",
 			[][]byte{{1}, {2}, {3}, {4}, {5}},
 			func(s *stack) error {
-				for i := 0; i < 6; i++ {
+				for range 6 {
 					_, err := s.PopByteArray()
 					if err != nil {
 						return err
@@ -971,5 +971,34 @@ func TestStack(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// TestStackRollInPlace ensures rolling and nipping shift the stack in place.
+// AllocsPerRun does not allow it to run in parallel.
+func TestStackRollInPlace(t *testing.T) {
+	var s stack
+	for i := range 5 {
+		s.PushByteArray([]byte{byte(i)})
+	}
+	allocs := testing.AllocsPerRun(10, func() {
+		if _, err := s.RollN(4); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("RollN allocates %v times", allocs)
+	}
+
+	// 11 rolls of the bottom item rotate the stack by one.
+	want := [][]byte{{1}, {2}, {3}, {4}, {0}}
+	if !reflect.DeepEqual(s.stk, want) {
+		t.Fatalf("got stack %v, want %v", s.stk, want)
+	}
+	if err := s.NipN(4); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.stk[:cap(s.stk)][4]; got != nil {
+		t.Fatalf("nipped slot still holds %v", got)
 	}
 }

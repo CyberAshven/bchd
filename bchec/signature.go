@@ -14,6 +14,9 @@ import (
 	"fmt"
 	"hash"
 	"math/big"
+
+	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
+	secpecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
 // Errors returned by canonicalPadding.
@@ -94,12 +97,39 @@ func (sig *Signature) Serialize() []byte {
 // signature is valid, false otherwise.
 func (sig *Signature) Verify(hash []byte, pubKey *PublicKey) bool {
 	if sig.sigType == SignatureTypeECDSA {
-		return ecdsa.Verify(pubKey.ToECDSA(), hash, sig.R, sig.S)
+		return verifyECDSA(pubKey, hash, sig.R, sig.S)
 	} else if sig.sigType == SignatureTypeSchnorr {
 		return verifySchnorr(pubKey, hash, sig.R, sig.S)
 	}
 	// unknown signature type
 	return false
+}
+
+// verifyECDSA verifies the ECDSA signature of the hash using the pubkey key
+// with the same rules as ecdsa.Verify, which is used for other curves.
+func verifyECDSA(pubKey *PublicKey, hash []byte, r *big.Int, s *big.Int) bool {
+	curve, ok := pubKey.Curve.(*KoblitzCurve)
+	if !ok {
+		return ecdsa.Verify(pubKey.ToECDSA(), hash, r, s)
+	}
+
+	// Signature is invalid if r or s is not in [1, N-1] or the hash is empty.
+	n := curve.Params().N
+	if len(hash) == 0 || r.Sign() <= 0 || s.Sign() <= 0 ||
+		r.Cmp(n) >= 0 || s.Cmp(n) >= 0 {
+
+		return false
+	}
+
+	// The scalars reduce modulo N, so the range check above must come
+	// first.  The dcrd verification truncates the hash to 256 bits and
+	// accepts X.x mod N == r.
+	var sigR, sigS secp.ModNScalar
+	sigR.SetByteSlice(r.Bytes())
+	sigS.SetByteSlice(s.Bytes())
+	var p secp.JacobianPoint
+	bigAffineToJacobian(pubKey.X, pubKey.Y, &p)
+	return secpecdsa.NewSignature(&sigR, &sigS).Verify(hash, secp.NewPublicKey(&p.X, &p.Y))
 }
 
 // verifySchnorr verifies the schnorr signature of the hash using the pubkey key.
@@ -119,34 +149,43 @@ func verifySchnorr(pubKey *PublicKey, hash []byte, r *big.Int, s *big.Int) bool 
 
 	// Compute scalar e = Hash(r || compressed(P) || m) mod N
 	eBytes := sha256.Sum256(append(append(padIntBytes(r), pubKey.SerializeCompressed()...), hash...))
-	e := new(big.Int).SetBytes(eBytes[:])
-	e.Mod(e, curve.Params().N)
+	var e, sigS secp.ModNScalar
+	e.SetBytes(&eBytes)
 
 	// Negate e
-	e.Neg(e).Mod(e, curve.Params().N)
+	e.Negate()
 
 	// Compute point R = s * G - e * P.
-	sgx, sgy, sgz := curve.scalarBaseMultJacobian(s.Bytes())
-	epx, epy, epz := curve.scalarMultJacobian(pubKey.X, pubKey.Y, e.Bytes())
-	rx, ry, rz := new(fieldVal), new(fieldVal), new(fieldVal)
-	curve.addJacobian(sgx, sgy, sgz, epx, epy, epz, rx, ry, rz)
+	sigS.SetByteSlice(s.Bytes())
+	var p, sG, eP, R secp.JacobianPoint
+	bigAffineToJacobian(pubKey.X, pubKey.Y, &p)
+	secp.ScalarBaseMultNonConst(&sigS, &sG)
+	secp.ScalarMultNonConst(&e, &p, &eP)
+	secp.AddNonConst(&sG, &eP, &R)
 
 	// Check that R is not infinity
-	if rz.Equals(new(fieldVal).SetInt(0)) {
+	if isInfinity(&R) {
 		return false
 	}
 
 	// Check if R.y is quadratic residue
-	yz := ry.Mul(rz).Normalize()
-	b := yz.Bytes()
-	if big.Jacobi(new(big.Int).SetBytes(b[:]), curve.P) != 1 {
+	yz := new(secp.FieldVal).Mul2(&R.Y, &R.Z).Normalize()
+	if !isQuadraticResidue(yz) {
 		return false
 	}
 
 	// Check R values match
 	// rx ≠ rz^2 * r mod p
-	fieldR := new(fieldVal).SetByteSlice(r.Bytes())
-	return rx.Normalize().Equals(rz.Square().Mul(fieldR).Normalize())
+	var fieldR secp.FieldVal
+	fieldR.SetByteSlice(r.Bytes())
+	return R.X.Equals(new(secp.FieldVal).SquareVal(&R.Z).Mul(&fieldR).Normalize())
+}
+
+// isQuadraticResidue returns whether the normalized field value is a non-zero
+// quadratic residue, which matches a Jacobi symbol of 1.
+func isQuadraticResidue(f *secp.FieldVal) bool {
+	var root secp.FieldVal
+	return !f.IsZero() && root.SquareRootVal(f)
 }
 
 // IsEqual compares this Signature instance to the one passed, returning true
@@ -291,7 +330,7 @@ func parseSchnorrSig(sigStr []byte) (*Signature, error) {
 }
 
 // ParseBERSignature parses an ECDSA signature in BER format for the curve type `curve`
-// into a Signature type, perfoming some basic sanity checks.  If parsing
+// into a Signature type, performing some basic sanity checks.  If parsing
 // according to the more strict DER format is needed, use ParseDERSignature.
 func ParseBERSignature(sigStr []byte, curve elliptic.Curve) (*Signature, error) {
 	return parseECDSASig(sigStr, curve, false)
@@ -432,6 +471,12 @@ func recoverKeyFromSignature(curve *KoblitzCurve, sig *Signature, msg []byte,
 	// step to prevent the jacobian conversion back and forth.
 	Qx, Qy := curve.Add(sRx, sRy, minuseGx, minuseGy)
 
+	// The point at infinity is no public key, and libsecp256k1 fails the
+	// recovery of it.
+	if Qx.Sign() == 0 && Qy.Sign() == 0 {
+		return nil, errors.New("recovered public key is the point at infinity")
+	}
+
 	return &PublicKey{
 		Curve: curve,
 		X:     Qx,
@@ -456,7 +501,7 @@ func SignCompact(curve *KoblitzCurve, key *PrivateKey,
 	// bitcoind checks the bit length of R and S here. The ecdsa signature
 	// algorithm returns R and S mod N therefore they will be the bitsize of
 	// the curve, and thus correctly sized.
-	for i := 0; i < (curve.H+1)*2; i++ {
+	for i := range (curve.H + 1) * 2 {
 		pk, err := recoverKeyFromSignature(curve, sig, hash, i, true)
 		if err == nil && pk.X.Cmp(key.X) == 0 && pk.Y.Cmp(key.Y) == 0 {
 			result := make([]byte, 1, 2*curve.byteSize+1)
@@ -491,7 +536,7 @@ func SignCompact(curve *KoblitzCurve, key *PrivateKey,
 
 // RecoverCompact verifies the compact ECDSA signature "signature" of "hash" for the
 // Koblitz curve in "curve". If the signature matches then the recovered public
-// key will be returned as well as a boolen if the original key was compressed
+// key will be returned as well as a boolean if the original key was compressed
 // or not, else an error will be returned.
 func RecoverCompact(curve *KoblitzCurve, signature,
 	hash []byte) (*PublicKey, bool, error) {
@@ -500,20 +545,31 @@ func RecoverCompact(curve *KoblitzCurve, signature,
 		return nil, false, errors.New("invalid compact signature size")
 	}
 
-	iteration := int((signature[0] - 27) & ^byte(4))
+	// Only the low three bits of the header count, as in libsecp256k1
+	// users: two for the recovery id and one for compression.
+	header := signature[0] - 27
+	iteration := int(header & 3)
 
 	// format is <header byte><bitlen R><bitlen S>
 	sig := &Signature{
 		R: new(big.Int).SetBytes(signature[1 : bitlen+1]),
 		S: new(big.Int).SetBytes(signature[bitlen+1:]),
 	}
+	N := curve.Params().N
+	if sig.R.Sign() == 0 || sig.R.Cmp(N) >= 0 {
+		return nil, false, errors.New("signature R is out of range")
+	}
+	if sig.S.Sign() == 0 || sig.S.Cmp(N) >= 0 {
+		return nil, false, errors.New("signature S is out of range")
+	}
+
 	// The iteration used here was encoded
 	key, err := recoverKeyFromSignature(curve, sig, hash, iteration, false)
 	if err != nil {
 		return nil, false, err
 	}
 
-	return key, ((signature[0] - 27) & 4) == 4, nil
+	return key, header&4 == 4, nil
 }
 
 // signRFC6979 generates a deterministic ECDSA signature according to RFC 6979 and BIP 62.

@@ -5,9 +5,11 @@
 package blockchain
 
 import (
+	"bytes"
 	"container/list"
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"github.com/gcash/bchd/txscript"
 
@@ -35,14 +37,41 @@ const (
 )
 
 const (
-	// This value is calculated by running the following on a 64-bit system:
-	//   unsafe.Sizeof(UtxoEntry{}) before adding tokenData
-	baseUtxoEntrySizeWithoutTokenData = 40
-
-	// This value is calculated by running the following on a 64-bit system:
-	//   unsafe.Sizeof(wire.TokenData{}) assuming commitment of length 40
-	baseUtxoEntryTokenDataSize = 88
+	// utxoMapEntrySize is the cache map's memory per entry.  On 64-bit
+	// platforms a slot holds the outpoint (36 bytes, padded to 40), the
+	// entry pointer and a control byte, 49 bytes.  The map is counted at
+	// about its lowest load, just after growing, where it measured up to
+	// 122 bytes per entry, or 125 with fewer than 16,000 entries.  The
+	// 41-byte slots of 32-bit platforms are counted as 100 bytes, where
+	// they measured up to 109.
+	utxoMapEntrySize = uint64(120 - 5*(8-unsafe.Sizeof(uintptr(0))))
 )
+
+// utxoEntrySize is the allocation of a UtxoEntry, which holds its token
+// data: 120 bytes on 64-bit platforms, rounded up to its size class.
+var utxoEntrySize = allocSize(int(unsafe.Sizeof(UtxoEntry{})))
+
+// sizeClasses are the Go allocator's size classes for small objects.
+var sizeClasses = [...]uint64{8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144,
+	160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480,
+	512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048,
+	2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912,
+	8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072,
+	20480, 21760, 24576, 27264, 28672, 32768}
+
+// allocSize returns the heap memory used by an allocation of n bytes.
+func allocSize(n int) uint64 {
+	if n == 0 {
+		return 0
+	}
+	for _, class := range sizeClasses {
+		if uint64(n) <= class {
+			return class
+		}
+	}
+	// Larger objects take whole 8 KiB pages.
+	return (uint64(n) + 8191) &^ 8191
+}
 
 // txoFlags is a bitmask defining additional information and state for a
 // transaction output in a utxo view.
@@ -98,7 +127,6 @@ func NewUtxoEntry(txOut *wire.TxOut, blockHeight int32, isCoinbase bool) *UtxoEn
 	if isCoinbase {
 		cbFlag |= tfCoinBase
 	}
-	txOut.PkScript, _ = txOut.TokenData.SeparateTokenDataFromPKScriptIfExists(txOut.PkScript, 0)
 	return &UtxoEntry{
 		amount:      txOut.Value,
 		pkScript:    txOut.PkScript,
@@ -159,9 +187,8 @@ func (entry *UtxoEntry) memoryUsage() uint64 {
 		return 0
 	}
 
-	baseEntrySize := uint64(baseUtxoEntrySizeWithoutTokenData + baseUtxoEntryTokenDataSize)
-
-	return baseEntrySize + uint64(len(entry.pkScript))
+	return utxoEntrySize + allocSize(cap(entry.pkScript)) +
+		allocSize(cap(entry.tokenData.Commitment))
 }
 
 // Spend marks the output as spent.  Spending an output that is already spent
@@ -241,6 +268,12 @@ type utxoCache struct {
 
 	// flushInProgress reports whether the cache is currently being flushed
 	flushInProgress bool
+
+	// staleJournals holds the blocks removed from the best chain since the
+	// last completed flush.  Their spend journal entries are kept until the
+	// next flush completes, since recovering from an interrupted flush may
+	// need to roll them back.
+	staleJournals map[chainhash.Hash]struct{}
 }
 
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
@@ -251,6 +284,7 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 		maxTotalMemoryUsage: maxTotalMemoryUsage,
 
 		cachedEntries: make(map[wire.OutPoint]*UtxoEntry),
+		staleJournals: make(map[chainhash.Hash]struct{}),
 	}
 }
 
@@ -258,16 +292,9 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 //
 // This method should be called with the state lock held.
 func (s *utxoCache) totalMemoryUsage() uint64 {
-	// This value is calculated by running the following on a 64-bit system:
-	// unsafe.Sizeof(wire.OutPoint{})
-	outpointSize := uint64(36)
-
-	// Total memory is all the keys plus the total memory of all the entries.
-	nbEntries := uint64(len(s.cachedEntries))
-
-	// Total size is total size of the keys + total size of the pointers in the
-	// map + total size of the elements held in the pointers.
-	return nbEntries*outpointSize + nbEntries*8 + s.totalEntryMemory
+	// Total size is the map, which holds the keys and the pointers, plus
+	// the entries they point to.
+	return uint64(len(s.cachedEntries))*utxoMapEntrySize + s.totalEntryMemory
 }
 
 // TotalMemoryUsage returns the total memory usage in bytes of the UTXO cache.
@@ -275,8 +302,8 @@ func (s *utxoCache) totalMemoryUsage() uint64 {
 // This method is safe for concurrent access.
 func (s *utxoCache) TotalMemoryUsage() uint64 {
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	tmu := s.totalMemoryUsage()
-	s.mtx.Unlock()
 	return tmu
 }
 
@@ -324,9 +351,80 @@ func (s *utxoCache) getEntry(outpoint wire.OutPoint) (*UtxoEntry, error) {
 // This method is safe for concurrent access.
 func (s *utxoCache) FetchEntry(outpoint wire.OutPoint) (*UtxoEntry, error) {
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	entry, err := s.getEntry(outpoint)
-	s.mtx.Unlock()
 	return entry.Clone(), err
+}
+
+// FetchEntryUncached is like FetchEntry, but an entry read from the database,
+// or the miss, is not added to the cache.
+//
+// This method is safe for concurrent access.
+func (s *utxoCache) FetchEntryUncached(outpoint wire.OutPoint) (*UtxoEntry, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if entry, found := s.cachedEntries[outpoint]; found {
+		return entry.Clone(), nil
+	}
+
+	var entry *UtxoEntry
+	err := s.db.View(func(dbTx database.Tx) error {
+		var err error
+		entry, err = dbFetchUtxoEntry(dbTx, outpoint)
+		return err
+	})
+	return entry, err
+}
+
+// cachedUnspentOutput returns an unspent output of the transaction with the
+// given hash, with an index from start up to end, that the cache holds.
+//
+// This method is safe for concurrent access.
+func (s *utxoCache) cachedUnspentOutput(hash *chainhash.Hash, start, end uint32) *UtxoEntry {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	outpoint := wire.OutPoint{Hash: *hash}
+	for outpoint.Index = start; outpoint.Index < end; outpoint.Index++ {
+		if entry := s.cachedEntries[outpoint]; entry != nil && !entry.IsSpent() {
+			return entry.Clone()
+		}
+	}
+	return nil
+}
+
+// storedUnspentOutput returns an unspent output of the transaction with the
+// given hash that the database holds, unless the cache has it spent.  The
+// database's keys start with the hash, so one seek finds its outputs there.
+//
+// This method is safe for concurrent access.
+func (s *utxoCache) storedUnspentOutput(hash *chainhash.Hash) (*UtxoEntry, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	var entry *UtxoEntry
+	err := s.db.View(func(dbTx database.Tx) error {
+		cursor := dbTx.Metadata().Bucket(utxoSetBucketName).Cursor()
+		key := outpointKey(wire.OutPoint{Hash: *hash})
+		ok := cursor.Seek(*key)
+		recycleOutpointKey(key)
+		for ; ok && bytes.HasPrefix(cursor.Key(), hash[:]); ok = cursor.Next() {
+			outpoint := DeserializeOutpointKey(cursor.Key())
+			if cached, ok := s.cachedEntries[*outpoint]; ok {
+				if cached != nil && !cached.IsSpent() {
+					entry = cached.Clone()
+					return nil
+				}
+				continue
+			}
+			var err error
+			entry, err = DeserializeUtxoEntry(cursor.Value())
+			return err
+		}
+		return nil
+	})
+	return entry, err
 }
 
 // FetchUtxoEntry returns the requested unspent transaction output from the point
@@ -342,6 +440,68 @@ func (b *BlockChain) FetchUtxoEntry(outpoint wire.OutPoint) (*UtxoEntry, error) 
 	b.chainLock.RLock()
 	defer b.chainLock.RUnlock()
 	return b.utxoCache.FetchEntry(outpoint)
+}
+
+// FetchUtxoEntryUncached returns the requested unspent transaction output like
+// FetchUtxoEntry, but does not add what it reads from the database to the UTXO
+// cache.  It suits lookups that are not part of validating blocks or
+// transactions, such as scans of the outputs of many transactions.  As with
+// FetchUtxoEntry, an output without data returns a nil entry and a nil error.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) FetchUtxoEntryUncached(outpoint wire.OutPoint) (*UtxoEntry, error) {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+	return b.utxoCache.FetchEntryUncached(outpoint)
+}
+
+// maxTxOutputs is the most outputs a transaction can have: the smallest is 9
+// bytes, an 8 byte value and an empty script.
+const maxTxOutputs = MaxTransactionSize / 9
+
+// utxoScanChunk is how many outputs FetchUnspentOutputOfTx looks up in the
+// cache each time it takes the locks.
+const utxoScanChunk = 256
+
+// unspentOutputScanHook, when set, is called by FetchUnspentOutputOfTx between
+// its search of the cache and its read of the database.  It is for tests.
+var unspentOutputScanHook func()
+
+// FetchUnspentOutputOfTx returns an unspent output of the transaction with
+// the given hash, or nil when it has none.  Like BCHN's AccessByTxid, it
+// looks at every output a transaction can have, but without a database read
+// for each: it searches the cache, which holds the outputs added since the
+// last flush, a chunk at a time, and then reads the outputs the database
+// holds with one seek.  As the cache is searched first, an output a flush
+// moves meanwhile is still found in the database.  Nothing it reads is added
+// to the cache.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) FetchUnspentOutputOfTx(hash *chainhash.Hash) (*UtxoEntry, error) {
+	for start := uint32(0); start < maxTxOutputs; start += utxoScanChunk {
+		entry := b.cachedUnspentOutput(hash, start)
+		if entry != nil {
+			return entry, nil
+		}
+	}
+	if unspentOutputScanHook != nil {
+		unspentOutputScanHook()
+	}
+
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+	return b.utxoCache.storedUnspentOutput(hash)
+}
+
+// cachedUnspentOutput searches a chunk of the outputs a transaction can have,
+// from start, in the cache.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) cachedUnspentOutput(hash *chainhash.Hash, start uint32) *UtxoEntry {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+	return b.utxoCache.cachedUnspentOutput(hash, start,
+		min(start+utxoScanChunk, maxTxOutputs))
 }
 
 // spendEntry marks the output as spent.  Spending an output that is already
@@ -517,6 +677,15 @@ func (s *utxoCache) Commit(view *UtxoViewpoint) error {
 		if ourEntry.IsSpent() && !entry.IsSpent() {
 			ourEntry = entry.Clone()
 			override = true
+
+			// A spent entry in the cache is a removal the database may
+			// not have seen yet, as when a reorg removed a flushed
+			// output, so the entry added back is not fresh, whatever the
+			// view says.  Spent before the next flush, a fresh entry would
+			// be dropped from the cache, and the database would keep the
+			// output as unspent.  Bitcoin Cash Node also never marks a
+			// coin fresh when it replaces a spent one it has not flushed.
+			ourEntry.packedFlags &^= tfFresh
 		}
 
 		// Store the entry we don't know.
@@ -556,13 +725,16 @@ func (s *utxoCache) flush(bestState *BestState) error {
 		return err
 	}
 
-	// Store all entries in batches.
-	flushBatch := func(dbTx database.Tx) error {
+	// Store all entries in batches.  Entries are only removed from the
+	// cache once the batch holding them has been committed, so a failed
+	// commit leaves them in the cache.
+	flushBatch := func(dbTx database.Tx) ([]wire.OutPoint, error) {
 		var (
 			// Form a batch by storing all entries to be put and deleted.
 			nbBatchEntries = 0
 			entriesPut     = make(map[wire.OutPoint]*UtxoEntry)
 			entriesDelete  = make([]wire.OutPoint, 0)
+			flushed        = make([]wire.OutPoint, 0)
 		)
 		for outpoint, entry := range s.cachedEntries {
 			// Nil entries or unmodified entries can just be pruned.
@@ -578,10 +750,8 @@ func (s *utxoCache) flush(bestState *BestState) error {
 			} else {
 				entriesPut[outpoint] = entry
 			}
+			flushed = append(flushed, outpoint)
 			nbBatchEntries++
-
-			s.totalEntryMemory -= entry.memoryUsage()
-			delete(s.cachedEntries, outpoint)
 
 			// End this batch when the maximum number of entries per batch has
 			// been reached.
@@ -592,34 +762,66 @@ func (s *utxoCache) flush(bestState *BestState) error {
 
 		// Apply the batched additions and deletions.
 		if err := dbPutUtxoEntries(dbTx, entriesPut); err != nil {
-			return err
+			return nil, err
 		}
 
-		return dbDeleteUtxoEntries(dbTx, entriesDelete)
+		return flushed, dbDeleteUtxoEntries(dbTx, entriesDelete)
 	}
 	s.flushInProgress = true
 	defer func() { s.flushInProgress = false }()
 	for len(s.cachedEntries) > 0 {
 		log.Tracef("Flushing %d more entries...", len(s.cachedEntries))
+		var flushed []wire.OutPoint
 		err := s.db.Update(func(dbTx database.Tx) error {
-			return flushBatch(dbTx)
+			var err error
+			flushed, err = flushBatch(dbTx)
+			return err
 		})
 		if err != nil {
 			return err
 		}
+		for _, outpoint := range flushed {
+			s.totalEntryMemory -= s.cachedEntries[outpoint].memoryUsage()
+			delete(s.cachedEntries, outpoint)
+		}
 	}
+
+	// A map keeps its memory after its entries are deleted, so replace the
+	// emptied map to release what it grew to.
+	s.cachedEntries = make(map[wire.OutPoint]*UtxoEntry)
 
 	// When done, store the best state hash in the database to indicate the state
 	// is consistent until that hash.
 	err = s.db.Update(func(dbTx database.Tx) error {
+		for hash := range s.staleJournals {
+			if err := dbRemoveSpendJournalEntry(dbTx, &hash); err != nil {
+				return err
+			}
+		}
 		return dbPutUtxoStateConsistency(dbTx, ucsConsistent, &bestState.Hash)
 	})
 	if err != nil {
 		return err
 	}
+	clear(s.staleJournals)
 	s.lastFlushHash = bestState.Hash
 	log.Debug("Done flushing UTXO cache to disk")
 	return nil
+}
+
+// setStaleJournal records whether the spend journal entry of the block is no
+// longer needed once the next flush completes, as for a block removed from the
+// best chain, or is needed again, as for a block added back to it.
+//
+// This function is safe for concurrent access.
+func (s *utxoCache) setStaleJournal(hash chainhash.Hash, stale bool) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if stale {
+		s.staleJournals[hash] = struct{}{}
+	} else {
+		delete(s.staleJournals, hash)
+	}
 }
 
 // Flush flushes the UTXO state to the database.
@@ -653,6 +855,18 @@ func (s *utxoCache) Flush(mode FlushMode, bestState *BestState) error {
 //
 // This method should be called with the state lock held.
 func (s *utxoCache) rollBackBlock(block *bchutil.Block, stxos []SpentTxOut) error {
+	// Load the outputs of the block into the cache first, since the
+	// database may hold them although the cache doesn't, and removing them
+	// must then remove them from the database too.
+	for _, tx := range block.Transactions() {
+		prevOut := wire.OutPoint{Hash: *tx.Hash()}
+		for txOutIdx := range tx.MsgTx().TxOut {
+			prevOut.Index = uint32(txOutIdx)
+			if _, err := s.getEntry(prevOut); err != nil {
+				return err
+			}
+		}
+	}
 	return disconnectTransactions(s, block, stxos)
 }
 
@@ -669,9 +883,43 @@ func (s *utxoCache) rollForwardBlock(block *bchutil.Block) error {
 // InitConsistentState checks the consistency status of the utxo state and
 // replays blocks if it lags behind the best state of the blockchain.
 //
+// The last flush may name a block a reorg has since removed from the best
+// chain.  The blocks from that block back to the best chain are then rolled
+// back too, using the spend journal entries kept for them.
+//
+// In fast sync mode the utxo set is emptied for the download instead.
+//
 // It needs to be ensured that the chainView passed to this method does not
 // get changed during the execution of this method.
-func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt <-chan struct{}) error {
+func (s *utxoCache) InitConsistentState(tip *blockNode, index *blockIndex, fastSync bool, interrupt <-chan struct{}) error {
+	if fastSync {
+		// Fast sync downloads the utxo set into an empty bucket, so the
+		// set an earlier start left is deleted, whether it is the set of
+		// a normal start or part of an earlier download, which may have
+		// failed its verification.  The download is first marked as
+		// unfinished and the state as flushed from no block, so that a
+		// start without fast sync refuses the set until a download is
+		// verified.  Like a re-index, the deletion is done in batches.
+		err := s.db.Update(func(dbTx database.Tx) error {
+			err := dbTx.Metadata().Put(chainStateFastSyncKeyName, []byte{1})
+			if err != nil {
+				return err
+			}
+			return dbPutUtxoStateConsistency(dbTx, ucsFlushOngoing,
+				&chainhash.Hash{})
+		})
+		if err != nil {
+			return err
+		}
+		log.Info("Deleting the UTXO set...")
+		err = deleteBucketKeys(s.db, utxoSetBucketName, reIndexDeleteBatch)
+		if err != nil {
+			return err
+		}
+		log.Info("Deletion complete")
+		return nil
+	}
+
 	// Load the consistency status from the database.
 	var statusCode byte
 	var statusHash *chainhash.Hash
@@ -683,35 +931,6 @@ func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt
 	})
 	if err != nil {
 		return err
-	}
-
-	if fastSync {
-		// If we're in fast sync mode and the status hash is not the zerohash then
-		// we must have previously started the node not in fastsync mode which means
-		// the UTXO set bucket will be dirty. In this case let's reset the UTXO
-		// bucket so we can get a fresh start.
-		if !statusHash.IsEqual(&chainhash.Hash{}) {
-			err := s.db.Update(func(tx database.Tx) error {
-				if err := tx.Metadata().DeleteBucket(utxoSetBucketName); err != nil {
-					return err
-				}
-
-				if _, err := tx.Metadata().CreateBucket(utxoSetBucketName); err != nil {
-					return err
-				}
-
-				return nil
-			})
-
-			return err
-		}
-
-		// If we're in fast sync mode and the status hash is the zero hash then
-		// this is either a completely new node or a node that suffered a hard
-		// shutdown during fast sync. In either case we don't need to repair
-		// the UTXO set as we can just write over existing entries as we download
-		// the UTXO set.
-		return nil
 	}
 
 	log.Tracef("UTXO cache consistency status from disk: [%d] hash %v",
@@ -743,44 +962,55 @@ func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt
 	log.Info("Reconstructing UTXO state after unclean shutdown. This may take " +
 		"a long time...")
 
-	// Even though this should always be true, make sure the fetched hash is in
-	// the best chain.
-	var statusNode *blockNode
-	var statusNodeNext *blockNode // the first one higher than the statusNode
-	attachNodes := list.New()
-	for node := tip; node.height >= 0; node = node.parent {
-		if node.hash == *statusHash {
-			statusNode = node
-			break
-		}
-		attachNodes.PushFront(node)
-		statusNodeNext = node
+	// Find the last flushed block and the blocks between it and the best
+	// chain, which a reorg removed.
+	flushNode := index.LookupNode(statusHash)
+	if flushNode == nil {
+		return AssertError(fmt.Sprintf("last utxo consistency status "+
+			"contains unknown hash %v", statusHash))
+	}
+	var detachedNodes []*blockNode
+	statusNode := flushNode
+	for statusNode != nil && tip.Ancestor(statusNode.height) != statusNode {
+		detachedNodes = append(detachedNodes, statusNode)
+		statusNode = statusNode.parent
+	}
+	if statusNode == nil {
+		return AssertError(fmt.Sprintf("last utxo consistency status "+
+			"contains hash %v that does not connect to the best chain",
+			statusHash))
 	}
 
-	if statusNode == nil {
-		return AssertError(fmt.Sprintf("last utxo consistency status contains "+
-			"hash that is not in best chain: %v", statusHash))
+	// Collect the blocks of the best chain after the fork point, which are
+	// replayed once the state is rolled back to it.
+	attachNodes := list.New()
+	for node := tip; node != statusNode; node = node.parent {
+		attachNodes.PushFront(node)
 	}
 
 	// If data was in the middle of a flush, we have to roll back all blocks from
 	// the last best block all the way back to the last consistent block.
-	log.Debugf("Rolling back %d blocks to rebuild the UTXO state...", tip.height-statusNode.height)
+	log.Debugf("Rolling back %d blocks to rebuild the UTXO state...",
+		int(tip.height-statusNode.height)+len(detachedNodes))
+
+	// rollBack rolls back the block of the node using its spend journal.
+	rollBack := func(dbTx database.Tx, node *blockNode) error {
+		block, err := dbFetchBlockByNode(dbTx, node)
+		if err != nil {
+			return err
+		}
+		stxos, err := dbFetchSpendJournalEntry(dbTx, block)
+		if err != nil {
+			return err
+		}
+		return s.rollBackBlock(block, stxos)
+	}
 
 	// Roll back blocks in batches.
 	rollbackBatch := func(dbTx database.Tx, node *blockNode) (*blockNode, error) {
 		nbBatchBlocks := 0
 		for ; node.height > statusNode.height; node = node.parent {
-			block, err := dbFetchBlockByNode(dbTx, node)
-			if err != nil {
-				return nil, err
-			}
-
-			stxos, err := dbFetchSpendJournalEntry(dbTx, block)
-			if err != nil {
-				return nil, err
-			}
-
-			if err := s.rollBackBlock(block, stxos); err != nil {
+			if err := rollBack(dbTx, node); err != nil {
 				return nil, err
 			}
 
@@ -797,7 +1027,7 @@ func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt
 	for node := tip; node.height > statusNode.height; {
 		log.Tracef("Rolling back %d more blocks...",
 			node.height-statusNode.height)
-		err := s.db.Update(func(dbTx database.Tx) error {
+		err := s.db.View(func(dbTx database.Tx) error {
 			var err error
 			node, err = rollbackBatch(dbTx, node)
 
@@ -814,14 +1044,34 @@ func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt
 		}
 	}
 
+	// Roll back the blocks removed from the best chain, after which their
+	// spend journal entries are no longer needed.
+	for _, node := range detachedNodes {
+		err := s.db.View(func(dbTx database.Tx) error {
+			return rollBack(dbTx, node)
+		})
+		if err != nil {
+			return err
+		}
+		s.staleJournals[node.hash] = struct{}{}
+	}
+
 	// Now we can flush and update the status to avoid redoing this work when
 	// interrupted.
-	if err := s.flush(&BestState{Hash: *statusHash}); err != nil {
+	if err := s.flush(&BestState{Hash: statusNode.hash}); err != nil {
 		return err
 	}
 
+	// Nothing is left to replay when the last flush was at the tip, so
+	// just mark the state as consistent.
+	if attachNodes.Len() == 0 {
+		return s.db.Update(func(dbTx database.Tx) error {
+			return dbPutUtxoStateConsistency(dbTx, ucsConsistent, &tip.hash)
+		})
+	}
+
 	log.Debugf("Replaying %d blocks to rebuild UTXO state...",
-		tip.height-statusNodeNext.height+1)
+		attachNodes.Len())
 
 	// Then we replay the blocks from the last consistent state up to the best
 	// state. Iterate forward from the consistent node to the tip of the best
@@ -855,7 +1105,7 @@ func (s *utxoCache) InitConsistentState(tip *blockNode, fastSync bool, interrupt
 		return node, nil
 	}
 
-	for node := statusNodeNext; node.height <= tip.height; {
+	for node := attachNodes.Front().Value.(*blockNode); node.height <= tip.height; {
 		log.Tracef("Replaying %d more blocks...", tip.height-node.height+1)
 		err := s.db.Update(func(dbTx database.Tx) error {
 			var err error

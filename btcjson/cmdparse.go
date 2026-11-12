@@ -16,10 +16,10 @@ import (
 func makeParams(rt reflect.Type, rv reflect.Value) []interface{} {
 	numFields := rt.NumField()
 	params := make([]interface{}, 0, numFields)
-	for i := 0; i < numFields; i++ {
+	for i := range numFields {
 		rtf := rt.Field(i)
 		rvf := rv.Field(i)
-		if rtf.Type.Kind() == reflect.Ptr {
+		if rtf.Type.Kind() == reflect.Pointer {
 			if rvf.IsNil() {
 				break
 			}
@@ -128,7 +128,7 @@ func UnmarshalCmd(r *Request) (interface{}, error) {
 
 	// Loop through each of the struct fields and unmarshal the associated
 	// parameter into them.
-	for i := 0; i < numParams; i++ {
+	for i := range numParams {
 		rvf := rv.Field(i)
 		// Unmarshal the parameter into the struct field.
 		concreteVal := rvf.Addr().Interface()
@@ -227,7 +227,7 @@ func typesMaybeCompatible(dest reflect.Type, src reflect.Type) bool {
 // pointers along with how many indirections were necessary.
 func baseType(arg reflect.Type) (reflect.Type, int) {
 	var numIndirects int
-	for arg.Kind() == reflect.Ptr {
+	for arg.Kind() == reflect.Pointer {
 		arg = arg.Elem()
 		numIndirects++
 	}
@@ -254,7 +254,7 @@ func assignField(paramNum int, fieldName string, dest reflect.Value, src reflect
 	// pointers that can be indirected to be the same without needing to
 	// create pointers for the destination field.
 	if destBaseType == srcBaseType && srcIndirects >= destIndirects {
-		for i := 0; i < srcIndirects-destIndirects; i++ {
+		for range srcIndirects - destIndirects {
 			src = src.Elem()
 		}
 		dest.Set(src)
@@ -268,7 +268,7 @@ func assignField(paramNum int, fieldName string, dest reflect.Value, src reflect
 	destIndirectsRemaining := destIndirects
 	if destIndirects > srcIndirects {
 		indirectDiff := destIndirects - srcIndirects
-		for i := 0; i < indirectDiff; i++ {
+		for range indirectDiff {
 			dest.Set(reflect.New(dest.Type().Elem()))
 			dest = dest.Elem()
 			destIndirectsRemaining--
@@ -283,13 +283,13 @@ func assignField(paramNum int, fieldName string, dest reflect.Value, src reflect
 	// Make any remaining pointers needed to get to the base dest type since
 	// the above direct assign was not possible and conversions are done
 	// against the base types.
-	for i := 0; i < destIndirectsRemaining; i++ {
+	for range destIndirectsRemaining {
 		dest.Set(reflect.New(dest.Type().Elem()))
 		dest = dest.Elem()
 	}
 
 	// Indirect through to the base source value.
-	for src.Kind() == reflect.Ptr {
+	for src.Kind() == reflect.Pointer {
 		src = src.Elem()
 	}
 
@@ -584,7 +584,7 @@ func NewCmd(method string, args ...interface{}) (interface{}, error) {
 
 	// Loop through each of the struct fields and assign the associated
 	// parameter into them after checking its type validity.
-	for i := 0; i < numParams; i++ {
+	for i := range numParams {
 		// Attempt to assign each of the arguments to the according
 		// struct field.
 		rvf := rv.Field(i)
