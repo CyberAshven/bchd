@@ -368,6 +368,13 @@ type server struct {
 	// script filters are off.
 	mpFilters *mpFilters
 
+	// scriptLeaves keeps the leaves of the block last asked about, so a
+	// peer that settles a disagreement over that block's script filter
+	// does not make every proof read the block and its spend journal
+	// again. A request for another block builds without waiting on the
+	// one already in flight.
+	scriptLeaves *scriptLeavesCache
+
 	// agentBlacklist is a list of blacklisted substrings by which to filter
 	// user agents.
 	agentBlacklist []string
@@ -1732,33 +1739,51 @@ func (s *server) filterIndexFor(filterType wire.FilterType) filterIndex {
 func (s *server) scriptFilterLeaves(blockHash *chainhash.Hash) (*bchutil.Block,
 	[]blockchain.SpentTxOut, []builder.ScriptLeaf, error) {
 
+	// A block can leave the main chain while its leaves are kept, so this
+	// is checked on every call, before the cache. The build itself runs
+	// inside get, which does not hold its lock across the block read.
 	if !s.chain.MainChainHasBlock(blockHash) {
 		return nil, nil, nil, fmt.Errorf("block %v is not in the main chain", blockHash)
 	}
-	block, err := s.chain.BlockByHash(blockHash)
+	entry, err := s.scriptLeaves.get(blockHash, func() (*scriptLeavesOfBlock, error) {
+		block, err := s.chain.BlockByHash(blockHash)
+		if err != nil {
+			return nil, err
+		}
+		stxos, err := s.chain.FetchSpendJournal(block)
+		if err != nil {
+			return nil, err
+		}
+		prevOutScripts := make([][]byte, len(stxos))
+		for i := range stxos {
+			prevOutScripts[i] = stxos[i].PkScript
+		}
+		leaves, err := builder.ScriptLeaves(block.MsgBlock(), prevOutScripts)
+		if err != nil {
+			return nil, err
+		}
+		return newScriptLeavesOfBlock(block, stxos, leaves), nil
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	stxos, err := s.chain.FetchSpendJournal(block)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	prevOutScripts := make([][]byte, len(stxos))
-	for i := range stxos {
-		prevOutScripts[i] = stxos[i].PkScript
-	}
-	leaves, err := builder.ScriptLeaves(block.MsgBlock(), prevOutScripts)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return block, stxos, leaves, nil
+	return entry.block, entry.stxos, entry.leaves, nil
 }
+
+// cfTreeBanScore is added to the ban score of a peer for a getcfrange or a
+// getcfproof message.  Each one reads a block and its spend journal unless
+// the block is the last one asked about, and a getcfproof for a spent output
+// reads the block that created it as well, so a peer that asks without end is
+// banned.  One that settles a disagreement asks for about one proof for each
+// level of the block's entry tree, a few dozen in all, and stays far below
+// the score that warns.
+const cfTreeBanScore = 1
 
 // OnGetCFRange is invoked when a peer receives a getcfrange bitcoin message.
 // It answers with the leaves of the block's script filter entry tree whose
 // keys start with the prefix, the leaves next to them, and the hashes that
-// rebuild the tree's root, so the peer can check that no other leaf has the
-// prefix.
+// rebuild the tree's root, so the peer can check that a tree whose leaves are
+// in order has no other leaf with the prefix.
 func (sp *serverPeer) OnGetCFRange(_ *peer.Peer, msg *wire.MsgGetCFRange) {
 	// Only script filters have an entry tree. A peer can send this
 	// regardless of the services we advertise.
@@ -1770,6 +1795,9 @@ func (sp *serverPeer) OnGetCFRange(_ *peer.Peer, msg *wire.MsgGetCFRange) {
 	if !sp.server.syncManager.IsCurrent() {
 		return
 	}
+
+	// A decaying ban score increase is applied to prevent flooding.
+	sp.addBanScore(0, cfTreeBanScore, "getcfrange")
 
 	_, _, leaves, err := sp.server.scriptFilterLeaves(&msg.BlockHash)
 	if err != nil {
@@ -1836,6 +1864,9 @@ func (sp *serverPeer) OnGetCFProof(_ *peer.Peer, msg *wire.MsgGetCFProof) {
 	if !sp.server.syncManager.IsCurrent() {
 		return
 	}
+
+	// A decaying ban score increase is applied to prevent flooding.
+	sp.addBanScore(0, cfTreeBanScore, "getcfproof")
 
 	block, stxos, leaves, err := sp.server.scriptFilterLeaves(&msg.BlockHash)
 	if err != nil {
@@ -4534,6 +4565,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string, db database
 		cfCheckptCaches:      make(map[wire.FilterType][]cfHeaderKV),
 		agentBlacklist:       agentBlacklist,
 		agentWhitelist:       agentWhitelist,
+		scriptLeaves:         newScriptLeavesCache(scriptLeavesKept),
 		inboundHosts:         make(map[string]int),
 		bans:                 loadBanList(filepath.Join(cfg.DataDir, banListFilename), time.Now()),
 	}
