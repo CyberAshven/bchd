@@ -358,6 +358,16 @@ type server struct {
 	mempoolFilterChanges uint64
 	mempoolFilterMtx     sync.Mutex
 
+	// mempoolScriptFilterBytes caches the script filter of the mempool the
+	// same way, under the same mutex.
+	mempoolScriptFilterBytes   []byte
+	mempoolScriptFilterChanges uint64
+
+	// mpFilters builds and serves the script filters of the transactions
+	// admitted to the mempool in each short interval. It is nil when
+	// script filters are off.
+	mpFilters *mpFilters
+
 	// agentBlacklist is a list of blacklisted substrings by which to filter
 	// user agents.
 	agentBlacklist []string
@@ -918,22 +928,27 @@ func (sp *serverPeer) OnGetCFMemPool(_ *peer.Peer, msg *wire.MsgGetCFMempool) {
 	// than they fetch the mempool.
 	sp.addBanScore(0, 10, "getcfmempool")
 
-	switch msg.FilterType {
-	case wire.GCSFilterRegular:
-		break
+	var filterBytes []byte
+	var err error
+	switch {
+	case msg.FilterType == wire.GCSFilterRegular:
+		filterBytes, err = sp.server.mempoolFilter()
+
+	// The script filter of the mempool is served with the mempool filters
+	// by interval, for a wallet that starts.
+	case msg.FilterType == wire.GCSFilterScripts && sp.server.mpFilters != nil:
+		filterBytes, err = sp.server.mempoolScriptFilter()
 
 	default:
 		peerLog.Debugf("Mempool filter request for unknown filter: %v",
 			msg.FilterType)
 		return
 	}
-
-	filterBytes, err := sp.server.mempoolFilter()
 	if err != nil {
 		return
 	}
 	zeroHash := &chainhash.Hash{}
-	resp := wire.NewMsgCFilter(wire.GCSFilterRegular, zeroHash, filterBytes)
+	resp := wire.NewMsgCFilter(msg.FilterType, zeroHash, filterBytes)
 	sp.QueueMessage(resp, nil)
 }
 
@@ -2504,6 +2519,9 @@ func (s *server) RemoveRebroadcastInventory(iv *wire.InvVect) {
 // relayTransactions generates and relays inventory vectors for all of the
 // passed transactions to all connected peers.
 func (s *server) relayTransactions(txns []*mempool.TxDesc) {
+	// Put them in the open interval of the mempool filters too.
+	s.addMempoolTxs(txns)
+
 	for _, txD := range txns {
 		iv := wire.NewInvVect(wire.InvTypeTx, txD.Tx.Hash())
 		s.RelayInventory(iv, txD)
@@ -3632,6 +3650,9 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnGetCFMempool: sp.OnGetCFMemPool,
 			OnGetCFRange:   sp.OnGetCFRange,
 			OnGetCFProof:   sp.OnGetCFProof,
+			OnSendMpFilter: sp.OnSendMpFilter,
+			OnGetMpFilters: sp.OnGetMpFilters,
+			OnGetMpTxs:     sp.OnGetMpTxs,
 			OnFeeFilter:    sp.OnFeeFilter,
 			OnFilterAdd:    sp.OnFilterAdd,
 			OnFilterClear:  sp.OnFilterClear,
@@ -4163,6 +4184,14 @@ func (s *server) Start() {
 	s.wg.Add(1)
 	go s.peerHandler()
 
+	if s.mpFilters != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.mpFilters.serve(s.quit)
+		}()
+	}
+
 	if !cfg.NoDoubleSpendProof {
 		s.wg.Add(1)
 		go s.dsProofCleanupHandler()
@@ -4557,6 +4586,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string, db database
 		indxLog.Info("BCMR index is enabled")
 		s.bcmrIndex = indexers.NewBcmrIndex(db, chainParams)
 		indexes = append(indexes, s.bcmrIndex)
+	}
+	// Mempool filters need no old blocks, so a pruned node serves them too.
+	if !cfg.NoScriptFilters && !cfg.NoCFilters {
+		s.mpFilters = newMpFilters()
 	}
 	if scriptFiltersWanted(cfg) {
 		indxLog.Info("Script filter index is enabled")

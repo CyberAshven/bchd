@@ -113,6 +113,11 @@ const (
 	CmdCFRange      = "cfrange"
 	CmdGetCFProof   = "getcfproof"
 	CmdCFProof      = "cfproof"
+	CmdSendMpFilter = "sendmpfilter"
+	CmdGetMpFilters = "getmpfilters"
+	CmdMpFilter     = "mpfilter"
+	CmdGetMpTxs     = "getmptxs"
+	CmdMpTxs        = "mptxs"
 	CmdSendCmpct    = "sendcmpct"
 	CmdCmpctBlock   = "cmpctblock"
 	CmdGetBlockTxns = "getblocktxn"
@@ -258,6 +263,20 @@ func makeEmptyMessage(command string) (Message, error) {
 
 	case CmdCFProof:
 		msg = &MsgCFProof{}
+	case CmdSendMpFilter:
+		msg = &MsgSendMpFilter{}
+
+	case CmdGetMpFilters:
+		msg = &MsgGetMpFilters{}
+
+	case CmdMpFilter:
+		msg = &MsgMpFilter{}
+
+	case CmdGetMpTxs:
+		msg = &MsgGetMpTxs{}
+
+	case CmdMpTxs:
+		msg = &MsgMpTxs{}
 
 	case CmdGetCFMempool:
 		msg = &MsgGetCFMempool{}
