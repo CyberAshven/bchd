@@ -3774,7 +3774,7 @@ func TestPushedData(t *testing.T) {
 func TestHasCanonicalPush(t *testing.T) {
 	t.Parallel()
 
-	for i := 0; i < 65535; i++ {
+	for i := range 65535 {
 		script, err := NewScriptBuilder().AddInt64(int64(i)).Script()
 		if err != nil {
 			t.Errorf("Script: test #%d unexpected error: %v\n", i,
@@ -3830,7 +3830,7 @@ func TestExtractDataElements(t *testing.T) {
 	for i := 0; i <= MaxScriptElementSizeLegacy; i++ {
 		builder := NewScriptBuilder()
 		numElements := i % 3
-		for a := 0; a < numElements; a++ {
+		for range numElements {
 			builder.AddData(bytes.Repeat([]byte{0x49}, i))
 		}
 		script, err := builder.Script()
@@ -3845,6 +3845,54 @@ func TestExtractDataElements(t *testing.T) {
 		}
 		if len(dataElements) != numElements {
 			t.Errorf("ExtractDataElements test #%d expected length of %d got %d\n", i, numElements, len(dataElements))
+		}
+	}
+}
+
+// TestExtractRedeemScript ensures ExtractRedeemScript returns the data of the
+// last push of a signature script, and an error instead of a panic for a
+// script that pushes nothing or does not parse.
+func TestExtractRedeemScript(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		script string
+		want   []byte
+		err    error
+	}{{
+		name:   "empty",
+		script: "",
+		err:    scriptError(ErrInvalidStackOperation, ""),
+	}, {
+		name:   "one push",
+		script: "DATA_2 0x5152",
+		want:   []byte{0x51, 0x52},
+	}, {
+		name:   "last of several pushes",
+		script: "0 DATA_1 0x51 DATA_2 0x5253",
+		want:   []byte{0x52, 0x53},
+	}, {
+		name:   "malformed push",
+		script: "DATA_2 0x51",
+		err:    scriptError(ErrMalformedPush, ""),
+	}}
+	for _, test := range tests {
+		var got []byte
+		var err error
+		p := panicValue(func() {
+			got, err = ExtractRedeemScript(mustParseShortForm(test.script))
+		})
+		if p != nil {
+			t.Errorf("%s: panicked: %v", test.name, p)
+			continue
+		}
+		if e := tstCheckScriptError(err, test.err); e != nil {
+			t.Errorf("%s: %v", test.name, e)
+			continue
+		}
+		if !bytes.Equal(got, test.want) {
+			t.Errorf("%s: got %x, want %x", test.name, got, test.want)
 		}
 	}
 }

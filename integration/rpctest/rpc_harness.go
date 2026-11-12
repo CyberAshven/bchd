@@ -24,11 +24,14 @@ import (
 const (
 	// These constants define the minimum and maximum p2p and rpc port
 	// numbers used by a test harness.  The min port is inclusive while the
-	// max port is exclusive.
+	// max port is exclusive.  Both ranges stay below 32768, where Linux
+	// starts the ephemeral ports it gives outgoing connections (macOS and
+	// Windows start at 49152), so that a connection the test makes can't
+	// hold a port that a harness then fails to listen on.
 	minPeerPort = 10000
-	maxPeerPort = 35000
+	maxPeerPort = 21000
 	minRPCPort  = maxPeerPort
-	maxRPCPort  = 60000
+	maxRPCPort  = 32000
 
 	// BlockVersion is the default block version used when generating
 	// blocks.
@@ -250,18 +253,30 @@ func (h *Harness) SetUp(createTestChain bool, numMatureOutputs uint32) error {
 
 	// Block until the wallet has fully synced up to the tip of the main
 	// chain.
+	return h.WaitForWallet()
+}
+
+// WaitForWallet blocks until the wallet has synced up to the tip of the main
+// chain.  The wallet follows the chain in the background, so a test that
+// spends what the block it just mined gave the wallet waits for it first.
+func (h *Harness) WaitForWallet() error {
 	_, height, err := h.Node.GetBestBlock()
 	if err != nil {
 		return err
 	}
+	deadline := time.Now().Add(time.Minute)
 	ticker := time.NewTicker(time.Millisecond * 100)
+	defer ticker.Stop()
 	for range ticker.C {
 		walletHeight := h.wallet.SyncedHeight()
-		if walletHeight == height {
+		if walletHeight >= height {
 			break
 		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the wallet is at height %d after a minute, "+
+				"the chain at %d", walletHeight, height)
+		}
 	}
-	ticker.Stop()
 
 	return nil
 }
@@ -316,7 +331,7 @@ func (h *Harness) connectRPCClient() error {
 	var err error
 
 	rpcConf := h.node.config.rpcConnConfig()
-	for i := 0; i < h.maxConnRetries; i++ {
+	for i := range h.maxConnRetries {
 		if client, err = rpcclient.New(&rpcConf, h.handlers); err != nil {
 			time.Sleep(time.Duration(i) * 50 * time.Millisecond)
 			continue

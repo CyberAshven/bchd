@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/dchest/siphash"
 	"github.com/gcash/bchd/chaincfg/chainhash"
@@ -53,7 +54,16 @@ func (msg *MsgCmpctBlock) BchDecode(r io.Reader, pver uint32, enc MessageEncodin
 		return err
 	}
 
-	for i := uint64(0); i < shortIDCount; i++ {
+	// Prevent more transactions than could possibly fit in a block.  The
+	// entries are appended as they are read, so memory use grows with the
+	// data actually received rather than with the counts.
+	if shortIDCount > uint64(maxTxPerBlock()) {
+		str := fmt.Sprintf("too many short ids for message "+
+			"[count %d, max %d]", shortIDCount, maxTxPerBlock())
+		return messageError("MsgCmpctBlock.BchDecode", str)
+	}
+
+	for range shortIDCount {
 		shortIDBytes := make([]byte, ShortIDSize)
 		_, err = io.ReadFull(r, shortIDBytes)
 		if err != nil {
@@ -69,11 +79,22 @@ func (msg *MsgCmpctBlock) BchDecode(r io.Reader, pver uint32, enc MessageEncodin
 	if err != nil {
 		return err
 	}
+	if prefilledTxCount > uint64(maxTxPerBlock())-shortIDCount {
+		str := fmt.Sprintf("too many transactions for message "+
+			"[count %d, max %d]", shortIDCount+prefilledTxCount,
+			maxTxPerBlock())
+		return messageError("MsgCmpctBlock.BchDecode", str)
+	}
 
-	for i := uint64(0); i < prefilledTxCount; i++ {
+	for range prefilledTxCount {
 		index, err := ReadVarInt(r, pver)
 		if err != nil {
 			return err
+		}
+		if index > math.MaxUint32 {
+			str := fmt.Sprintf("prefilled transaction index %d "+
+				"overflows 32 bits", index)
+			return messageError("MsgCmpctBlock.BchDecode", str)
 		}
 		tx := MsgTx{}
 		err = tx.BchDecode(r, pver, enc)
@@ -139,9 +160,10 @@ func (msg *MsgCmpctBlock) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgCmpctBlock) MaxPayloadLength(pver uint32) uint32 {
-	// This can take up to the max payload. The derived block
-	// cannot be larger than the excessive block size.
-	return maxMessagePayload()
+	// The largest is the largest block with every transaction prefilled:
+	// the block + nonce 8 bytes + short ID count (varInt) 1 byte + a one
+	// byte differential index for every transaction.
+	return MaxBlockPayload() + 9 + maxTxPerBlock()
 }
 
 // BlockHash computes the block identifier hash for this block.
@@ -160,6 +182,24 @@ func (msg *MsgCmpctBlock) TotalTransactions() int {
 // known inventory map, we will append it as a PrefilledTx. Otherwise
 // we'll add the short ID of the transaction.
 func NewMsgCmpctBlockFromBlock(block *MsgBlock, knownInventory map[chainhash.Hash]bool) (*MsgCmpctBlock, error) {
+	txHashes, err := block.TxHashes()
+	if err != nil {
+		return nil, err
+	}
+	return NewMsgCmpctBlockFromBlockHashes(block, txHashes, knownInventory)
+}
+
+// NewMsgCmpctBlockFromBlockHashes is NewMsgCmpctBlockFromBlock with the
+// hashes of the block's transactions, in order, so they are not recomputed
+// for every peer.
+func NewMsgCmpctBlockFromBlockHashes(block *MsgBlock, txHashes []chainhash.Hash,
+	knownInventory map[chainhash.Hash]bool) (*MsgCmpctBlock, error) {
+
+	if len(txHashes) != len(block.Transactions) {
+		str := fmt.Sprintf("got %d tx hashes for %d transactions",
+			len(txHashes), len(block.Transactions))
+		return nil, messageError("NewMsgCmpctBlockFromBlockHashes", str)
+	}
 	nonce, err := RandomUint64()
 	if err != nil {
 		return nil, err
@@ -190,9 +230,8 @@ func NewMsgCmpctBlockFromBlock(block *MsgBlock, knownInventory map[chainhash.Has
 
 	lastIndex := 0
 	for i, tx := range block.Transactions {
-		if knownInventory[tx.TxHash()] { // The other peer knows the transaction so we can just send the short IDs.
-			txHash := tx.TxHash()
-			sum64 := siphash.Hash(key0, key1, txHash.CloneBytes())
+		if knownInventory[txHashes[i]] { // The other peer knows the transaction so we can just send the short IDs.
+			sum64 := siphash.Hash(key0, key1, txHashes[i][:])
 			shortIDBytes := make([]byte, 8)
 			binary.LittleEndian.PutUint64(shortIDBytes, sum64)
 			var shortID [ShortIDSize]byte

@@ -21,7 +21,7 @@ var log2FloorMasks = []uint32{0xffff0000, 0xff00, 0xf0, 0xc, 0x2}
 func fastLog2Floor(n uint32) uint8 {
 	rv := uint8(0)
 	exponent := uint8(16)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if n&log2FloorMasks[i] != 0 {
 			rv += exponent
 			n >>= exponent
@@ -76,8 +76,8 @@ func (c *chainView) genesis() *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) Genesis() *blockNode {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	genesis := c.genesis()
-	c.mtx.Unlock()
 	return genesis
 }
 
@@ -100,8 +100,8 @@ func (c *chainView) tip() *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) Tip() *blockNode {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	tip := c.tip()
-	c.mtx.Unlock()
 	return tip
 }
 
@@ -156,8 +156,8 @@ func (c *chainView) setTip(node *blockNode) {
 // This function is safe for concurrent access.
 func (c *chainView) SetTip(node *blockNode) {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	c.setTip(node)
-	c.mtx.Unlock()
 }
 
 // height returns the height of the tip of the chain view.  It will return -1 if
@@ -177,8 +177,8 @@ func (c *chainView) height() int32 {
 // This function is safe for concurrent access.
 func (c *chainView) Height() int32 {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	height := c.height()
-	c.mtx.Unlock()
 	return height
 }
 
@@ -201,8 +201,8 @@ func (c *chainView) nodeByHeight(height int32) *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) NodeByHeight(height int32) *blockNode {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	node := c.nodeByHeight(height)
-	c.mtx.Unlock()
 	return node
 }
 
@@ -212,10 +212,10 @@ func (c *chainView) NodeByHeight(height int32) *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) Equals(other *chainView) bool {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	other.mtx.Lock()
+	defer other.mtx.Unlock()
 	equals := len(c.nodes) == len(other.nodes) && c.tip() == other.tip()
-	other.mtx.Unlock()
-	c.mtx.Unlock()
 	return equals
 }
 
@@ -234,8 +234,8 @@ func (c *chainView) contains(node *blockNode) bool {
 // This function is safe for concurrent access.
 func (c *chainView) Contains(node *blockNode) bool {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	contains := c.contains(node)
-	c.mtx.Unlock()
 	return contains
 }
 
@@ -256,7 +256,7 @@ func (c *chainView) next(node *blockNode) *blockNode {
 }
 
 // Next returns the successor to the provided node for the chain view.  It will
-// return nil if there is no successfor or the provided node is not part of the
+// return nil if there is no successor or the provided node is not part of the
 // view.
 //
 // For example, assume a block chain with a side chain as depicted below:
@@ -276,8 +276,8 @@ func (c *chainView) next(node *blockNode) *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) Next(node *blockNode) *blockNode {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	next := c.next(node)
-	c.mtx.Unlock()
 	return next
 }
 
@@ -341,8 +341,8 @@ func (c *chainView) findFork(node *blockNode) *blockNode {
 // This function is safe for concurrent access.
 func (c *chainView) FindFork(node *blockNode) *blockNode {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	fork := c.findFork(node)
-	c.mtx.Unlock()
 	return fork
 }
 
@@ -420,7 +420,7 @@ func (c *chainView) blockLocator(node *blockNode) BlockLocator {
 // This function is safe for concurrent access.
 func (c *chainView) BlockLocator(node *blockNode) BlockLocator {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	locator := c.blockLocator(node)
-	c.mtx.Unlock()
 	return locator
 }

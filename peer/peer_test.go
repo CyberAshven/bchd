@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/btcsuite/go-socks/socks"
 	"github.com/gcash/bchd/chaincfg"
 	"github.com/gcash/bchd/chaincfg/chainhash"
+	"github.com/gcash/bchd/internal/socks"
 	"github.com/gcash/bchd/peer"
 	"github.com/gcash/bchd/wire"
 )
@@ -50,7 +50,7 @@ func (c conn) LocalAddr() net.Addr {
 	return &addr{c.lnet, c.laddr}
 }
 
-// Remote returns the remote address for the connection.
+// RemoteAddr returns the remote address for the connection.
 func (c conn) RemoteAddr() net.Addr {
 	if !c.proxy {
 		return &addr{c.rnet, c.raddr}
@@ -304,7 +304,7 @@ func TestPeerConnection(t *testing.T) {
 				}
 				outPeer.AssociateConnection(outConn)
 
-				for i := 0; i < 4; i++ {
+				for range 4 {
 					select {
 					case <-verack:
 					case <-time.After(time.Second):
@@ -330,7 +330,7 @@ func TestPeerConnection(t *testing.T) {
 				}
 				outPeer.AssociateConnection(outConn)
 
-				for i := 0; i < 4; i++ {
+				for range 4 {
 					select {
 					case <-verack:
 					case <-time.After(time.Second):
@@ -446,6 +446,9 @@ func TestPeerListeners(t *testing.T) {
 			OnSendHeaders: func(_ *peer.Peer, msg *wire.MsgSendHeaders) {
 				ok <- msg
 			},
+			OnDSProof: func(_ *peer.Peer, msg *wire.MsgDSProof) {
+				ok <- msg
+			},
 		},
 		UserAgentName:          "peer",
 		UserAgentVersion:       "1.0",
@@ -474,7 +477,7 @@ func TestPeerListeners(t *testing.T) {
 	}
 	outPeer.AssociateConnection(outConn)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-verack:
 		case <-time.After(time.Second * 1):
@@ -490,6 +493,11 @@ func TestPeerListeners(t *testing.T) {
 		{
 			"OnGetAddr",
 			wire.NewMsgGetAddr(),
+		},
+		{
+			"OnDSProof",
+			wire.NewMsgDSProof(wire.OutPoint{}, wire.DSProofSpender{},
+				wire.DSProofSpender{}),
 		},
 		{
 			"OnAddr",
@@ -722,7 +730,7 @@ func TestOutboundPeer(t *testing.T) {
 
 	// Test PushXXX
 	var addrs []*wire.NetAddress
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		na := wire.NetAddress{}
 		addrs = append(addrs, &na)
 	}
@@ -888,7 +896,7 @@ func TestDuplicateVersionMsg(t *testing.T) {
 	inPeer := peer.NewInboundPeer(peerCfg)
 	inPeer.AssociateConnection(inConn)
 	// Wait for the veracks from the initial protocol version negotiation.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-verack:
 		case <-time.After(time.Second):
@@ -955,7 +963,7 @@ func TestUpdateLastBlockHeight(t *testing.T) {
 	inPeer.AssociateConnection(inConn)
 
 	// Wait for the veracks from the initial protocol version negotiation.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-verack:
 		case <-time.After(time.Second):
@@ -982,5 +990,64 @@ func TestUpdateLastBlockHeight(t *testing.T) {
 	if height := localPeer.LastBlock(); height != remotePeerHeight+1 {
 		t.Fatalf("height not allowed to advance - got %d, want %d", height,
 			remotePeerHeight+1)
+	}
+}
+
+// TestKnownTxs ensures KnownTxs returns those of the passed hashes that are
+// known transactions of the peer, and not one known only as a block.
+func TestKnownTxs(t *testing.T) {
+	p := peer.NewInboundPeer(&peer.Config{})
+	known, unknown, block := chainhash.Hash{1}, chainhash.Hash{2},
+		chainhash.Hash{3}
+	p.AddKnownInventory(wire.NewInvVect(wire.InvTypeTx, &known))
+	p.AddKnownInventory(wire.NewInvVect(wire.InvTypeBlock, &block))
+
+	got := p.KnownTxs([]chainhash.Hash{known, unknown, block})
+	if len(got) != 1 || !got[known] {
+		t.Fatalf("got %v, want only %v", got, known)
+	}
+}
+
+// TestSendCmpctFlags ensures a sendcmpct sets the flags WantsCompactBlocks
+// and WantsDirectBlockRelay report, and that they can be read while the peer
+// handles it.  They were set without the mutex the readers hold, a data race
+// that the race detector reports.
+func TestSendCmpctFlags(t *testing.T) {
+	cfg := &peer.Config{
+		ChainParams:            &chaincfg.MainNetParams,
+		TstAllowSelfConnection: true,
+	}
+	inConn, outConn := pipe(
+		&conn{raddr: "10.0.0.1:8333"},
+		&conn{raddr: "10.0.0.2:8333"},
+	)
+	inPeer := peer.NewInboundPeer(cfg)
+	inPeer.AssociateConnection(inConn)
+	outPeer, err := peer.NewOutboundPeer(cfg, "10.0.0.2:8333")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPeer.AssociateConnection(outConn)
+	defer func() {
+		inPeer.Disconnect()
+		outPeer.Disconnect()
+		inPeer.WaitForDisconnect()
+		outPeer.WaitForDisconnect()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !inPeer.VerAckReceived() || !outPeer.VerAckReceived() {
+		if time.Now().After(deadline) {
+			t.Fatal("handshake did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	outPeer.QueueMessage(wire.NewMsgSendCmpct(true,
+		wire.CompactBlocksProtocolVersion), nil)
+	for !inPeer.WantsCompactBlocks() || !inPeer.WantsDirectBlockRelay() {
+		if time.Now().After(deadline) {
+			t.Fatal("the flags of the sendcmpct were not set")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

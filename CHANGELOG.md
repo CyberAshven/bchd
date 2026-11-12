@@ -1,0 +1,1885 @@
+# bchd changelog
+
+All notable user-visible changes to [bchd](https://github.com/gcash/bchd), a full Bitcoin Cash node written in Go, are listed here, newest first. Each entry summarizes the consensus, networking, RPC/gRPC, indexing, mining, and packaging changes that landed in a release.
+
+bchd forked from [btcd](https://github.com/btcsuite/btcd) 0.12.x. The original btcd changelog (0.3.0-alpha through 0.12.0) is preserved unchanged at the bottom of this file under **Legacy btcd changelog (pre-fork)**.
+
+## Unreleased
+
+This release keeps the websocket notifications from missing a transaction that spends an output created later in the same block, sends a block's transactions parents first, lets mobile wallets ask for the mempool each time they start or wake, which costs the node a filter build only when the mempool changed, keeps `invalidateblock`, `reconsiderblock` and `finalizeblock` from deadlocking the node, and adds `getbcmridentity`, which answers for a BCMR identity, a token's or any other with a publication on chain, from an index of their authchains.
+
+### Performance
+
+- The `filteredblockconnected` notifications extract the addresses of a block's outputs once, not once for each client.
+- `getcfmempool` builds the filter of the mempool only when the mempool changed since it last built it, and serves that filter to every peer that asks in between. It built the filter for each request, which for a mempool of 50,000 transactions takes about a tenth of a second and 50 MB of short-lived memory.
+
+### New options
+
+- bchd keeps an index of script filters, filter type 1 (#767), beside the committed filter index, and serves them through `getcfilters`, `getcfheaders` and `getcfcheckpt`, and through the `getcfilter` and `getcfilterheader` RPCs. A script filter lists the locking script of each output a block creates and of each output it spends, without its token prefix, and the token categories of both, so a light wallet watches only its own scripts and token categories rather than every coin it holds. It is served with the Merkle root of the block's sorted entries in front, and its header covers both. The index reads the scripts of every block's spent outputs from the spend journal, so the first start after upgrading builds it for every block from genesis before the node serves, and a node that is pruned, fast synced or run with `--nocfilters` keeps none. `--noscriptfilters` turns it off, and `--dropscriptfilterindex` deletes it.
+- `--bcmrindex` keeps an index of the authchain of every token category, as CHIP-BCMR defines it: the transactions from the category's authbase, whose ID is the category ID, to its authhead, each with its BCMR metadata registry publication, and whether the identity was burned. It keeps every authchain that holds a publication too, from where it begins, since the publishing transaction or any behind it can be the authbase that a registry names in its `registryIdentity`: a transaction with a publication that is no link starts one, and a walker adds every transaction behind each publication in the background, unless more than 100,000 that the index doesn't otherwise track are behind it, when it adds none of them. Tracking an identity says nothing of whether its registry should be trusted. Authchains that share transactions, after a merge or when one genesis creates several categories, share them in the index. It reads every block from the last checkpoint before CashTokens activated once, and the spend journal only of the blocks that spend the identity output of an authbase or of a transaction behind a publication, so it can't be used with `--prune` or `--fastsync`. It keeps what it needs to undo the latest 1,000 blocks, so it can't be used with a `--maxreorgdepth` above 1,000; a deeper reorganization, while finalization is off or before it finalized a block, fails and asks for a rebuild. `--dropbcmrindex` deletes it.
+
+### Consensus & Network
+
+- A peer whose ban score reaches `--banthreshold` is banned. It took a score above it, so the offenses that score 100, which BCHN bans for at once, such as an invalid block or a fork below a checkpoint, left the peer connected at a score that doesn't decay, and bchd warned at each of its small `getdata` requests. A peer on another chain now gets banned, for `--banduration`, a day by default.
+- A peer connected to with `--connect` or `--addnode` isn't banned on any path, as was meant. Only an invalid block, header or transaction spared it, and any other offense could lock a `--connect` node out of its only peer for a day. A score raised by a lasting offense also counts the decaying part as it has decayed, where a request an hour ago still counted in full.
+- A banned host isn't dialed, as an outbound peer that was banned was dialed again right away, only to be disconnected after its handshake. As in Bitcoin Cash Node, a ban doesn't apply to persistent and whitelisted peers, and a whitelisted peer was refused after its handshake.
+- A peer's `getcfmempool` adds 10 to its ban score and its `mempool` 20, rather than 33 each, so that a wallet can ask for the mempool three times in a row, with the filter first, as mobile wallets ask each time they start or wake. A wallet that asked twice within about a minute was banned for a day.
+
+### RPC & gRPC
+
+- `setban`, `listbanned` and `clearbanned` take the arguments of the same commands in Bitcoin Cash Node and answer in the same form. `setban` bans an IP address or a subnet, or lifts a single ban, `listbanned` shows the bans in force, those of ban scores too, and `clearbanned` lifts all of them, or only the manual or the automatic ones. Manual bans are kept in `banlist.json` in the data directory, so they outlive a restart.
+- `getbcmridentity`, with `--bcmrindex`, returns what the index knows of an identity, a token's by its category ID or that of any transaction of an authchain the index tracks, with the links of its authchain in the mempool: the authhead, the BCMR publication to read (the authhead's if it has a well-formed one, else the newest earlier one, marked not current), the number of fungible tokens a token's genesis created, and the CashTokens data of the authhead's identity output. With `includeauthchain` it also returns the authchain's transactions, in the shape of CHIP-BCMR's authchain extension, in pages that `after` continues, and a merkle proof of the newest confirmed link, which proves the earlier ones too. `rpcclient` has the call.
+- `listbcmridentities`, with `--bcmrindex`, lists what the index knows of the identity of every token, a page at a time, from the chain alone, for an admin user. It is what a table of every token can be generated from.
+- `bcmrhints` writes a file of where the authchain of every token stood at a height, from a node with `--bcmrindex`, for wallets that scan block filters. The same height gives the same bytes on every node, so anyone can check a published file by its SHA-256. See [docs/bcmr_hints.md](docs/bcmr_hints.md).
+- `GetBcmrIdentity` gives the same answers over gRPC, and over REST at `/v1/GetBcmrIdentity`, with transaction and block hashes little-endian as in the other calls, and a publication's hash in the byte order it was pushed in. `GetBlockchainInfo` has `bcmr_index`.
+- The websocket notifications of a block's transactions (`recvtx`, `redeemingtx`, `filteredblockconnected`, `rescanblocks`, and `rescan` without the spend journal) no longer miss a transaction that spends a watched output of a transaction the block lists after it. Since the canonical transaction ordering upgrade, blocks list their transactions by txid, so this happens to about half of such pairs. A block's live notifications also kept watching the spent output.
+- These notifications, and `rescan`'s, list a block's transactions with each one after those it spends. A wallet that records each transaction as it comes, such as bchwallet with a bchd backend, saw the spend before the output it spends and kept that output unspent.
+- `invalidateblock`, `reconsiderblock` and `finalizeblock` no longer deadlock the node when they run while it connects or disconnects a block, which it does most of the time while it syncs; a deadlocked node had to be killed. They now wait until the chain is done with that block, so they can't change the chain in the middle of another change either, as when a reorganization disconnected a block that `finalizeblock` had just finalized.
+- `invalidateblock` of the block after the genesis block no longer freezes the node. It panicked while it held the lock of the block index, and the RPC server recovered from the panic with the lock still held, so that everything that reads the index waited forever.
+- `invalidateblock` of a block off the main chain no longer disconnects the main chain down to the fork and marks it invalid. It marks that block invalid and leaves the main chain alone.
+- A `rescan` that reached the tip as the node shut down no longer can hang the shutdown. Requests to the websocket notification manager return once it has shut down, and the sync manager stops while it is paused.
+- A panic in an RPC handler, which the RPC server recovers from, no longer leaves the block index, the best chain, the UTXO cache or the mempool locked, or the chain lock in the accessors that RPC handlers use, which would freeze the node.
+- `reconsiderblock` and other calls that change the chain no longer can crash the node as the sync peer changes, and fast sync's headers no longer race with the readers of the best state.
+- `reconsiderblock` keeps the block's entry in the block index rather than replacing it, so that a side chain built on the block, which the call doesn't touch, can't later leave the main chain and the index with different entries for it.
+- A `rescan` that reaches the tip waits until the sync manager has paused before it reads the tip and registers its addresses, so that a block being connected can no longer slip between the two.
+- `invalidateblock` marks every block built on the block, and `reconsiderblock` clears those marks and returns to the best chain they make. It left them invalid, so that after invalidating and reconsidering a block the node stayed behind, refused the next block, and would have banned the peers that announced it.
+- An `invalidateblock` that fails, or a `reconsiderblock` that can't read the block, leaves the block as it was. A block that stayed connected was left marked invalid, and a chain that couldn't be read was left marked valid.
+
+### Other
+
+- The new `bcmr` package has CHIP-BCMR's on-chain rules, for the index and for wallets.
+- The JavaScript client in `bchrpc/pb-js` is generated with `protoc-gen-js` 4.0.3 rather than protoc 3.6.1, and `bchrpc/pb-py` has the new call. Setters in the JavaScript client now return the message.
+- The Docker image builds with Go 1.27.3.
+- An index that needs no spent outputs no longer stops the node from starting when its tip is a block a reorganization left while the index was off, as after a run without it or on an older version: the block's spend journal is gone by then. One that needs them, the address and filter indexes, says which one to drop.
+- `--bcmrindex` is refused on a data directory that was pruned or fast synced before, not only with `--prune` or `--fastsync` set.
+- The transaction and SLP indexes store the version of their records, as the address and filter indexes do, so that a later bchd can migrate them, and so that bchd refuses an index that a later version built rather than misread it. An index built before is marked version 1, which its records are.
+- `rpctest` harnesses listen on ports below 32768, where Linux starts the ephemeral ports of outgoing connections. Their RPC ports reached 60000, so a connection that a test made could hold the RPC port of a harness, which then failed to start with "address already in use", as neutrino's sync test did on CI.
+
+## 0.22.4 (2026-10-27)
+
+This release fetches announced blocks through their headers, as BCHN does, cuts the memory `--slpgraphsearch` needs to about a fifth, and has the gRPC address calls return the address's number of transactions. Nodes with `--addrindex` should read the upgrade notes first.
+
+### Performance
+
+- `--slpgraphsearch` keeps about 210 bytes per SLP transaction instead of the whole transaction (about 1,000 bytes for a typical SEND, more for larger ones), and reads the transactions a search returns from the memory pool or the transaction index.
+- Loading `--slpgraphsearch` takes about a third less memory at its peak, about 280 MB less per million SLP transactions.
+
+### Consensus & Network
+
+- Catching up with a competing chain that overtakes the node's own no longer takes two minutes per block.
+- Add the `chipnet-seed.bchd.cash` DNS seed.
+- A peer disconnected just as one of its messages arrived no longer leaves a goroutine behind.
+- A synced node no longer downloads and stores the blocks of lower-work forks that peers announce.
+- A compact block with an invalid header now costs the peer BCHN's ban score, and compact blocks go only to peers known to have the parent's header.
+
+### RPC & gRPC
+
+- gRPC `GetAddressTransactions` and `GetRawAddressTransactions` return the address's number of confirmed transactions in `confirmed_count`.
+- On 32-bit builds, `GetAddressTransactions` and `GetRawAddressTransactions` with an `nb_skip` of 2^31 or more return no confirmed transactions instead of the newest ones.
+- gRPC `GetAddressTransactions` and `GetRawAddressTransactions` no longer list a just-confirmed transaction as unconfirmed too.
+- The gRPC SLP calls no longer treat a transaction that left the memory pool unconfirmed as valid after the next block.
+- The gRPC SLP calls no longer treat as valid a transaction that a reorg disconnected and the memory pool didn't take back.
+- `GetSlpGraphSearch` and the graph search count of `GetSlpTrustedValidation` answer bad client input with `InvalidArgument` or `NotFound` instead of `Internal` or `Aborted`.
+- `GetSlpGraphSearch` and `GetSlpTrustedValidation` answer a transaction the SLP index does not hold with `NotFound`, and a failure to read the index with `Internal`, rather than both with `Aborted`.
+- `GetSlpTrustedValidation` answers a query hash of the wrong length with `InvalidArgument` rather than `Aborted`.
+- `GetSlpTokenMetadata` answers a token with no GENESIS or metadata in the SLP index with `NotFound`, a failure to read the index with `Internal`, and a token ID of the wrong length with `InvalidArgument`, instead of `Aborted`.
+- `CheckSlpTransaction` and `SubmitTransaction` answer `Internal` when the SLP index cannot read an input's entry, rather than taking the input for one without tokens.
+- When the SLP index fails to read a transaction's SLP data, `GetTransaction`, `GetBlock`, `GetMempool` and `GetAddressTransactions` answer `Internal`, and the subscriptions send the transaction as `UNKNOWN_OR_INVALID`, instead of reporting an invalid SLP transaction that burns its inputs.
+- An SLP transaction in the memory pool whose check hits a database failure is checked again at the next block, instead of staying invalid to the SLP calls while it is in the pool.
+- `GetUnspentOutput`, `GetAddressUnspentOutputs` and `GetTransaction` answer `Internal` when the SLP index fails to read a token or its metadata, rather than leaving it out.
+- `GetUnspentOutput` returns the SLP token and token metadata of a confirmed output, not only of an unconfirmed one.
+- A memory pool transaction spending an output whose SLP index entry is corrupt is logged as an error, with advice to rebuild the index, and left unjudged instead of judged invalid.
+- An output or transaction whose SLP index entry is corrupt fails the gRPC call with `Internal`, and streams send it with its SLP state unknown, instead of answering without its token or token metadata.
+- `GetUnspentOutput` returns an output's SLP token metadata only when `include_token_metadata` is set, as `GetAddressUnspentOutputs` does, so clients that read it must now set the flag.
+- `GetSlpTokenMetadata` no longer reports a mint baton that a block burned while confirming, from the memory pool, the GENESIS or MINT that created it.
+- `GetSlpTokenMetadata` reports a token's mint baton ended once a MINT ending it is in the memory pool, as it does once the MINT is confirmed, instead of the baton the MINT spent.
+- `searchrawtransactions`, the websocket address filters and `notifyreceived`, and the gRPC address calls and transaction filters refuse a legacy address from another network, such as a testnet address on mainnet, instead of reading it as this network's address with the same hash.
+- On systems that don't allow reading the network interfaces, such as Android, bchd creates its RPC certificate without their addresses instead of failing to start.
+
+### Database
+
+- A block spending an output whose SLP index entry is corrupt stops the node with advice to rebuild the index with `--dropslpindex`, instead of storing the spending transaction as invalid for good.
+- A corrupt SLP token metadata record stops the node with advice to rebuild the index, or fails the gRPC call that reads it, instead of crashing the node.
+- When an index fails on a block, the log names the index instead of reporting a failure to write the chain state.
+- When an index fails to catch up at startup, the error names the index.
+
+### Build & Packaging
+
+- Update dependencies, including gRPC v1.85.0, protobuf v1.36.12, grpc-gateway v2.33.0 and the Prometheus client v1.25.0, and regenerate `bchrpc/pb` with them.
+
+### Other
+
+- txscript can sign inputs that spend CashTokens, and sign with `SIGHASH_UTXOS`. `SignTxOutputWithSigHashes`, `SignatureScriptWithSigHashes`, `RawTxInECDSASignatureWithSigHashes` and `RawTxInSchnorrSignatureWithSigHashes` take the transaction's signature hashes, computed once for all its inputs, which must include the outputs it spends (`NewTxSigHashes(tx).WithUtxos(tx, utxos)`) for those. The functions without them can't see the spent outputs, so they now return an error for `SIGHASH_UTXOS` instead of a signature the network refuses.
+- txscript's signing functions return an error, instead of panicking or making an invalid signature, for signature hashes that don't fit the transaction and for `SIGHASH_UTXOS` with `SIGHASH_ANYONECANPAY`.
+- txscript's `SignTxOutput` and `SignTxOutputWithSigHashes` sign P2SH32 inputs.
+- txscript's `SignTxOutput` keeps a P2PKH or P2PK signature from `previousScript` only if it is valid, and no longer returns an invalid script when re-signing one wrapped in P2SH.
+- txscript's `CalcSignatureHash` returns an error for `SIGHASH_UTXOS` unless the signature hashes include all the outputs the transaction spends.
+- `--slpgraphsearch` no longer logs an error for each SLP transaction that arrives while the graph loads.
+- txscript's `SignTxOutput` drops multisig signatures in `previousScript` whose hash type the network refuses, and returns an error for a `previousScript` in Schnorr multisig mode instead of losing its signatures.
+- txscript's signing functions return an error for a hash type the network refuses, such as `SigHashOld`, instead of a signature it rejects.
+- txscript's `SignTxOutput` returns an error for a P2SH or P2SH32 input whose redeem script is itself P2SH or P2SH32, instead of an invalid script.
+
+### Upgrade notes
+
+- **Address index.** On first start, and after an earlier release has run with `--addrindex`, nodes with it read the address index once to count the transactions of large addresses: under a second on chipnet, a few minutes at most on mainnet.
+
+## 0.22.3 (2026-10-23)
+
+This release makes validation, initial sync and block relay considerably faster, adds double spend proofs, block finalization and Tor v3 support, adds CashTokens data and several BCHN-compatible calls to the JSON-RPC server, and brings consensus validation in line with Bitcoin Cash Node in a number of edge cases. It also drops free transactions, as BCHN did, and fixes many robustness issues in the P2P, RPC, gRPC and database code. Upgrading is recommended for all nodes; read the upgrade notes first if the node sets `--minrelaytxfee` to 0 or uses `--profile`, runs pruned or with `--addrindex` or `--slpindex`, serves `sendrawtransaction`, websocket or gRPC clients, or is short of memory.
+
+### Performance
+
+- Hash the spent outputs once per transaction and size parsed scripts to their opcode count. Together, a full chipnet sync takes about 23% less wall time and 24% less CPU.
+- Use the dcrd secp256k1 package in `bchec`, as btcd does. Script validation is 26% faster and mempool acceptance 18% faster.
+- Analyse scripts without parsing them first, cutting memory allocated during validation and mempool acceptance by 16-31%.
+- Add the outputs of an in-block parent to the UTXO view once instead of once per spending input (a 2000×2000 block goes from 142 ms to 0.38 ms).
+- Hash a relayed block's transactions once for all compact block peers. With 125 peers this saves about 10 s of CPU per 32 MB block.
+- With indexes on, sync allocates about half as much, and at the same `--gcpercent` uses about half the CPU: ffldb commits to its cache's treaps in batches, the transaction and address indexes find transaction locations by scanning the block's bytes, and the SLP index sorts a block's transactions in linear time.
+- Refresh the checkpoints from BCHN (mainnet now 970892). During initial sync, blocks up to the last checkpoint only get the checks that don't depend on the chain state, so sync is much faster; `--nocheckpoints` validates every block in full.
+
+### New options
+
+- `--gcpercent` (default 50, up from v0.22.2's fixed 10) sets the garbage collector target; higher values trade memory for CPU. `GOGC` and `GOMAXPROCS` are no longer overridden.
+- `--maxtxfee` (default 0.1 BCH, as in BCHN) is the highest fee `sendrawtransaction` and `testmempoolaccept` accept without `allowhighfees`.
+- `--maxreorgdepth` (default 10) and `--finalizationdelay` (default 7200 seconds), as in BCHN.
+- `--rpcauthtimeout` now also applies to websocket clients.
+- `--nodoublespendproof` turns off double spend proofs.
+- `--sigcachemaxsize` also bounds the cache of transaction signature hashes, whose entries for transactions that failed validation or left the mempool unmined stayed until restart.
+- `--maxpeers` keeps `--targetoutboundpeers` slots for outbound peers, as BCHN keeps slots for its outbound connections, so inbound peers can't take them all. Persistent peers no longer count toward it, and a negative value is refused instead of crashing the node.
+- `--minrelaytxfee` must be above 0 and at most 21000000. `--limitfreerelay`, `--norelaypriority`, `--blockminsize` and `--blockprioritysize` are deprecated and do nothing.
+- `--profile` with a bare port listens on localhost only.
+- `--grpcmaxsubscriptions` (default 100) limits the gRPC subscriptions all clients hold at once, and one client's to a quarter of it without `--grpcauthtoken`, `--grpcmaxfilterentries` (default 100,000) the entries one subscription's requests add to its transaction filter, and `--grpcmaxconcurrentcalls` (default 16) the other gRPC calls in progress, with up to four times as many waiting, as BCHN's HTTP server runs 16 requests and queues 64. A call over a limit gets `ResourceExhausted`. A client is an IPv4 address or an IPv6 /56, so one with several addresses can hold more; clients at loopback, private or link-local addresses, such as a proxy in front of the server, share only the overall limit.
+
+### Consensus & Network
+
+- Bring consensus validation in line with BCHN in several edge cases, including double spends within a block, failed signature checks and the signature cache, CashTokens prefix parsing and the coinbase rules, the BIP34 height push, `OP_NUM2BIN`, and orphan blocks. No block on mainnet, testnet3, testnet4 or chipnet is affected.
+- Finalize blocks 10 deep and reject forks below them, and require BCHN's minimum chain work before the node considers itself synced. A sync peer that leaves the node below that work is replaced, so it can't hold the node on a low-work fork.
+- Fix the stored ABLA state, which after a restart or a block disconnect could drop the next block's size limit to 16 MB.
+- On testnet4 and chipnet the block size limit starts at 2 MB, as in BCHN, instead of 32 MB, and the UAHF, Magnetic Anomaly and Graviton rules start at BCHN's heights, one block later than before. `--excessiveblocksize` now defaults to the network's default size, which is also its minimum, and a larger value no longer raises the size and sigchecks limits blocks are validated against, except on regtest and simnet.
+- Support Tor v3 onion addresses and BIP155 `addrv2`, as BCHN does. Tor v2 addresses, which Tor no longer supports, are dropped.
+- Match bloom filters and build merkle blocks as BCHN does (gcash/bchutil#50).
+- Match P2PK and bare multisig scripts to BCHN's templates for standardness. A key that isn't pushed directly, or doesn't start with a valid prefix, makes the script pay to script.
+- Create, check and relay double spend proofs (`dsproof-beta`), as BCHN does.
+- Every new transaction must pay `--minrelaytxfee`, as in BCHN. Free relay and coin-age priority are gone.
+- Dust is judged at BCHN's default `-dustrelayfee` of 1000 satoshis per kB, whatever `--minrelaytxfee` is, so raising that no longer refuses outputs BCHN relays. After the May 2026 upgrade an output whose script starts with `OP_RETURN` but isn't a data carrier is never dust, as in BCHN.
+- Transactions leave the mempool two weeks after entering it, with the transactions that spend them, as with BCHN's default `-mempoolexpiry`. A transaction a reorg put back below the minimum fee is never mined, and no longer stays until a restart. A reorg no longer leaves mempool transactions spending a block transaction the mempool refused, and puts back one that was also an orphan.
+- Regtest applies every upgrade from the first block, CashTokens included, and activates CSV at height 576, as BCHN does.
+- Track each requested block and transaction, as BCHN does. A `notfound`, 60 s without the transaction or the peer leaving moves a transaction request to the next peer that announced it, each peer's tracked announcements are capped at 100,000, and a peer that delivers none of the blocks it was asked for within BCHN's timeout is disconnected, its blocks going to other announcers. A compact block whose missing transactions don't arrive within 30 s, or that arrives while two from its peer are being reconstructed, is fetched in full.
+- Announced transactions are looked up in the UTXO set only when about to be requested, and without filling the UTXO cache, instead of twice for every unknown txid.
+- A `getdata` for the compact block of a block more than 5 below the tip gets the full block, as in BCHN, and a compact block is built without copying the peer's whole known inventory.
+- Fix a deadlock between the peer handler and the sync manager that stopped sync and relay for good, and a shutdown hang behind a pending relay.
+- Local addresses, which inbound onion peers come from, are no longer banned, as in BCHN, or held to `--maxpeersperip`. Ended bans are dropped every 15 minutes, and `node disconnect` releases its peer's per-IP slot.
+- Fix several P2P message and compact block relay issues, including a data race on the `sendcmpct` flags, and bound UPnP requests to five seconds.
+- BIP68 sequence locks and `OP_CHECKSEQUENCEVERIFY` read the transaction version as unsigned, as BCHN does. Only versions that have been invalid since May 2023 are affected.
+- Bloom filtering follows BCHN: a peer without a filter gets filtered blocks as with one that matches everything, `filteradd` without a filter is ignored, `filterclear` is always accepted and turns relay on, and the `mempool` reply lists the whole pool, parents first, with the peer's fee filter applied.
+- Messages other than blocks are held to BCHN's 2 MiB, or to their largest valid size, so a peer can make the node hold at most about 141 MB for one message instead of 268 MB.
+- The block message limit follows ABLA, at twice the largest block size ABLA allows within the next 2048 blocks, as in BCHN, and never below the limit `--excessiveblocksize` sets, so after a long run of full blocks the node can still receive the largest valid blocks. cfilter messages may hold the filter of any block that limit allows, instead of at most 4 MiB.
+- P2P rejects carry BCHN's short reasons, and none is sent for a duplicate, an orphan or an internal error, as in BCHN. Dust, an undersized transaction, one over its sigchecks limit and a script that fails only standardness flags are rejected with code 64, as in BCHN, and script failures name BCHN's script error.
+- Script failures name the error BCHN gives for them, also where several of BCHN's errors shared one of bchd's error codes or, for all but a few scripts, where several rules fail, in `testmempoolaccept`, `sendrawtransaction` and P2P rejects, for example `mandatory-script-verify-flag-failed (Push value size limit exceeded)`. With `--relaynonstd`, or on a network that relays nonstandard transactions, a transaction whose version breaks the May 2023 rule gets BCHN's code 64 and `bad-txns-version` before its scripts run, instead of code 16 and a script error, and is not kept as an orphan.
+- A peer that sends a transaction breaking a consensus rule, such as a mandatory script failure, or an invalid block it was asked for, has BCHN's score for the rule added to its ban score, 100 for most rules, as BCHN does. Transactions add nothing while the node is not synced, as its mempool then checks them under its old tip's rules. Whitelisted and persistent peers are spared, `--nobanning` is honored, and a block rebuilt from a compact block adds nothing, as in BCHN.
+- A message whose payload can't be decoded gets BCHN's reject, with the message's own command, the malformed code and `error parsing message`, and other read errors get none, as from BCHN. A peer's reject is logged at debug level, and one with a reason over the 111 bytes, or a command over the 12 bytes, that BCHN reads is logged as unparseable, where every reject was logged as a warning with its whole reason.
+- A `getdata` for a block relayed early as a compact block waits until the block is processed instead of getting `notfound`, which BCHN answers by disconnecting, and a block known to be invalid is no longer served. A compact block for a block held as an orphan no longer fetches it again from each relaying peer.
+- A transaction that left the mempool unmined is no longer rebroadcast until a restart. Expired orphan double spend proofs add at most 25 to a peer's ban score per expiry, so a burst of them no longer bans honest peers for a day, and the proofs are indexed by peer.
+- A disconnected block's transactions go back into the mempool parents first without recursion, which a long chain of transactions could overflow, and a shutdown no longer leaves peer goroutines, RPC calls, the CPU miner or the connection manager's address lookup waiting on the stopped peer handler or sync manager.
+
+### RPC & gRPC
+
+- Include CashTokens data (`tokenData`) in transaction outputs, in BCHN's format, and fix CashTokens outputs in `createrawtransaction`.
+- Add `testmempoolaccept`, `getblock` verbosity 3 (input `prevout`), the transaction `fee` at verbosity 2 and 3, `finalizeblock` and `getfinalizedblockhash`, as in BCHN. Verbosity 2 still lists the transactions under `rawtx`, where BCHN uses `tx`; rpcclient's `GetBlockVerboseTx` now reads either.
+- `sendrawtransaction` honours `allowhighfees`, relays a transaction already in the mempool again, and returns -26 for rejected transactions, as BCHN does.
+- `testmempoolaccept` gives BCHN's short reject reasons, such as `18: txn-mempool-conflict`, with the description in `reject-details`, and `sendrawtransaction`'s -26 message is in BCHN's form: the reason, the description and the reject code.
+- Report P2SH32 outputs as `scripthash` with the correct address (gcash/bchutil#47), pay to script outputs as `script`, and renamed opcodes by their current names. JSON-RPC shows the public key of a P2PK or bare multisig output as the cashaddr of its key hash, as BCHN does.
+- Index spends of token outputs in the address index, and match websocket `rescan` spends on the outputs they spend.
+- Return errors instead of crashing on malformed JSON-RPC requests and bad gRPC input. gRPC subscriptions are torn down properly, and idle gRPC connections close after 5 minutes.
+- A gRPC subscription that falls more than 50000 events behind, counting only the kinds of event it takes, now ends with `ResourceExhausted`.
+- A websocket client is disconnected when it takes less than 64 KiB in 30 s while a message waits for it, much as with BCHN's `-rpcservertimeout` for HTTP, or when more than 64 MiB of notifications wait for it. A client that stopped reading used to stall every client's notifications, new websocket connections and shutdown, and `loadtxfilter` no longer holds them up while it decodes its addresses.
+- `getdsproof` and gRPC `GetDoubleSpendProof` search at most 1000 unconfirmed ancestors and list at most the 1000 nearest descendants.
+- gRPC logs each call, and errors that only concern the caller, such as a bad filter, a refused SLP transaction, a missing index, a limit it reached or its deadline passing, at debug, and names a bad filter address by its index instead of repeating it. A `SubscribeTransactionStream` call that ends on a bad filter no longer leaves a goroutine holding the client's next request.
+- Move SLP parsing to `gcash/goslp` v1.0.0, a maintained copy of `simpleledgerinc/goslp`, whose repository was deleted. 32-bit builds now read SLP amounts of 2^31 base units or more correctly.
+- When a MINT confirms, the SLP index now drops the token's cached metadata, as it was meant to, unless a later MINT still in the mempool set it, and metadata from the mempool goes at the first block after its transaction leaves the mempool. gRPC could otherwise report the mint baton where a double-spent MINT had put it, until a restart.
+- Every SLP token gets an internal ID of its own. A SEND of zero tokens of a token with no GENESIS took the next token's, and logged critical lines, and after a reorg and a restart a new token could overwrite another's metadata. `GetUnspentOutput` returns an unconfirmed output that holds no tokens instead of failing.
+- Add `getdsproof`, `getdsprooflist` and `getdsproofscore` as in BCHN, the `notifydsproofs` websocket command, and the gRPC calls `GetDoubleSpendProof`, `GetDoubleSpendProofs`, `GetDoubleSpendProofScore` and `SubscribeDoubleSpendProofs`.
+- `verifymessage` accepts cashaddr addresses. `validateaddress` keeps the token-aware form and adds `istokenaware`, `scriptPubKey` and `isscript`. `createrawtransaction` rejects a repeated destination or an amount above 21 million BCH, and accepts legacy addresses. `getinfo` and `getmininginfo` report `testnet` on testnet4 and chipnet. Limited users can stop the notifications they can start.
+- With the mempool included, as by default, `gettxout` returns null for an output a mempool transaction spends and for an index past a mempool transaction's outputs, as BCHN does.
+- `gettxoutproof` without a block hash no longer needs `--txindex`: it finds the block from an unspent output of the first transaction, in one read of the UTXO database, where BCHN tries each transaction. It checks its txids in linear time. `verifytxoutproof` returns an empty list for a proof that proves nothing, such as one whose merkle root does not match its header, as BCHN does.
+- gRPC address queries accept legacy and P2SH32 addresses, and transaction filters match them. `GetAddressUnspentOutputs` no longer returns an output twice, or both an output and the change of a transaction that spent it while the call ran, misses one created while it runs, or lists a bare multisig output under its first key's address, and `GetBlockchainInfo` works on chipnet.
+- `getrawmempool`'s `startingpriority` and `currentpriority`, and gRPC's `starting_priority`, are deprecated and always 0. `estimatepriority` is now an unknown method.
+- `createrawtransaction` takes BCHN's forms too: outputs as an array, `data` outputs, outputs with `tokenData`, the locktime as the third argument and an input's `sequence`. It keeps the outputs in order, makes version 2 transactions, and refuses what BCHN refuses: null arguments, an input without its `vout` or its `txid` in full, a `vout` that is negative or above 2^31-1, and a sequence out of range. `bchctl` sends its arguments as given and shows both forms in its usage, and rpcclient gains `CreateRawTransactionOrdered` and sends cashtokens entries with their documented field names instead of Go's.
+- `decodescript` gives `p2sh_32`, `getblocktemplate` gives each transaction's `txid` and `sigops` and the `sigoplimit`, the sigops fields holding the sigchecks, and `validateaddress` shows a legacy address as its cashaddr, as BCHN does.
+- Request ids come back exactly as sent, whatever their JSON type, as in BCHN. An integer id above 2^53 was rounded, and a bool, object or array id got no reply.
+- An HTTP request without an id, or with a null id, is run and answered with `"id":null`, alone or in a batch, as in BCHN, instead of being taken for a notification and dropped. Websocket requests without an id are still notifications.
+- `searchrawtransactions`, which limited users can call, refuses a count above 10,000 and clamps its skip, where a huge count could exhaust memory or panic. gRPC `GetAddressTransactions` gives an unconfirmed transaction's `fee_per_kb` per kB, as documented and as the subscriptions do, where 0.22.2 gave it per byte.
+- Websocket clients that have not authenticated have `--rpcmaxwebsockets` slots of their own, and when those are full the one that has waited longest makes room, so they can no longer keep out authenticated clients or those using the `authenticate` command.
+- Verbose `getrawmempool` builds its result after releasing the mempool lock, and a recovered panic no longer leaves the `getblocktemplate` long poll or a client's rescan filter locked.
+- `getblockchaininfo` asks the sync manager for the sync peer's height, where it read the sync peer beside the sync manager, a data race that failed the call when the sync peer changed. Like BCHN's, it now waits while a block is being processed.
+- gRPC replies are written under a 30 s inactivity deadline, as websocket messages are, so a client that stops reading no longer holds its calls. Transaction subscriptions look up the outputs a transaction spends once for all subscribers, from the spend journal or the UTXO set, so spends of confirmed outputs now match without `--txindex`. `GetAddressUnspentOutputs` reads an address's history once and stops when its call ends, as the SLP graph search now does.
+- gRPC `GetAddressTransactions` loads each transaction its results' inputs spend from once per call, and the transaction subscriptions take confirmed transactions' inputs from the block's spend journal once per block: for an address whose transactions spend from one large transaction, a call took 22 s and 18 GB, and now 0.12 s and 130 MB. The address calls and `searchrawtransactions` read an address's entries and transactions in one database transaction, so a block connected between reading the entries and the transactions no longer fails the call, and `GetAddressUnspentOutputs` fails with `Aborted` when the chain reorganizes during the call instead of mixing the two chains' histories.
+- A gRPC transaction filter keeps at most `--grpcmaxfilterentries` of the outputs it matched, the newest, to match their spends, where it kept every one for the life of the call.
+- A gRPC request whose client sends less than 64 KiB of it in 30 s is ended, much as with BCHN's `-rpcservertimeout`; streams whose client sends its messages when it chooses are not affected.
+- When the replies a gRPC server is sending hold more than 512 MiB, those whose clients have taken no 64 KiB part of them in the last 2 s are reset, and a client that does not read its socket has its connection closed, so clients that stop reading can no longer make the node hold replies for 30 s each; a stream whose client takes a 64 KiB part at least every 2 s is never reset.
+- The SLP graph search allocates for what it finds rather than for the token's whole graph, and no longer fails when a block adds to the graph while it runs. `GetSlpTrustedValidation` counts graph searches without serializing their transactions, once per transaction and valid hashes in a request. An SLP transaction back in the mempool, as when its wallet sends it again after it expired, stays in the SLP cache while there; gRPC could otherwise show it and its outputs as not SLP and refuse SENDs of its tokens.
+
+### Mining
+
+- `getblocktemplate` no longer fails when the mempool holds a transaction that is not final yet, and template size limits follow ABLA. `blockmaxsize` now defaults to the network's block size limit less 1000 bytes.
+- Each `getblocktemplate` transaction's `depends` now includes parents that come later in canonical order, and each transaction is listed with its own `fee` and `sigchecks` rather than another transaction's.
+- `submitblock` returns BIP22 reasons such as `duplicate-invalid` or `prev-blk-not-found`, as BCHN does, and no longer reports a block with an unknown parent, or one that ends up on a side chain, as accepted. Proposals are checked at the next block height.
+- `submitblock` and block proposals reject trailing data after the block.
+- `generate` writes the right coinbase height when the tip moves while mining, and only returns blocks that were accepted.
+- Templates select transactions by fee rate only. The priority area and `--blockminsize` filling are gone.
+
+### Database
+
+- Fix hangs when pruning, after a failed database commit, and when `peers.json` is rejected.
+- Keep UTXO cache entries until their flush commits, and recover at startup from a flush interrupted after a reorg.
+- ffldb refuses a block region that reaches past its block, as the database interface specifies, instead of returning bytes of the block file around it.
+- A block a peer sends with data after its last transaction is stored without it, as its own serialization, as BCHN stores blocks.
+- A failed UTXO flush, block write or chain state update now shuts the node down cleanly, as BCHN does, instead of running on a stale tip, and a block whose commit failed is no longer appended to the block files again.
+- An interrupted `--reindexchainstate` resumes on the next start instead of leaving an incomplete UTXO set, and it deletes the old UTXO set in batches rather than holding every deletion in memory.
+- A database lookup that fails now fails the operation instead of reading as missing data, also where the caller turned the missing data into an error of its own, so a disk error can no longer get a valid block marked invalid or a websocket `rescan` retried without end.
+- A database error while processing a block stops the node cleanly, as BCHN does, where netsync panicked on corruption. Corruption gets the `--reindexchainstate` advice, and only a re-index that cannot read the stored blocks says to sync again. Deleting the old UTXO set for a re-index or a fast sync logs its progress.
+- Dropping an index, with `--dropaddrindex`, `--droptxindex`, `--dropcfindex` or `--dropslpindex` or when the address index is rebuilt, no longer slows down as it goes, and it can be interrupted between batches; it resumes on the next start that enables the index or gives its drop flag again.
+- `--fastsync` is refused before it changes the database when the last checkpoint has no UTXO set, as on testnet3, testnet4 and chipnet; it used to empty the UTXO set and mark the database pruned. A start without `--fastsync` is refused until a downloaded set is verified, and each fast sync start deletes the old set in batches.
+- A block file is synced to disk before writes move to the next one, as in BCHN. Pruned nodes delete the block files of earlier runs again; since 2018 they only deleted files filled since their last start.
+- Move to `gcash/goleveldb` v1.1.0, a maintained fork of `syndtr/goleveldb` that brings upstream fixes since 2018 and fixes data loss during crash recovery, hangs after failed writes, and several panics. After a failed disk write it takes no more writes until the node restarts, and a corrupted MANIFEST fails the open instead of silently dropping tables. The on-disk format is unchanged.
+
+### Security
+
+- Fix a remotely triggerable crash on `OP_ACTIVEBYTECODE` in a script holding an `OP_PUSHDATA1`, `2` or `4` push, which a relayed transaction, or a block BCHN accepts, caused on every node.
+- Fix consensus bugs that made 0.22.2 accept blocks BCHN rejects, which could split bchd nodes from the network: two transactions in one block spending the same output, a Schnorr signature accepted through a cached ECDSA one with the same R and S, a non-empty signature that doesn't parse failing without the NULLFAIL error or a signature check counted, and token outputs in the coinbase or with an invalid prefix.
+- Fix a UTXO cache bug that could keep an output unspent after a block spent it, when a reorg or `invalidateblock` removed the block that first mined its transaction and a block after the reorg mined it again, so the node would accept a block spending the output a second time, which BCHN rejects.
+- Fix a CashTokens consensus bug allowing fungible token inflation. Per-category amount sums could overflow and wrap around, so BCHD accepted transactions that BCHN rejects.
+- Fix a remotely triggerable crash on a bloom filter with no data, and merkle block matching whose time grew exponentially with a block's chains of transactions (gcash/bchutil#50). Fix a crash on compact blocks with invalid prefilled transaction indexes.
+- Address decoding, which RPC, websocket and gRPC clients can reach, took time quadratic in the input's length; input over 130 characters is now refused before decoding. A block holding a long chain of transactions no longer stalls a `--slpindex` node for time quadratic in the chain's length.
+- Fix a remotely triggerable crash in 32-bit builds on an SLP script with a malformed push length, reachable through the SLP index and the gRPC SLP calls.
+- With `--slpgraphsearch`, a graph search through a token whose graph held a chain of about 2.2 million sends, or 0.9 million in 32-bit builds, stopped the node, as the search recursed once per transaction past Go's stack limit; it now keeps a stack of its own.
+- Fix gRPC authentication with `--prometheus`, where every handler ran before the `--grpcauthtoken` check.
+- `--profile` with a bare port served its unauthenticated pages on every interface, and they show the command line, which can hold the RPC password. It now listens on localhost.
+- Fix many consensus, P2P, RPC and gRPC robustness issues in addition to the items above, and bound what peers and clients can make the node hold or compute, such as tracked requests, the signature hash cache, websocket notification queues, double spend proof lookups and `gettxoutproof`'s work. P2P messages are now allocated by the bytes actually received, and the ban list and peer limits apply as soon as a connection is accepted, as in BCHN.
+- Build with Go 1.26.9 or newer, or 1.27.2 or newer: the gRPC server's HTTP/2 comes from the Go standard library, and those releases carry its HTTP/2 fixes. The `golang.org/x/net` update brings five HTTP/2 fixes to the gRPC client in `bchrpc/proxy`.
+- The RPC server and rpcclient use `gorilla/websocket` v1.5.3 instead of `btcsuite/websocket`, a 2015 snapshot of it that lacks its later fixes, such as v1.4.1's frame-length check.
+- A 32-bit build with an `--excessiveblocksize` of about 244 MB or more could be crashed by a peer sending or claiming a message over 1 GiB, and at 512 MB or more any build could send or receive no message at all. The block message limit now stops at 2 GB, ABLA's maximum.
+- Bound how many gRPC subscriptions and calls clients hold at once, and what a subscription's filter holds; any client could open them without limit, as gRPC needs no token unless `--grpcauthtoken` is set.
+
+### Build & Packaging
+
+- Go 1.26 is required to build, and 1.26.9 or 1.27.2 or newer for the gRPC server's HTTP/2 fixes. Release binaries should use Go 1.27.2 or newer.
+- Publish the Docker image for `linux/riscv64` too, and update dependencies.
+- Serve gRPC-Web with `github.com/traefik/grpc-web` v0.18.0, a maintained fork of `improbable-eng/grpc-web`, whose `nhooyr.io/websocket` dependency's domain no longer resolves, so bchd's modules can again be fetched without proxy.golang.org (#761).
+- Replace the archived `go-grpc-prometheus` with an in-tree gRPC metrics interceptor, which exports the same metric names, help strings and labels with `--prometheus`.
+- Regenerate `bchrpc/pb` with protoc-gen-go v1.36.11, protoc-gen-go-grpc v1.6.2 and grpc-gateway v2.29.0, from one `bchrpc/regen.sh` with the plugins pinned as go.mod tools, so the deprecated `github.com/golang/protobuf` is no longer a dependency.
+- Build release binaries for `linux/arm64` and `darwin/arm64` too.
+- Stop building plan9 release binaries.
+
+### Other
+
+- Stricter cashaddr validation and the correct network for pay-to-pubkey addresses (gcash/bchutil#48, gcash/bchutil#49).
+- SOCKS5 proxies, for P2P dials, `bchctl`, rpcclient and the fast sync download, are dialed with an in-tree client on `golang.org/x/net/proxy` instead of `btcsuite/go-socks`, so the dial timeout covers the handshake and a malformed proxy reply returns an error (#757).
+- The exported `addrmgr` and `peer` APIs use the new `wire.NetAddressV2` type, as btcd did.
+- `txscript.GetScriptClass` and `ExtractPkScriptAddrs` recognize P2PK and multisig only in BCHN's forms, so the address index and address filters no longer match outputs written any other way.
+- `bchec` no longer verifies ECDSA signatures over an empty hash, as Go 1.27's `crypto/ecdsa` does.
+- The unknown block version warning ignores the BIP320 version-rolling bits, so ASICBoost blocks no longer trigger it.
+- The sync progress line shows 100% as soon as the node catches up, instead of at the next block.
+- P2SH32 addresses in legacy form decode, as in BCHN, and an SLP P2SH32 address in token-aware form, which SLP does not have, is refused (gcash/bchutil 83c74af).
+- `txscript.ExtractRedeemScript` and `CalcScriptInfo` return an error for an empty signature script instead of panicking.
+- `database.Tx` has a new method, `FetchBlockSize`, which gives a stored block's size without reading the block, also after the block was pruned.
+- The ABLA auto-configuration line is logged at debug level, as in BCHN, instead of printed to standard error at every start.
+- The JSON-RPC and gRPC servers' own HTTP errors go to bchd's log, under RPCS and GRPC, instead of to standard error in Go's format. A TLS handshake a client drops, as port checks do, is logged at debug level, as BCHN logs its HTTP server's connection events.
+- Go programs that import `bchrpc/pb` get code from protoc-gen-go v1.36.11 and protoc-gen-go-grpc v1.6.2, which no longer imports `github.com/golang/protobuf` and needs grpc-go 1.64 or newer; the streaming types keep their old names as aliases. `UnimplementedBchrpcServer` now has value methods, so embed it by value: `RegisterBchrpcServer` panics on a nil embedded pointer. `RegisterBchrpcHandlerFromEndpoint` connects with `grpc.NewClient`, which resolves the endpoint with the dns resolver and ignores `grpc.WithBlock`.
+- Fast sync no longer leaves a goroutine running after the UTXO set is verified, and its progress line reads the byte count without a data race.
+- `blockchain.CheckTransactionVersion` is exported. txscript has 19 new error codes named after BCHN's script errors, such as `ErrMinimalNumber` and `ErrNumberRange64Bit`, which the engine returns instead of `ErrNumberTooBig`, `ErrNumberTooSmall`, `ErrIntegerOverflow`, `ErrMinimalData`, `ErrInvalidIndex` and others where BCHN tells failures apart. `NewEngine` accepts a pay-to-script-hash input script that is not push only, and `Execute` refuses it. netsync's `PeerNotifier` interface gains `Misbehaving`, which implementations must add, and `SyncManager` gains `QueueCompactBlock`. `blockchain.Config` gains `NotifyMaxBlockSizeLookAhead` and wire gains `SetMaxBlockSizeLookAhead`; `wire.MaxCFilterDataSize` is now the floor of the cfilter limit, which follows the block limit. `indexers.ErrAddrHistoryChanged`, slpgraphsearch's `Db.Count`, `BlockChain.DisconnectCount` and `bchrpc.GrpcServerConfig.AuthRequired` are new; with `AuthRequired` false, a program embedding the gRPC server gets the per-client subscription share. `indexers.SlpCache.RemoveTokenMetadata` takes the confirming MINT's hash, and `netsync.SyncManager.SyncHeight` is answered by the block handler.
+
+### Upgrade notes
+
+- **Address index.** Nodes with `--addrindex` rebuild the address index on first start. This is very slow: every block is read and indexed again, and the node does not sync or serve RPC or gRPC until it is done. After downgrading to an earlier release with `--addrindex` and upgrading again, start once with `--dropaddrindex`, which exits when done, then with `--addrindex` to rebuild it; this release cannot tell which blocks the earlier one indexed.
+- **SLP index.** Earlier releases misread SLP amounts of 2^31 base units or more on 32-bit platforms, so the SLP index there can hold wrong token validity. Start once with `--dropslpindex`, which exits when done, then with `--slpindex` to rebuild it. On any platform an index can also hold a zero-amount SEND, or after a reorg and a restart a token's metadata, under another token's internal ID, which the same rebuild fixes.
+- **ABLA state.** The stored ABLA states are rebuilt once on first start, without a reindex. It works from the block sizes the database keeps, pruned blocks included, and also reads a block large enough to move the state, in case an earlier release stored it with extra bytes, so the rebuild stays quick at today's block sizes.
+- **Regtest.** Regtest chains made by earlier releases follow the old rules and can fail on a reorg or reindex; start regtest nodes from an empty data directory.
+- **Fees.** Free transactions are no longer relayed or mined. Every new transaction must pay `--minrelaytxfee`, and a node set to 0 refuses to start. The four deprecated options still parse, with a warning, for this release.
+- **`sendrawtransaction`.** Fees above 0.1 BCH need `allowhighfees` or a higher `--maxtxfee`. Transactions that break a blockchain rule, such as a failed script, now return -26 instead of -25; missing inputs still return -25. The -26 message starts with BCHN's reason instead of `TX rejected:`.
+- **`createrawtransaction`.** The token category is now read in txid byte order, as `tokenData` reports it. The token amount may be a JSON integer or a string, as in BCHN. Transactions are now version 2, so the same request gives a different txid, and null arguments or an input without `vout` are refused.
+- **Integer parameters.** JSON-RPC parameters are now passed on exactly as sent, so integer parameters must be written as integers: `1.0` or `1e3` is rejected, as in BCHN, rather than read as `1` or `1000`.
+- **Script type names.** Clients parsing `type` or `script_class` will see `scripthash` for P2SH32 and `script` for pay to script outputs. Data carriers over 223 bytes were `nonstandard`; they are now `nulldata` in `type` and `datacarrier` in `script_class`. Scripts that do not parse now have a `script_class` of `script` or `nonstandard` instead of an empty one. JSON-RPC shows the public key of a P2PK or multisig output as the cashaddr of its key hash. P2PK and multisig follow BCHN's templates too, so a key pushed with `OP_PUSHDATA1` or with a malformed first byte makes the output `script` or `nonstandard`, with no addresses.
+- **Connections.** Websocket clients using `authenticate` must send it within `--rpcauthtimeout`, and a websocket client that takes less than 64 KiB in 30 s while a message waits for it, or falls more than 64 MiB behind on notifications, is disconnected. Inbound connections still in the handshake count toward the peer limits, and `--maxpeers` keeps `--targetoutboundpeers` slots for outbound peers, so at the defaults at most 117 inbound peers are accepted.
+- **`gettxout`.** With the mempool included, an output a mempool transaction spends is now null, and an index past a mempool transaction's outputs is null instead of error -5.
+- **gRPC limits.** A public gRPC server with more than 100 subscribers, more than 16 calls in progress and 64 waiting, or a client watching more than 100,000 entries in one subscription, needs `--grpcmaxsubscriptions`, `--grpcmaxconcurrentcalls` or `--grpcmaxfilterentries`. A gRPC client that takes less than 64 KiB of a reply in 30 s has its call reset, and one whose socket takes nothing for 30 s is disconnected. Address filters now match spends of confirmed outputs without `--txindex`. `GetAddressTransactions` gives an unconfirmed transaction's `fee_per_kb` per kB, 1000 times the per-byte value 0.22.2 gave. A request whose client sends less than 64 KiB of it in 30 s is ended, a server sending more than 512 MiB of replies at once resets those whose clients have taken no 64 KiB part of them in the last 2 s and closes the connection of a client that does not read its socket, and `GetAddressUnspentOutputs` fails with `Aborted` when the chain reorganizes during the call; call it again. Without `--grpcauthtoken`, one client address, or IPv6 /56, may hold at most a quarter of `--grpcmaxsubscriptions`; a server behind a proxy that connects from a public address sees all its clients as one, so raise `--grpcmaxsubscriptions` fourfold or connect the proxy from a private address.
+- **Reject codes.** Dust, undersized transactions, transactions over their sigchecks limit and scripts that fail only standardness flags are refused with code 64 instead of 16 or 65, in `testmempoolaccept`, the -26 message and P2P rejects, with BCHN's reasons.
+- **`searchrawtransactions`.** A count above 10,000 is refused with -8, so page through results in steps of at most 10,000.
+- **Memory.** `--gcpercent` now defaults to 50, where 0.22.2 fixed the garbage collector's target at 10, so garbage collection takes less CPU and bchd uses more memory, most of all during a sync. A node short of memory can set `gcpercent=10`, as before, or a limit with `GOMEMLIMIT`.
+- **Database errors.** A database error while processing a block now stops the node, as BCHN does, instead of letting it run on without the data.
+- **Spent outputs after a reorg.** Earlier releases could keep an output in the UTXO set after a block spent it, when a reorg or `invalidateblock` removed the block that first mined its transaction, a block after the reorg mined it again, and a later block spent it before the next UTXO flush. Such an output stays until the UTXO set is rebuilt, so a node whose log shows `REORGANIZE` lines can start once with `--reindexchainstate` to rebuild it. A pruned node, or one that ever ran a fast sync, can't re-index; to rebuild its UTXO set, sync it again from an empty data directory.
+- **Bans.** A peer that sends a transaction breaking a consensus rule, or an invalid block it was asked for, now gets BCHN's score for the rule, 100 for most. bchd bans above `--banthreshold`, 100 by default, so one such failure plus any further misbehavior bans the peer for `--banduration`. Transactions add nothing while the node syncs. Whitelisted and persistent peers are spared, and `--nobanning` turns bans off.
+- **Requests without an id.** HTTP JSON-RPC requests without an id or with a null id, JSON-RPC 2.0 notifications included, now run and get a reply with `"id":null`, as in BCHN; they used to be ignored.
+- **btcjson.** Go programs that decode requests with btcjson get a numeric id as a `json.Number` and a bool, object or array id as a `json.RawMessage`.
+- **txscript.** Go programs that check txscript error codes for script failures should check the new codes: a number too long is `ErrNumberRange32Bit`, `ErrNumberRange64Bit` or `ErrNumberRangeBigInt`, a number not minimally encoded `ErrMinimalNumber`, division by zero `ErrDivByZero`, and an introspection index `ErrInvalidTxInputIndex` or `ErrInvalidTxOutputIndex`; the txscript error codes list the other splits. btcjson's `TransactionOutputCashToken` marshals with lowercase field names and leaves out an empty capability and commitment.
+- **`--profile`.** A bare port now listens on 127.0.0.1. Use `0.0.0.0:port` or `:port` to listen on every interface as before.
+- **Mining.** `submitblock` failures return a BIP22 reason instead of `rejected: <error>`, and `submitblock` and block proposals now use BCHN's reason strings, for example `bad-cb-amount` instead of `bad-cb-value` and `bad-version(0x00000002)` instead of `bad-version`. Templates follow the network's block size limit as ABLA grows it; a larger `excessiveblocksize` no longer makes them bigger or loosens validation, except on regtest and simnet.
+- **Finalization.** Blocks 10 deep that have been known for two hours are final once the chain has the network's minimum chain work, so reorgs deeper than that are refused. Recover with `invalidateblock` on the node's own chain, or start with `--maxreorgdepth=-1`.
+- **`peers.json`** moves to a new format; downgrading discards it and the address list refills from seeds.
+- **Addresses.** 0.22.2 reported P2SH32 outputs with a wrong address, so clients that stored addresses from it should read those again. Address decoding is stricter (gcash/bchutil#48), so a `--miningaddr` in a form it now refuses stops the node at startup. `validateaddress` shows a legacy address as its cashaddr.
+- **Unclean shutdown after a reorg.** If 0.22.2 stopped uncleanly after a reorg, before its next UTXO flush, it failed on every start since, and 0.22.3 stops with `mismatched spend journal serialization`. Start once with `--reindexchainstate` to rebuild the UTXO set. A pruned node, or one that ever ran a fast sync, can't re-index; to rebuild its UTXO set, sync it again from an empty data directory.
+- **Downgrading during a reindex.** Let an interrupted `--reindexchainstate` finish before downgrading. Earlier releases don't resume it: they roll back every block above the point it reached and replay them, the whole chain if it was still deleting the old set.
+
+## 0.22.2 (2026-07-25)
+
+### Consensus & Network
+
+- Only arm a peer stall deadline for a `getblocks` with a non-zero stop hash. An open-ended `getblocks` needs no reply, so the deadline disconnected honest, fully-synced peers (btcsuite/btcd#1317).
+- Stop replying to `getblocks` with an empty `notfound` when pruned.
+- Fix a hang on shutdown caused by a blocking queue send to a peer that had already quit.
+- Always signal the send completion channel when serving a merkle block, which could otherwise wedge a peer's input handler.
+- Fix two data races in the connection manager on `ConnReq.Addr`.
+- Log a warning when a transaction is relayed to no peer, which happens when its fee rate is below every peer's fee filter.
+
+### Mining
+
+- Pad the coinbase to the minimum transaction size enforced at the block height. Block generation was permanently broken on regtest above height 1000 and simnet above 3000.
+- Set the Upgrade9 behavior flag in `CheckConnectBlockTemplate`, which rejected valid CashToken transactions in `getblocktemplate`.
+
+### RPC & gRPC
+
+- Match transaction subscriptions on the address funding an input, so spends of outputs the subscription did not watch arrive now notify. Confirmed parents require `--txindex`.
+- Report the missing parent rather than "already have transaction" when submitting a transaction held in the orphan pool, matching BCHN.
+- Make the `estimatefee` `nblocks` parameter optional, matching BCHN and Bitcoin ABC 0.19.1.
+
+### Database
+
+- Fix a panic when a block rolls the block store over to a new flat file. The panic was recovered while the file lock was held, leaving the database wedged rather than crashing.
+
+### Security
+
+- Fix a CashTokens consensus rule violation allowing minting NFT forgery. The authorization check shared one flag across all output categories, so a single authorized minting output authorized every other one in the same transaction. Reported by 0xaudron.
+- Fix a remotely triggerable crash in the committed filter handlers, which dereferenced a missing index. `--fastsync` also advertised `NODE_CF` without maintaining one.
+- Reject raw transactions with trailing bytes in `decoderawtransaction` and `sendrawtransaction`, which were previously discarded and the transaction relayed.
+
+### Build & Packaging
+
+- Publish the Docker image to GHCR on each release tag.
+- Rewrite the deprecated `io/ioutil` usage go-bindata emits, with a `make bindata` target so it survives regeneration.
+- Update dependencies, including `google.golang.org/grpc`, `golang.org/x/crypto`, and `golang.org/x/net`.
+
+### Other
+
+- Export `bchec.ErrInvalidSquareRoot` for use with `errors.Is`.
+- Modernize loops to range over integers, and adopt `slices.Backward` and `strings.Builder`.
+- Assert the CHIP-2021-05 hashing density limit in the VM limits tests, which previously carried a check that could never execute.
+- Fail rather than skip in the invalid VMB vector tests when a vector executes without error.
+- Fix flaky address manager tests by generating only routable addresses.
+
+## 0.22.1 (2026-06-30)
+
+### Consensus & Network
+
+- Remove the defunct `dnsseed.electroncash.de` DNS seed.
+
+### Mining
+
+- Include the Upgrade9 (CashTokens) script flags when building block templates. Templates were validated with the bare `StandardVerifyFlags`, so on token-active networks valid CashToken transactions were dropped from the template, producing empty or near-empty blocks.
+
+### Other
+
+- Modernize `sync/atomic` usage with the typed atomic APIs and adopt `WaitGroup.Go`.
+
+## 0.22.0 (2026-04-23)
+
+### Consensus & Network
+
+- Add network parameters and activation logic for the May 15, 2026 BCH upgrade (Upgrade12), gating the new script flags by activation time across chains.
+- Implement CHIP-2024-12 P2S (Pay to Script).
+- Implement CHIP-2025-05 Functions: function definition and invocation operations.
+- Implement CHIP-2021-05 Loops: bounded looping operations.
+- Implement CHIP-2025-05: re-enable the bitwise opcodes OP_INVERT, OP_2MUL, OP_2DIV, OP_LSHIFT, and OP_RSHIFT.
+- Align Upgrade12 consensus, policy, and VMB tests with BCHN, including corrected operation-cost accounting.
+
+### Security
+
+- Fix CVE-2018-17145 (inv-message memory-exhaustion denial-of-service vector).
+
+### Build & Packaging
+
+- Bump the Dockerfile to the latest Go release and trim the Docker build context.
+
+### Other
+
+- Add VMB (VM bytecode) test vectors for the May 2026 upgrade covering bitwise ops, loops, functions, and P2S.
+
+## 0.21.1 (2025-05-18)
+
+### Build & Packaging
+
+- Gzip test fixtures and ignore `node_modules` to dramatically reduce the module/package size, resolving "module source tree too large" errors when installing through the Go module proxy.
+
+## 0.21.0 (2025-05-13)
+
+### Consensus & Network
+
+- Implement CHIP-2021-05 VM Limits and CHIP-2024-07 BigInt high-precision arithmetic (the May 2025 "Upgrade 11"), adding VM limit constants, opcode cost accounting, big-integer script numbers, and activation rules (active by default on regtest and simnet) (#570).
+
+## 0.20.0 (2025-01-14)
+
+### Consensus & Network
+
+- Add full support for the BCH May 2023 network upgrade (Upgrade 9): native CashTokens, new token-aware opcodes, P2SH32 outputs, and updated transaction size limits (#545).
+- Implement ABLA (Adaptive Blocksize Limit Algorithm) for the dynamic block size limit, with state persisted to the database and a fixed-size config option (#545, #553).
+- Add chipnet support and bring TestNet4 onto the correct network magic bytes with updated chain parameters (#545).
+- Bump the P2P protocol version to 70016 and update DNS seeds to match BCHN, adding bchd.cash seeds.
+- Add support for receiving the `sendaddrv2` message from peers, including before verack (#554).
+- Fix a consensus incompatibility in `txscript.IsUnspendable` that diverged from other implementations and posed a fork/UTXO-commitment risk (#475).
+
+### Mempool & Policy
+
+- Actively prevent network discovery and outbound connections when running in regression-test (regnet) mode (#519).
+
+### RPC & gRPC
+
+- Add the `signrawtransactionwithkey` JSON-RPC method (#497).
+- Expose CashTokens token data and TestNet4 in the gRPC (bchrpc) API, and populate token data correctly across endpoints.
+- Increase RPC read/write timeouts to 5 minutes for expensive lookups (#515).
+
+### Wallet & Indexing
+
+- Fix an SLP graph indexer bug and correct SLP index map allocation.
+
+### Performance
+
+- Reduce map allocations during block processing and avoid slice reallocations in `processOrphans`.
+
+### Security
+
+- Fix an `opcodeCheckSig` bug where input token data was not passed to the BIP143 signature hash under certain conditions (#552).
+
+### Build & Packaging
+
+- Update to Go 1.23.4 and migrate CI from Travis to GitHub Actions.
+- Fix `bchctl` in the Dockerfile and update the Kubernetes deployment to handle certificates.
+
+### Bug Fixes
+
+- Fix a bug when cloning the script engine stacks used by `meep` (#506).
+
+## 0.19.0 (2022-05-05)
+
+### Consensus & Network
+
+- Implement the May 2022 BCH hard fork: 64-bit script integers, native introspection opcodes, and OP_MUL, with fork activation and new TestNet4 parameters (#499).
+
+### Mempool & Policy
+
+- Treat `OP_RETURN OP_1NEGATE` as a standard transaction (#476).
+
+### RPC & gRPC
+
+- Add HTTPS support to the gRPC proxy (#478).
+
+### Bug Fixes
+
+- Fix `NullDataScript` handling and standardness tests (#477).
+
+## 0.18.1 (2021-05-24)
+
+### Consensus & Network
+
+- Improve peer and sync-manager candidate selection, including a regtest `isSyncCandidate` fix (#470).
+- Isolate height checks in peer syncing (#471).
+
+### Wallet & Indexing
+
+- Guard against nil buckets in the address, cfilter, SLP, and tx indexers to prevent panics (#473).
+
+### Other
+
+- Promote select peer logging messages from trace to debug level (#469).
+
+## 0.18.0 (2021-05-12)
+
+### Consensus & Network
+
+- Avoid connecting to Bitcoin ABC nodes and prevent the connection manager from dialing duplicate addresses (#450).
+- Remove the dead `seed-bch.bitcoinforks.org` DNS seed (#443).
+- Add a clean-shutdown check in `updateSyncPeer` to avoid races during node shutdown (#442).
+
+### Mempool & Policy
+
+- Allow multiple OP_RETURN (null-data) outputs per transaction via a configurable policy (#467).
+
+### Mining
+
+- Add a `SignMuSig` function to the `bchec` package (#457).
+
+### RPC & gRPC
+
+- Add SLP gRPC/REST endpoints and fields: `GetParsedSlpScript`, `GetTrustedValidation`, `GetTokenMetadata`, and `CheckSlpTransaction` (with `DisableSlpBurnErrors`), plus SLP token metadata/addresses on `GetTransaction`, `GetUnspentOutput`, and the transaction subscription filters (#387, #458).
+- Validate SLP transactions by default in `SubmitTransaction` (clients must opt out via `skip_slp_validity_check`) to guard against accidental token burns (#387).
+- Add a gRPC-gateway REST/JSON proxy server (with CORS and no-cache middleware) and regenerated Swagger definitions for the bchrpc API (#387).
+- Return pubkey (P2PK) outputs from `GetAddressUnspentOutputs` (#432).
+
+### Wallet & Indexing
+
+- Add the SLP (Simple Ledger Protocol) token index, validating SLP/NFT1 token transactions (genesis, mint, send, mint-baton tracking, burn detection) with a new `--slpindex` config option (#387, #452).
+- Add SLP Graph Search, building a token transaction graph to support trusted client-side validation (#451).
+- Fix index-manager handling of indexers whose `StartBlock()` height is greater than 0, so SLP and other late-starting indexes sync correctly (#455).
+- Refuse to start an index on a pruned node (print an error and exit) and prevent a crash when SLP index initialization fails (#433).
+
+### Performance
+
+- Flush the UTXO cache during state reconstruction and correctly set `lastFlushHash` on init, with tests for a hard shutdown mid-flush (#445, #446, #447).
+
+### Build & Packaging
+
+- Add Prometheus metrics support and per-component shutdown logging (#453).
+- Add `darwin/arm64` (Apple Silicon) binary builds.
+- Add `RegressionTestAnyHost` and `RegressionTestNoReset` regtest options for Docker-based setups (#462).
+
+### Bug Fixes
+
+- Fix a panic in the fee estimator triggered by chain reorgs (#434).
+- Fix a crash related to unconfirmed NFT child tokens in the gRPC server (#387).
+
+## 0.17.1 (2020-12-08)
+
+### Consensus & Network
+
+- Update mainnet chain params for post-hardfork (ASERT) activation, and add post-fork params for testnet3, regtest, and simnet (#430).
+- Add a UTXO-set checkpoint hash and sources to the chain params.
+- Fix the DNS seeds list after the hard fork (#428).
+
+### RPC & gRPC
+
+- Add an `RPCAuthTimeout` option to configure the RPC auth timeout (#421).
+
+### Performance
+
+- Check for known inventory before relaying a compact block, avoiding redundant relays.
+
+### Build & Packaging
+
+- Build with Go 1.15.5 (#423).
+
+## 0.17.0 (2020-10-24)
+
+### Consensus & Network
+
+- Implement the aserti3-2d (ASERT) difficulty adjustment algorithm for the November 2020 BCH hard fork, and wire up its activation (#399, #402).
+- Select a new sync peer when the median of sync-peer candidates is ahead of us, improving recovery from stalled syncs (#411).
+
+### Mempool & Policy
+
+- Increase the maximum standard transaction size to 100k (#405).
+- Remove `ScriptVerifyMinimalIf` from the standard verification flags to match Bitcoin ABC policy (#413).
+
+### RPC & gRPC
+
+- Rebuild all protobuf bindings and document little-endian field formats in the gRPC comments (#394).
+- Add a Java protobuf package (`com.bchd.rpc`) for the bchrpc API (#396).
+
+### Build & Packaging
+
+- Build with Go 1.15.3; drop darwin/386 support (removed in Go 1.15) (#419).
+
+## 0.16.5 (2020-07-23)
+
+### Mempool & Policy
+
+- Default to disabling relay of free (very low fee) transactions (#383).
+
+### RPC & gRPC
+
+- Support cookie-based RPC authorization (#393).
+- Accept either int or bool for the verbosity argument in `getrawtransaction` and `searchrawtransactions` (#391).
+- Add a `getbalances` RPC client command and backport `getblock` verbosity fixes (#388, #389).
+- Return the version in `getnetworkinfo` in the same format as ABC/BCHN.
+- Remove custom HTTP handling so RPC connections support keep-alives (#384).
+
+### Security
+
+- Avoid a panic in `bchec` `fieldVal.SetByteSlice` for oversized inputs.
+- Fix a deadlock in `dynamicbanscore`.
+
+### Bug Fixes
+
+- Prevent a peer's last block height from going backwards (#392).
+
+### Other
+
+- Document that CIFS users must turn off async preemption (#390).
+
+## 0.16.4 (2020-07-06)
+
+### RPC & gRPC
+
+- Fix an off-by-one error in transaction confirmation counts in the gRPC API (#376).
+
+### Wallet & Indexing
+
+- Raise `MaxCFilterDataSize` to 2 MiB so larger compact filters can be served.
+
+## 0.16.3 (2020-06-10)
+
+### Consensus & Network
+
+- Fix a bug calculating sigcheck density (#374).
+
+## 0.16.2 (2020-05-19)
+
+### Consensus & Network
+
+- First-pass cleanup of pre-fork hard-fork code paths (#373).
+- Add a new fastsync checkpoint and update the testnet checkpoint hash.
+
+### RPC & gRPC
+
+- Remove sigops references from the RPC server results.
+
+## 0.16.1 (2020-05-15)
+
+### Consensus & Network
+
+- Fix bugs in OP_REVERSEBYTES and set the Phonon activation time in tests (#371).
+
+## 0.16.0 (2020-05-05)
+
+### Consensus & Network
+
+- Activate the May 2020 (Phonon) hard fork, with sigcheck accounting replacing sigop counting (#348, #360, #366).
+- Add the OP_REVERSEBYTES script opcode (#348).
+- Do not disconnect peers that send unknown commands; only warn in the logs (#369).
+- Remove dead/invalid DNS seeds and add back the bitcoinforks seeders (#337, #359, #364).
+
+### Mining
+
+- Update the mining package for the May 2020 hard fork (#348, #362).
+- Add a config option to set `CoinbaseFlags` in the block-template coinbase input (#340).
+
+### RPC & gRPC
+
+- Improve memory usage of the `GetAddressUnspentOutputs` RPC call (#332, #333).
+
+### Security
+
+- Add a first-pass MuSig implementation with session commitments (#334, #347).
+
+### Build & Packaging
+
+- Build with Go 1.14.2 and update all dependencies, including a new bchutil (#344, #365, #368).
+
+## 0.15.2 (2019-11-30)
+
+### Consensus & Network
+
+- Make verack part of the version handshake; add peers on `OnVerAck` rather than `OnVersion` to harden connection negotiation (#319, #320).
+- Add configurable user-agent filtering for peer connections (#318).
+
+### RPC & gRPC
+
+- Update `ParsePkScript` to support multiple networks (#317).
+- Guard against a nil request in `SubscribeTransactionStream` to prevent a crash (#324).
+- Warn instead of exiting when binding the RPC/gRPC server to a non-localhost address (#314).
+
+### Performance
+
+- Skip transaction rescan when the client has subscribed to no addresses or UTXOs (#321).
+
+### Build & Packaging
+
+- Add a sample bchd systemd service unit.
+
+## 0.15.1 (2019-11-17)
+
+### Consensus & Network
+
+- Fix a consensus bug in OP_CHECKMULTISIG where the dummy stack element was not copied correctly (#311).
+- Update checkpoints with the new (Graviton) hard-fork parameters (#310).
+- Add the `testnet-seed.bchd.cash` DNS seed (#309).
+
+### Performance
+
+- Improve initial block download and syncing performance (#307).
+- Allow `wire.MsgTx` objects to be garbage-collected before the UTXO cache is flushed, reducing memory use (#292).
+
+### Security
+
+- Copy `pkScript` in `addTxOut` and `disconnectTransactions` to prevent UTXO data corruption (#293).
+- Add a notification lock to guard against a double unlock (#308).
+
+### Build & Packaging
+
+- Switch the Docker image to a multi-stage build (#301).
+
+## 0.15.0 (2019-10-21)
+
+### Consensus & Network
+
+- Add the November 2019 (Graviton) hard-fork rules (#284).
+
+### RPC & gRPC
+
+- Match bitcoind's RPC error codes when rejecting transactions (#278).
+- Fix a gRPC bug returning unspent outputs and refactor `GetUnspentOutput` to match the JSON-RPC code (#281, #282).
+- Check spent status in the mempool when returning unspent outputs (#286).
+
+### Wallet & Indexing
+
+- Migrate the committed-filter (cfindex) index to version 2; disable cfindex in fastsync mode and skip migration when the chain is pruned (#288).
+
+## 0.14.7 (2019-08-20)
+
+### RPC & gRPC
+
+- Add the `GetMempool` gRPC method to retrieve the full mempool (#270).
+- Add the `GetUnspentOutput` gRPC method and a `mempool` flag on `GetAddressUnspentOutputs` to include unconfirmed UTXOs (#267).
+- Add streaming raw (serialized) transaction and block subscriptions to gRPC (#273, #274).
+- Add median time to gRPC `BlockInfo` and fix median time in `GetBlockchainInfo` (#271).
+- Add batched JSON-RPC 2.0 request support, and accept boolean verbosity in `getblock` (ElectrumX compatibility).
+- Regenerate gRPC bindings, adding a Python library and updated JS (#275).
+
+### Build & Packaging
+
+- Convert the project from `dep` to Go modules (#266).
+
+### Bug Fixes
+
+- Ensure downstream peers receive new blocks accepted via reorg of previously-orphaned blocks (#265).
+- Only scan `.fdb` files when loading the block database, ignoring stray files (#258).
+
+## 0.14.6 (2019-06-15)
+
+### Consensus & Network
+
+- Fix `OP_NUM2BIN` to pop a byte array off the stack (matching Bitcoin ABC) rather than a scriptnum (#253).
+
+## 0.14.5 (2019-06-13)
+
+### Consensus & Network
+
+- Fix a bug in Schnorr signature validation by normalizing field values before comparison (#250).
+
+### Mempool & Policy
+
+- Increase `DefaultBlockPrioritySize` to 1,600,000 bytes (#238).
+
+### Mining
+
+- Increase the default mining block size (`blockmaxsize`) to ~32 MB (#240).
+- Fix block-template generation so coinbase padding no longer drops the coinbase below the 100-byte minimum (#238).
+
+### RPC & gRPC
+
+- Implement the `getnetworkinfo` JSON-RPC call (#241).
+- Fix CORS preflight (OPTIONS) handling for grpc-web (#243).
+- Generate grpc-web JavaScript client libraries (#248).
+
+### Performance
+
+- Set the fast-sync worker count based on `runtime.NumCPU()` (#251).
+
+## 0.14.4 (2019-05-26)
+
+### Consensus & Network
+
+- Activate the GreatWall (May 15, 2019) hard fork at block height 582679, enforcing the Schnorr and SegWit-recovery script flags, and add a checkpoint at the fork block (#230).
+- Switch transaction-signing functions to Schnorr and add `ScriptVerifySchnorr` to the standard verify flags (#228).
+
+### RPC & gRPC
+
+- Fix `GetAddressUnspentOutputs` to return all UTXOs for an address instead of only the last 100 (#225).
+
+### Build & Packaging
+
+- Expose the database cache size and flush interval as config options (#232).
+
+### Bug Fixes
+
+- Override the UTXO cache entry (using a clone) in the reorg case so spent/unspent transitions are applied correctly (#234).
+
+## 0.14.3 (2019-05-03)
+
+### RPC & gRPC
+
+- Add a new bchrpc gRPC API server with full node and wallet query support, gRPC-Web via protocol multiplexing for browser clients, CORS, and server reflection (#217, #222).
+- Add spent-output (stxo) metadata to transaction input responses (#217).
+- Add API, client-usage, and wallet-operation documentation (#217).
+
+### Bug Fixes
+
+- Fix `GetMerkleProof` returning incorrect proofs (#217).
+- Fix `GetAddressTransactions` and fetch address transactions in reverse order (#217).
+- Fix a bug subscribing to blocks (#217).
+
+## 0.14.2 (2019-04-17)
+
+### Consensus & Network
+
+- Update segwit-recovery handling to the latest May 2019 hard-fork spec (#216).
+- Fix a bug in OP_NUM2BIN (#215).
+
+### Mempool & Policy
+
+- Add the `invalidateblock` RPC and set flags on ancestors of invalidated blocks (#214, #218).
+
+### RPC & gRPC
+
+- Fix `getinfo` to return the correct protocol version (#212).
+
+### Wallet & Indexing
+
+- cfindex no longer requires transaction inputs to build filters (#213).
+
+## 0.14.1 (2019-04-10)
+
+### Consensus & Network
+
+- Fix a bug in OP_CAT and allow multiple data pushes in OP_RETURN (#210, #211).
+- Add `ScriptVerifyCheckDataSig` to the standard verify flags (#206).
+
+### Performance
+
+- Add compact block (BIP152) relay and processing support, including `sendcmpct`/`getblocktxns` handling and direct block relay to requesting peers (#197).
+- Use the hashcache for script validation where possible (#208).
+
+### Wallet & Indexing
+
+- Update bchutil to the new compact-filter format and add indexer database migrations (#204, #209).
+
+## 0.14.0 (2019-03-21)
+
+### Consensus & Network
+
+- Implement the May 2019 BCH hard fork (Great Wall): activation, tests, and the `ScriptVerifyAllowSegwitRecovery` flag (#192).
+- Add Schnorr signature support in the `bchec` package and wire OP_CHECKSIG/OP_CHECKDATASIG to accept Schnorr signatures (#180).
+- Fix `MaxBlockSigOps` enforcement so the sigop limit scales per-MB of block size with accurate byte counting (#193).
+- Fix bugs in UTXO rollback and `InitConsistentState` so the chain rolls back correctly (#174, #181).
+
+### Wallet & Indexing
+
+- Add `GetCFMempool` for compact block filters over the mempool (#190, #195).
+
+### Performance
+
+- Improve reliability of the FastSync UTXO-set download, add SOCKS5 proxy support, and show download progress (#188, #189, #198).
+
+## 0.13.0 (2018-12-18)
+
+### Overview
+
+- Initial bchd release, a full Bitcoin Cash node forked from btcd 0.12.x.
+
+### Consensus & Network
+
+- Bitcoin Cash network parameters: BCH network magic and Bitcoin Cash DNS seeds (#15).
+- UAHF support: enforce the must-be-big block consensus rule and replay-protected `SIGHASH_FORKID` signature hashing with BIP143-style digests (#22).
+- New difficulty adjustment: implement the legacy EDA and the November 2017 DAA, with per-network activation heights.
+- May 2018 hard fork rules.
+- November 2018 Magnetic Anomaly hard fork: canonical transaction ordering (CTOR) enforced in block sanity checks plus new script verification flags, with configurable activation (#26, #135).
+- Remove SegWit, keeping consensus aligned with the Bitcoin Cash chain (#16).
+- Add an ECMH multiset implementation (`bchec`) as the basis for UTXO set commitments (#156).
+- Configurable excessive block size (`--excessiveblocksize`) defaulting to 32 MB, with `EB` signaling advertised in the user-agent string (#118, #151).
+
+### Mempool & Policy
+
+- Magnetic Anomaly mempool activation, including one-transaction-input (OTI) ordering validation during fast block acceptance.
+
+### Mining
+
+- Block templates honor the configured excessive block size for `addblock` and mining (#118).
+
+### RPC & gRPC
+
+- Add `reconsiderblock` and `invalidateblock` RPCs for manual chain reorganization (#136).
+- Add `gettxoutproof` and `verifytxoutproof` RPCs (and matching rpcclient helpers) (#153).
+
+### Wallet & Indexing
+
+- cashaddr address format support throughout the node, used as the default Bitcoin Cash address encoding (#28).
+- Optional transaction index and address index for serving lite-client and block-explorer queries.
+
+### Performance
+
+- In-memory UTXO cache to speed up block validation (#21).
+- Optional block-file pruning to reduce on-disk storage (#126).
+- Fast-sync mode that downloads a committed UTXO set instead of replaying all historical blocks (#158, #164).
+
+### Build & Packaging
+
+- Dockerfile for easy node setup and Kubernetes deployment manifests (#39).
+- Travis-based release builds and a published security-disclosure policy (#62, #65).
+
+### Bug Fixes
+
+- Fix testnet difficulty calculation after the DAA hard fork (#37).
+- Fix a UTXO-set reorganization bug (#162).
+- Correct `ExcessiveBlockSize` handling in the `addblock` utility (#118).
+
+---
+
+# Legacy btcd changelog (pre-fork)
+
+> The entries below predate the Bitcoin Cash fork. They are the upstream
+> [btcd](https://github.com/btcsuite/btcd) changelog (0.3.0-alpha through
+> 0.12.0), preserved verbatim for historical reference. bchd forked from
+> btcd 0.12.x; see the **0.13.0** entry above for the start of bchd's own
+> history.
+
+Changes in 0.12.0 (Fri Nov 20 2015)
+
+- Protocol and network related changes:
+  - Add a new checkpoint at block height 382320 (#555)
+  - Implement BIP0065 which includes support for version 4 blocks, a new
+    consensus opcode (OP_CHECKLOCKTIMEVERIFY) that enforces transaction
+    lock times, and a double-threshold switchover mechanism (#535, #459,
+    #455)
+  - Implement BIP0111 which provides a new bloom filter service flag and
+    hence provides support for protocol version 70011 (#499)
+  - Add a new parameter --nopeerbloomfilters to allow disabling bloom
+    filter support (#499)
+  - Reject non-canonically encoded variable length integers (#507)
+  - Add mainnet peer discovery DNS seed (seed.bitcoin.jonasschnelli.ch)
+    (#496)
+  - Correct reconnect handling for persistent peers (#463, #464)
+  - Ignore requests for block headers if not fully synced (#444)
+  - Add CLI support for specifying the zone id on IPv6 addresses (#538)
+  - Fix a couple of issues where the initial block sync could stall (#518,
+    #229, #486)
+  - Fix an issue which prevented the --onion option from working as
+    intended (#446)
+- Transaction relay (memory pool) changes:
+  - Require transactions to only include signatures encoded with the
+    canonical 'low-s' encoding (#512)
+  - Add a new parameter --minrelaytxfee to allow the minimum transaction
+    fee in BTC/kB to be overridden (#520)
+  - Retain memory pool transactions when they redeem another one that is
+    removed when a block is accepted (#539)
+  - Do not send reject messages for a transaction if it is valid but
+    causes an orphan transaction which depends on it to be determined
+    as invalid (#546)
+  - Refrain from attempting to add orphans to the memory pool multiple
+    times when the transaction they redeem is added (#551)
+  - Modify minimum transaction fee calculations to scale based on bytes
+    instead of full kilobyte boundaries (#521, #537)
+- Implement signature cache:
+  - Provides a limited memory cache of validated signatures which is a
+    huge optimization when verifying blocks for transactions that are
+    already in the memory pool (#506)
+  - Add a new parameter '--sigcachemaxsize' which allows the size of the
+    new cache to be manually changed if desired (#506)
+- Mining support changes:
+  - Notify getblocktemplate long polling clients when a block is pushed
+    via submitblock (#488)
+  - Speed up getblocktemplate by making use of the new signature cache
+    (#506)
+- RPC changes:
+  - Implement getmempoolinfo command (#453)
+  - Implement getblockheader command (#461)
+  - Modify createrawtransaction command to accept a new optional parameter
+    'locktime' (#529)
+  - Modify listunspent result to include the 'spendable' field (#440)
+  - Modify getinfo command to include 'errors' field (#511)
+  - Add timestamps to blockconnected and blockdisconnected notifications
+    (#450)
+  - Several modifications to searchrawtranscations command:
+    - Accept a new optional parameter 'vinextra' which causes the results
+      to include information about the outputs referenced by a transaction's
+      inputs (#485, #487)
+    - Skip entries in the mempool too (#495)
+    - Accept a new optional parameter 'reverse' to return the results in
+      reverse order (most recent to oldest) (#497)
+    - Accept a new optional parameter 'filteraddrs' which causes the
+      results to only include inputs and outputs which involve the
+      provided addresses (#516)
+  - Change the notification order to notify clients about mined
+    transactions (recvtx, redeemingtx) before the blockconnected
+    notification (#449)
+  - Update verifymessage RPC to use the standard algorithm so it is
+    compatible with other implementations (#515)
+  - Improve ping statistics by pinging on an interval (#517)
+- Websocket changes:
+  - Implement session command which returns a per-session unique id (#500,
+    #503)
+- btcctl utility changes:
+  - Add getmempoolinfo command (#453)
+  - Add getblockheader command (#461)
+  - Add getwalletinfo command (#471)
+- Notable developer-related package changes:
+  - Introduce a new peer package which acts a common base for creating and
+    concurrently managing bitcoin network peers (#445)
+  - Various cleanup of the new peer package (#528, #531, #524, #534,
+    #549)
+  - Blocks heights now consistently use int32 everywhere (#481)
+  - The BlockHeader type in the wire package now provides the BchDecode
+    and BchEncode methods (#467)
+  - Update wire package to recognize BIP0064 (getutxo) service bit (#489)
+  - Export LockTimeThreshold constant from txscript package (#454)
+  - Export MaxDataCarrierSize constant from txscript package (#466)
+  - Provide new IsUnspendable function from the txscript package (#478)
+  - Export variable length string functions from the wire package (#514)
+  - Export DNS Seeds for each network from the chaincfg package (#544)
+  - Preliminary work towards separating the memory pool into a separate
+    package (#525, #548)
+- Misc changes:
+  - Various documentation updates (#442, #462, #465, #460, #470, #473,
+    #505, #530, #545)
+  - Add installation instructions for gentoo (#542)
+  - Ensure an error is shown if OS limits can't be set at startup (#498)
+  - Tighten the standardness checks for multisig scripts (#526)
+  - Test coverage improvement (#468, #494, #527, #543, #550)
+  - Several optimizations (#457, #474, #475, #476, #508, #509)
+  - Minor code cleanup and refactoring (#472, #479, #482, #519, #540)
+- Contributors (alphabetical order):
+  - Ben Echols
+  - Bruno Clermont
+  - danda
+  - Daniel Krawisz
+  - Dario Nieuwenhuis
+  - Dave Collins
+  - David Hill
+  - Javed Khan
+  - Jonathan Gillham
+  - Joseph Becher
+  - Josh Rickmar
+  - Justus Ranvier
+  - Mawuli Adzoe
+  - Olaoluwa Osuntokun
+  - Rune T. Aune
+
+Changes in 0.11.1 (Wed May 27 2015)
+
+- Protocol and network related changes:
+  - Use correct sub-command in reject message for rejected transactions
+    (#436, #437)
+  - Add a new parameter --torisolation which forces new circuits for each
+    connection when using tor (#430)
+- Transaction relay (memory pool) changes:
+  - Reduce the default number max number of allowed orphan transactions
+    to 1000 (#419)
+  - Add a new parameter --maxorphantx which allows the maximum number of
+    orphan transactions stored in the mempool to be specified (#419)
+- RPC changes:
+  - Modify listtransactions result to include the 'involveswatchonly' and
+    'vout' fields (#427)
+  - Update getrawtransaction result to omit the 'confirmations' field
+    when it is 0 (#420, #422)
+  - Update signrawtransaction result to include errors (#423)
+- btcctl utility changes:
+  - Add gettxoutproof command (#428)
+  - Add verifytxoutproof command (#428)
+- Notable developer-related package changes:
+  - The btcec package now provides the ability to perform ECDH
+    encryption and decryption (#375)
+  - The block and header validation in the blockchain package has been
+    split to help pave the way toward concurrent downloads (#386)
+- Misc changes:
+  - Minor peer optimization (#433)
+- Contributors (alphabetical order):
+  - Dave Collins
+  - David Hill
+  - Federico Bond
+  - Ishbir Singh
+  - Josh Rickmar
+
+Changes in 0.11.0 (Wed May 06 2015)
+
+- Protocol and network related changes:
+  - **IMPORTANT: Update is required due to the following point**
+  - Correct a few corner cases in script handling which could result in
+    forking from the network on non-standard transactions (#425)
+  - Add a new checkpoint at block height 352940 (#418)
+  - Optimized script execution (#395, #400, #404, #409)
+  - Fix a case that could lead stalled syncs (#138, #296)
+- Network address manager changes:
+  - Implement eclipse attack countermeasures as proposed in
+    http://cs-people.bu.edu/heilman/eclipse (#370, #373)
+- Optional address indexing changes:
+  - Fix an issue where a reorg could cause an orderly shutdown when the
+    address index is active (#340, #357)
+- Transaction relay (memory pool) changes:
+  - Increase maximum allowed space for nulldata transactions to 80 bytes
+    (#331)
+  - Implement support for the following rules specified by BIP0062:
+    - The S value in ECDSA signature must be at most half the curve order
+      (rule 5) (#349)
+    - Script execution must result in a single non-zero value on the stack
+      (rule 6) (#347)
+    - NOTE: All 7 rules of BIP0062 are now implemented
+  - Use network adjusted time in finalized transaction checks to improve
+    consistency across nodes (#332)
+  - Process orphan transactions on acceptance of new transactions (#345)
+- RPC changes:
+  - Add support for a limited RPC user which is not allowed admin level
+    operations on the server (#363)
+  - Implement node command for more unified control over connected peers
+    (#79, #341)
+  - Implement generate command for regtest/simnet to support
+    deterministically mining a specified number of blocks (#362, #407)
+  - Update searchrawtransactions to return the matching transactions in
+    order (#354)
+  - Correct an issue with searchrawtransactions where it could return
+    duplicates (#346, #354)
+  - Increase precision of 'difficulty' field in getblock result to 8
+    (#414, #415)
+  - Omit 'nextblockhash' field from getblock result when it is empty
+    (#416, #417)
+  - Add 'id' and 'timeoffset' fields to getpeerinfo result (#335)
+- Websocket changes:
+  - Implement new commands stopnotifyspent, stopnotifyreceived,
+    stopnotifyblocks, and stopnotifynewtransactions to allow clients to
+    cancel notification registrations (#122, #342)
+- btcctl utility changes:
+  - A single dash can now be used as an argument to cause that argument to
+    be read from stdin (#348)
+  - Add generate command
+- Notable developer-related package changes:
+  - The new version 2 btcjson package has now replaced the deprecated
+    version 1 package (#368)
+  - The btcec package now performs all signing using RFC6979 deterministic
+    signatures (#358, #360)
+  - The txscript package has been significantly cleaned up and had a few
+    API changes (#387, #388, #389, #390, #391, #392, #393, #395, #396,
+    #400, #403, #404, #405, #406, #408, #409, #410, #412)
+  - A new PkScriptLocs function has been added to the wire package MsgTx
+    type which provides callers that deal with scripts optimization
+    opportunities (#343)
+- Misc changes:
+  - Minor wire hashing optimizations (#366, #367)
+  - Other minor internal optimizations
+- Contributors (alphabetical order):
+  - Alex Akselrod
+  - Arne Brutschy
+  - Chris Jepson
+  - Daniel Krawisz
+  - Dave Collins
+  - David Hill
+  - Jimmy Song
+  - Jonas Nick
+  - Josh Rickmar
+  - Olaoluwa Osuntokun
+  - Oleg Andreev
+
+Changes in 0.10.0 (Sun Mar 01 2015)
+
+- Protocol and network related changes:
+  - Add a new checkpoint at block height 343185
+  - Implement BIP066 which includes support for version 3 blocks, a new
+    consensus rule which prevents non-DER encoded signatures, and a
+    double-threshold switchover mechanism
+  - Rather than announcing all known addresses on getaddr requests which
+    can possibly result in multiple messages, randomize the results and
+    limit them to the max allowed by a single message (1000 addresses)
+  - Add more reserved IP spaces to the address manager
+- Transaction relay (memory pool) changes:
+  - Make transactions which contain reserved opcodes nonstandard
+  - No longer accept or relay free and low-fee transactions that have
+    insufficient priority to be mined in the next block
+  - Implement support for the following rules specified by BIP0062:
+    - ECDSA signature must use strict DER encoding (rule 1)
+    - The signature script must only contain push operations (rule 2)
+    - All push operations must use the smallest possible encoding (rule 3)
+    - All stack values interpreted as a number must be encoding using the
+      shortest possible form (rule 4)
+    - NOTE: Rule 1 was already enforced, however the entire script now
+      evaluates to false rather than only the signature verification as
+      required by BIP0062
+  - Allow transactions with nulldata transaction outputs to be treated as
+    standard
+- Mining support changes:
+  - Modify the getblocktemplate RPC to generate and return block templates
+    for version 3 blocks which are compatible with BIP0066
+  - Allow getblocktemplate to serve blocks when the current time is
+    less than the minimum allowed time for a generated block template
+    (https://github.com/gcash/bchd/issues/209)
+- Crypto changes:
+  - Optimize scalar multiplication by the base point by using a
+    pre-computed table which results in approximately a 35% speedup
+    (https://github.com/btcsuite/btcec/issues/2)
+  - Optimize general scalar multiplication by using the secp256k1
+    endomorphism which results in approximately a 17-20% speedup
+    (https://github.com/btcsuite/btcec/issues/1)
+  - Optimize general scalar multiplication by using non-adjacent form
+    which results in approximately an additional 8% speedup
+    (https://github.com/btcsuite/btcec/issues/3)
+- Implement optional address indexing:
+  - Add a new parameter --addrindex which will enable the creation of an
+    address index which can be queried to determine all transactions which
+    involve a given address
+    (https://github.com/gcash/bchd/issues/190)
+  - Add a new logging subsystem for address index related operations
+  - Support new searchrawtransactions RPC
+    (https://github.com/gcash/bchd/issues/185)
+- RPC changes:
+  - Require TLS version 1.2 as the minimum version for all TLS connections
+  - Provide support for disabling TLS when only listening on localhost
+    (https://github.com/gcash/bchd/pull/192)
+  - Modify help output for all commands to provide much more consistent
+    and detailed information
+  - Correct case in getrawtransaction which would refuse to serve certain
+    transactions with invalid scripts
+    (https://github.com/gcash/bchd/issues/210)
+  - Correct error handling in the getrawtransaction RPC which could lead
+    to a crash in rare cases
+    (https://github.com/gcash/bchd/issues/196)
+  - Update getinfo RPC to include the appropriate 'timeoffset' calculated
+    from the median network time
+  - Modify listreceivedbyaddress result type to include txids field so it
+    is compatible
+  - Add 'iswatchonly' field to validateaddress result
+  - Add 'startingpriority' and 'currentpriority' fields to getrawmempool
+    (https://github.com/gcash/bchd/issues/178)
+  - Don't omit the 'confirmations' field from getrawtransaction when it is
+    zero
+- Websocket changes:
+  - Modify the behavior of the rescan command to automatically register
+    for notifications about transactions paying to rescanned addresses
+    or spending outputs from the final rescan utxo set when the rescan
+    is through the best block in the chain
+- btcctl utility changes:
+  - Make the list of commands available via the -l option rather than
+    dumping the entire list on usage errors
+  - Alphabetize and categorize the list of commands by chain and wallet
+  - Make the help option only show the help options instead of also
+    dumping all of the commands
+  - Make the usage syntax much more consistent and correct a few cases of
+    misnamed fields
+    (https://github.com/gcash/bchd/issues/305)
+  - Improve usage errors to show the specific parameter number, reason,
+    and error code
+  - Only show the usage for specific command is shown when a valid command
+    is provided with invalid parameters
+  - Add support for a SOCK5 proxy
+  - Modify output for integer fields (such as timestamps) to display
+    normally instead in scientific notation
+  - Add invalidateblock command
+  - Add reconsiderblock command
+  - Add createnewaccount command
+  - Add renameaccount command
+  - Add searchrawtransactions command
+  - Add importaddress command
+  - Add importpubkey command
+- showblock utility changes:
+  - Remove utility in favor of the RPC getblock method
+- Notable developer-related package changes:
+  - Many of the core packages have been relocated into the btcd repository
+    (https://github.com/gcash/bchd/issues/214)
+  - A new version of the btcjson package that has been completely
+    redesigned from the ground up based based upon how the project has
+    evolved and lessons learned while using it since it was first written
+    is now available in the btcjson/v2/btcjson directory
+    - This will ultimately replace the current version so anyone making
+      use of this package will need to update their code accordingly
+  - The btcec package now provides better facilities for working directly
+    with its public and private keys without having to mix elements from
+    the ecdsa package
+  - Update the script builder to ensure all rules specified by BIP0062 are
+    adhered to when creating scripts
+  - The blockchain package now provides a MedianTimeSource interface and
+    concrete implementation for providing time samples from remote peers
+    and using that data to calculate an offset against the local time
+- Misc changes:
+  - Fix a slow memory leak due to tickers not being stopped
+    (https://github.com/gcash/bchd/issues/189)
+  - Fix an issue where a mix of orphans and SPV clients could trigger a
+    condition where peers would no longer be served
+    (https://github.com/gcash/bchd/issues/231)
+  - The RPC username and password can now contain symbols which previously
+    conflicted with special symbols used in URLs
+  - Improve handling of obtaining random nonces to prevent cases where it
+    could error when not enough entropy was available
+  - Improve handling of home directory creation errors such as in the case
+    of unmounted symlinks (https://github.com/gcash/bchd/issues/193)
+  - Improve the error reporting for rejected transactions to include the
+    inputs which are missing and/or being double spent
+  - Update sample config file with new options and correct a comment
+    regarding the fact the RPC server only listens on localhost by default
+    (https://github.com/gcash/bchd/issues/218)
+  - Update the continuous integration builds to run several tools which
+    help keep code quality high
+  - Significant amount of internal code cleanup and improvements
+  - Other minor internal optimizations
+- Code Contributors (alphabetical order):
+  - Beldur
+  - Ben Holden-Crowther
+  - Dave Collins
+  - David Evans
+  - David Hill
+  - Guilherme Salgado
+  - Javed Khan
+  - Jimmy Song
+  - John C. Vernaleo
+  - Jonathan Gillham
+  - Josh Rickmar
+  - Michael Ford
+  - Michail Kargakis
+  - kac
+  - Olaoluwa Osuntokun
+
+Changes in 0.9.0 (Sat Sep 20 2014)
+
+- Protocol and network related changes:
+  - Add a new checkpoint at block height 319400
+  - Add support for BIP0037 bloom filters
+    (https://github.com/conformal/btcd/issues/132)
+  - Implement BIP0061 reject handling and hence support for protocol
+    version 70002 (https://github.com/conformal/btcd/issues/133)
+  - Add testnet DNS seeds for peer discovery (testnet-seed.alexykot.me
+    and testnet-seed.bitcoin.schildbach.de)
+  - Add mainnet DNS seed for peer discovery (seeds.bitcoin.open-nodes.org)
+  - Make multisig transactions with non-null dummy data nonstandard
+    (https://github.com/conformal/btcd/issues/131)
+  - Make transactions with an excessive number of signature operations
+    nonstandard
+  - Perform initial DNS lookups concurrently which allows connections
+    more quickly
+  - Improve the address manager to significantly reduce memory usage and
+    add tests
+  - Remove orphan transactions when they appear in a mined block
+    (https://github.com/conformal/btcd/issues/166)
+  - Apply incremental back off on connection retries for persistent peers
+    that give invalid replies to mirror the logic used for failed
+    connections (https://github.com/conformal/btcd/issues/103)
+  - Correct rate-limiting of free and low-fee transactions
+- Mining support changes:
+  - Implement getblocktemplate RPC with the following support:
+    (https://github.com/conformal/btcd/issues/124)
+    - BIP0022 Non-Optional Sections
+    - BIP0022 Long Polling
+    - BIP0023 Basic Pool Extensions
+    - BIP0023 Mutation coinbase/append
+    - BIP0023 Mutations time, time/increment, and time/decrement
+    - BIP0023 Mutation transactions/add
+    - BIP0023 Mutations prevblock, coinbase, and generation
+    - BIP0023 Block Proposals
+  - Implement built-in concurrent CPU miner
+    (https://github.com/conformal/btcd/issues/137)
+    NOTE: CPU mining on mainnet is pointless. This has been provided
+    for testing purposes such as for the new simulation test network
+  - Add --generate flag to enable CPU mining
+  - Deprecate the --getworkkey flag in favor of --miningaddr which
+    specifies which addresses generated blocks will choose from to pay
+    the subsidy to
+- RPC changes:
+  - Implement gettxout command
+    (https://github.com/conformal/btcd/issues/141)
+  - Implement validateaddress command
+  - Implement verifymessage command
+  - Mark getunconfirmedbalance RPC as wallet-only
+  - Mark getwalletinfo RPC as wallet-only
+  - Update getgenerate, setgenerate, gethashespersec, and getmininginfo
+    to return the appropriate information about new CPU mining status
+  - Modify getpeerinfo pingtime and pingwait field types to float64 so
+    they are compatible
+  - Improve disconnect handling for normal HTTP clients
+  - Make error code returns for invalid hex more consistent
+- Websocket changes:
+  - Switch to a new more efficient websocket package
+    (https://github.com/conformal/btcd/issues/134)
+  - Add rescanfinished notification
+  - Modify the rescanprogress notification to include block hash as well
+    as height (https://github.com/conformal/btcd/issues/151)
+- btcctl utility changes:
+  - Accept --simnet flag which automatically selects the appropriate port
+    and TLS certificates needed to communicate with btcd and btcwallet on
+    the simulation test network
+  - Fix createrawtransaction command to send amounts denominated in BTC
+  - Add estimatefee command
+  - Add estimatepriority command
+  - Add getmininginfo command
+  - Add getnetworkinfo command
+  - Add gettxout command
+  - Add lockunspent command
+  - Add signrawtransaction command
+- addblock utility changes:
+  - Accept --simnet flag which automatically selects the appropriate port
+    and TLS certificates needed to communicate with btcd and btcwallet on
+    the simulation test network
+- Notable developer-related package changes:
+  - Provide a new bloom package in btcutil which allows creating and
+    working with BIP0037 bloom filters
+  - Provide a new hdkeychain package in btcutil which allows working with
+    BIP0032 hierarchical deterministic key chains
+  - Introduce a new btcnet package which houses network parameters
+  - Provide new simnet network (--simnet) which is useful for private
+    simulation testing
+  - Enforce low S values in serialized signatures as detailed in BIP0062
+  - Return errors from all methods on the btcdb.Db interface
+    (https://github.com/conformal/btcdb/issues/5)
+  - Allow behavior flags to alter btcchain.ProcessBlock
+    (https://github.com/conformal/btcchain/issues/5)
+  - Provide a new SerializeSize API for blocks
+    (https://github.com/conformal/btcwire/issues/19)
+  - Several of the core packages now work with Google App Engine
+- Misc changes:
+  - Correct an issue where the database could corrupt under certain
+    circumstances which would require a new chain download
+  - Slightly optimize deserialization
+  - Use the correct IP block for he.net
+  - Fix an issue where it was possible the block manager could hang on
+    shutdown
+  - Update sample config file so the comments are on a separate line
+    rather than the end of a line so they are not interpreted as settings
+    (https://github.com/conformal/btcd/issues/135)
+  - Correct an issue where getdata requests were not being properly
+    throttled which could lead to larger than necessary memory usage
+  - Always show help when given the help flag even when the config file
+    contains invalid entries
+  - General code cleanup and minor optimizations
+
+Changes in 0.8.0-beta (Sun May 25 2014)
+
+- Btcd is now Beta (https://github.com/conformal/btcd/issues/130)
+- Add a new checkpoint at block height 300255
+- Protocol and network related changes:
+  - Lower the minimum transaction relay fee to 1000 satoshi to match
+    recent reference client changes
+    (https://github.com/conformal/btcd/issues/100)
+  - Raise the maximum signature script size to support standard 15-of-15
+    multi-signature pay-to-sript-hash transactions with compressed pubkeys
+    to remain compatible with the reference client
+    (https://github.com/conformal/btcd/issues/128)
+  - Reduce max bytes allowed for a standard nulldata transaction to 40 for
+    compatibility with the reference client
+  - Introduce a new btcnet package which houses all of the network params
+    for each network (mainnet, testnet3, regtest) to ultimately enable
+    easier addition and tweaking of networks without needing to change
+    several packages
+  - Fix several script discrepancies found by reference client test data
+  - Add new DNS seed for peer discovery (seed.bitnodes.io)
+  - Reduce the max known inventory cache from 20000 items to 1000 items
+  - Fix an issue where unknown inventory types could lead to a hung peer
+  - Implement inventory rebroadcast handler for sendrawtransaction
+    (https://github.com/conformal/btcd/issues/99)
+  - Update user agent to fully support BIP0014
+    (https://github.com/conformal/btcwire/issues/10)
+- Implement initial mining support:
+  - Add a new logging subsystem for mining related operations
+  - Implement infrastructure for creating block templates
+  - Provide options to control block template creation settings
+  - Support the getwork RPC
+  - Allow address identifiers to apply to more than one network since both
+    testnet3 and the regression test network unfortunately use the same
+    identifier
+- RPC changes:
+  - Set the content type for HTTP POST RPC connections to application/json
+    (https://github.com/conformal/btcd/issues/121)
+  - Modified the RPC server startup so it only requires at least one valid
+    listen interface
+  - Correct an error path where it was possible certain errors would not
+    be returned
+  - Implement getwork command
+    (https://github.com/conformal/btcd/issues/125)
+  - Update sendrawtransaction command to reject orphans
+  - Update sendrawtransaction command to include the reason a transaction
+    was rejected
+  - Update getinfo command to populate connection count field
+  - Update getinfo command to include relay fee field
+    (https://github.com/conformal/btcd/issues/107)
+  - Allow transactions submitted with sendrawtransaction to bypass the
+    rate limiter
+  - Allow the getcurrentnet and getbestblock extensions to be accessed via
+    HTTP POST in addition to Websockets
+    (https://github.com/conformal/btcd/issues/127)
+- Websocket changes:
+  - Rework notifications to ensure they are delivered in the order they
+    occur
+  - Rename notifynewtxs command to notifyreceived (funds received)
+  - Rename notifyallnewtxs command to notifynewtransactions
+  - Rename alltx notification to txaccepted
+  - Rename allverbosetx notification to txacceptedverbose
+    (https://github.com/conformal/btcd/issues/98)
+  - Add rescan progress notification
+  - Add recvtx notification
+  - Add redeemingtx notification
+  - Modify notifyspent command to accept an array of outpoints
+    (https://github.com/conformal/btcd/issues/123)
+  - Significantly optimize the rescan command to yield up to a 60x speed
+    increase
+- btcctl utility changes:
+  - Add createencryptedwallet command
+  - Add getblockchaininfo command
+  - Add importwallet command
+  - Add addmultisigaddress command
+  - Add setgenerate command
+  - Accept --testnet and --wallet flags which automatically select
+    the appropriate port and TLS certificates needed to communicate
+    with btcd and btcwallet (https://github.com/conformal/btcd/issues/112)
+  - Allow path expansion from config file entries
+    (https://github.com/conformal/btcd/issues/113)
+  - Minor refactor simplify handling of options
+- addblock utility changes:
+  - Improve logging by making it consistent with the logging provided by
+    btcd (https://github.com/conformal/btcd/issues/90)
+- Improve several package APIs for developers:
+  - Add new amount type for consistently handling monetary values
+  - Add new coin selector API
+  - Add new WIF (Wallet Import Format) API
+  - Add new crypto types for private keys and signatures
+  - Add new API to sign transactions including script merging and hash
+    types
+  - Expose function to extract all pushed data from a script
+    (https://github.com/conformal/btcscript/issues/8)
+- Misc changes:
+  - Optimize address manager shuffling to do 67% less work on average
+  - Resolve a couple of benign data races found by the race detector
+    (https://github.com/conformal/btcd/issues/101)
+  - Add IP address to all peer related errors to clarify which peer is the
+    cause (https://github.com/conformal/btcd/issues/102)
+  - Fix a UPNP case issue that prevented the --upnp option from working
+    with some UPNP servers
+  - Update documentation in the sample config file regarding debug levels
+  - Adjust some logging levels to improve debug messages
+  - Improve the throughput of query messages to the block manager
+  - Several minor optimizations to reduce GC churn and enhance speed
+  - Other minor refactoring
+  - General code cleanup
+
+Changes in 0.7.0 (Thu Feb 20 2014)
+
+- Fix an issue when parsing scripts which contain a multi-signature script
+  which require zero signatures such as testnet block
+  000000001881dccfeda317393c261f76d09e399e15e27d280e5368420f442632
+  (https://github.com/conformal/btcscript/issues/7)
+- Add check to ensure all transactions accepted to mempool only contain
+  canonical data pushes (https://github.com/conformal/btcscript/issues/6)
+- Fix an issue causing excessive memory consumption
+- Significantly rework and improve the websocket notification system:
+  - Each client is now independent so slow clients no longer limit the
+    speed of other connected clients
+  - Potentially long-running operations such as rescans are now run in
+    their own handler and rate-limited to one operation at a time without
+    preventing simultaneous requests from the same client for the faster
+    requests or notifications
+  - A couple of scenarios which could cause shutdown to hang have been
+    resolved
+  - Update notifynewtx notifications to support all address types instead
+    of only pay-to-pubkey-hash
+  - Provide a --rpcmaxwebsockets option to allow limiting the number of
+    concurrent websocket clients
+  - Add a new websocket command notifyallnewtxs to request notifications
+    (https://github.com/conformal/btcd/issues/86) (thanks @flammit)
+- Improve btcctl utility in the following ways:
+  - Add getnetworkhashps command
+  - Add gettransaction command (wallet-specific)
+  - Add signmessage command (wallet-specific)
+  - Update getwork command to accept
+- Continue cleanup and work on implementing the RPC API:
+  - Implement getnettotals command
+    (https://github.com/conformal/btcd/issues/84)
+  - Implement networkhashps command
+    (https://github.com/conformal/btcd/issues/87)
+  - Update getpeerinfo to always include syncnode field even when false
+  - Remove help addenda for getpeerinfo now that it supports all fields
+- Close standard RPC connections on auth failure
+- Provide a --rpcmaxclients option to allow limiting the number of
+  concurrent RPC clients (https://github.com/conformal/btcd/issues/68)
+- Include IP address in RPC auth failure log messages
+- Resolve a rather harmless data races found by the race detector
+  (https://github.com/conformal/btcd/issues/94)
+- Increase block priority size and max standard transaction size to 50k
+  and 100k, respectively (https://github.com/conformal/btcd/issues/71)
+- Add rate limiting of free transactions to the memory pool to prevent
+  penny flooding (https://github.com/conformal/btcd/issues/40)
+- Provide a --logdir option (https://github.com/conformal/btcd/issues/95)
+- Change the default log file path to include the network
+- Add a new ScriptBuilder interface to btcscript to support creation of
+  custom scripts (https://github.com/conformal/btcscript/issues/5)
+- General code cleanup
+
+Changes in 0.6.0 (Tue Feb 04 2014)
+
+- Fix an issue when parsing scripts which contain invalid signatures that
+  caused a chain fork on block
+  0000000000000001e4241fd0b3469a713f41c5682605451c05d3033288fb2244
+- Correct an issue which could lead to an error in removeBlockNode
+  (https://github.com/conformal/btcchain/issues/4)
+- Improve addblock utility as follows:
+  - Check imported blocks against all chain rules and checkpoints
+  - Skip blocks which are already known so you can stop and restart the
+    import or start the import after you have already downloaded a portion
+    of the chain
+  - Correct an issue where the utility did not shutdown cleanly after
+    processing all blocks
+  - Add error on attempt to import orphan blocks
+  - Improve error handling and reporting
+  - Display statistics after input file has been fully processed
+- Rework, optimize, and improve headers-first mode:
+  - Resuming the chain sync from any point before the final checkpoint
+    will now use headers-first mode
+    (https://github.com/conformal/btcd/issues/69)
+  - Verify all checkpoints as opposed to only the final one
+  - Reduce and bound memory usage
+  - Rollback to the last known good point when a header does not match a
+    checkpoint
+  - Log information about what is happening with headers
+- Improve btcctl utility in the following ways:
+  - Add getaddednodeinfo command
+  - Add getnettotals command
+  - Add getblocktemplate command (wallet-specific)
+  - Add getwork command (wallet-specific)
+  - Add getnewaddress command (wallet-specific)
+  - Add walletpassphrasechange command (wallet-specific)
+  - Add walletlock command (wallet-specific)
+  - Add sendfrom command (wallet-specific)
+  - Add sendmany command (wallet-specific)
+  - Add settxfee command (wallet-specific)
+  - Add listsinceblock command (wallet-specific)
+  - Add listaccounts command (wallet-specific)
+  - Add keypoolrefill command (wallet-specific)
+  - Add getreceivedbyaccount command (wallet-specific)
+  - Add getrawchangeaddress command (wallet-specific)
+  - Add gettxoutsetinfo command (wallet-specific)
+  - Add listaddressgroupings command (wallet-specific)
+  - Add listlockunspent command (wallet-specific)
+  - Add listlock command (wallet-specific)
+  - Add listreceivedbyaccount command (wallet-specific)
+  - Add validateaddress command (wallet-specific)
+  - Add verifymessage command (wallet-specific)
+  - Add sendtoaddress command (wallet-specific)
+- Continue cleanup and work on implementing the RPC API:
+  - Implement submitblock command
+    (https://github.com/conformal/btcd/issues/61)
+  - Implement help command
+  - Implement ping command
+  - Implement getaddednodeinfo command
+    (https://github.com/conformal/btcd/issues/78)
+  - Implement getinfo command
+  - Update getpeerinfo to support bytesrecv and bytessent
+    (https://github.com/conformal/btcd/issues/83)
+- Improve and correct several RPC server and websocket areas:
+  - Change the connection endpoint for websockets from /wallet to /ws
+    (https://github.com/conformal/btcd/issues/80)
+  - Implement an alternative authentication for websockets so clients
+    such as javascript from browsers that don't support setting HTTP
+    headers can authenticate (https://github.com/conformal/btcd/issues/77)
+  - Add an authentication deadline for RPC connections
+    (https://github.com/conformal/btcd/issues/68)
+  - Use standard authentication failure responses for RPC connections
+  - Make automatically generated certificate more standard so it works
+    from client such as node.js and Firefox
+  - Correct some minor issues which could prevent the RPC server from
+    shutting down in an orderly fashion
+  - Make all websocket notifications require registration
+  - Change the data sent over websockets to text since it is JSON-RPC
+  - Allow connections that do not have an Origin header set
+- Expose and track the number of bytes read and written per peer
+  (https://github.com/conformal/btcwire/issues/6)
+- Correct an issue with sendrawtransaction when invoked via websockets
+  which prevented a minedtx notification from being added
+- Rescan operations issued from remote wallets are no stopped when
+  the wallet disconnects mid-operation
+  (https://github.com/conformal/btcd/issues/66)
+- Several optimizations related to fetching block information from the
+  database
+- General code cleanup
+
+Changes in 0.5.0 (Mon Jan 13 2014)
+
+- Optimize initial block download by introducing a new mode which
+  downloads the block headers first (up to the final checkpoint)
+- Improve peer handling to remove the potential for slow peers to cause
+  sluggishness amongst all peers
+  (https://github.com/conformal/btcd/issues/63)
+- Fix an issue where the initial block sync could stall when the sync peer
+  disconnects (https://github.com/conformal/btcd/issues/62)
+- Correct an issue where --externalip was doing a DNS lookup on the full
+  host:port instead of just the host portion
+  (https://github.com/conformal/btcd/issues/38)
+- Fix an issue which could lead to a panic on chain switches
+  (https://github.com/conformal/btcd/issues/70)
+- Improve btcctl utility in the following ways:
+  - Show getdifficulty output as floating point to 6 digits of precision
+  - Show all JSON object replies formatted as standard JSON
+  - Allow btcctl getblock to accept optional params
+  - Add getaccount command (wallet-specific)
+  - Add getaccountaddress command (wallet-specific)
+  - Add sendrawtransaction command
+- Continue cleanup and work on implementing RPC API calls
+  - Update getrawmempool to support new optional verbose flag
+  - Update getrawtransaction to match the reference client
+  - Update getblock to support new optional verbose flag
+  - Update raw transactions to fully match the reference client including
+    support for all transaction types and address types
+  - Correct getrawmempool fee field to return BTC instead of Satoshi
+  - Correct getpeerinfo service flag to return 8 digit string so it
+    matches the reference client
+  - Correct verifychain to return a boolean
+  - Implement decoderawtransaction command
+  - Implement createrawtransaction command
+  - Implement decodescript command
+  - Implement gethashespersec command
+  - Allow RPC handler overrides when invoked via a websocket versus
+    legacy connection
+- Add new DNS seed for peer discovery
+- Display user agent on new valid peer log message
+  (https://github.com/conformal/btcd/issues/64)
+- Notify wallet when new transactions that pay to registered addresses
+  show up in the mempool before being mined into a block
+- Support a tor-specific proxy in addition to a normal proxy
+  (https://github.com/conformal/btcd/issues/47)
+- Remove deprecated sqlite3 imports from utilities
+- Remove leftover profile write from addblock utility
+- Quite a bit of code cleanup and refactoring to improve maintainability
+
+Changes in 0.4.0 (Thu Dec 12 2013)
+
+- Allow listen interfaces to be specified via --listen instead of only the
+  port (https://github.com/conformal/btcd/issues/33)
+- Allow listen interfaces for the RPC server to be specified via
+  --rpclisten instead of only the port
+  (https://github.com/conformal/btcd/issues/34)
+- Only disable listening when --connect or --proxy are used when no
+  --listen interface are specified
+  (https://github.com/conformal/btcd/issues/10)
+- Add several new standard transaction checks to transaction memory pool:
+  - Support nulldata scripts as standard
+  - Only allow a max of one nulldata output per transaction
+  - Enforce a maximum of 3 public keys in multi-signature transactions
+  - The number of signatures in multi-signature transactions must not
+    exceed the number of public keys
+  - The number of inputs to a signature script must match the expected
+    number of inputs for the script type
+  - The number of inputs pushed onto the stack by a redeeming signature
+    script must match the number of inputs consumed by the referenced
+    public key script
+- When a block is connected, remove any transactions from the memory pool
+  which are now double spends as a result of the newly connected
+  transactions
+- Don't relay transactions resurrected during a chain switch since
+  other peers will also be switching chains and therefore already know
+  about them
+- Cleanup a few cases where rejected transactions showed as an error
+  rather than as a rejected transaction
+- Ignore the default configuration file when --regtest (regression test
+  mode) is specified
+- Implement TLS support for RPC including automatic certificate generation
+- Support HTTP authentication headers for web sockets
+- Update address manager to recognize and properly work with Tor
+  addresses (https://github.com/conformal/btcd/issues/36) and
+  (https://github.com/conformal/btcd/issues/37)
+- Improve btcctl utility in the following ways:
+  - Add the ability to specify a configuration file
+  - Add a default entry for the RPC cert to point to the location
+    it will likely be in the btcd home directory
+  - Implement --version flag
+  - Provide a --notls option to support non-TLS configurations
+- Fix a couple of minor races found by the Go race detector
+- Improve logging
+  - Allow logging level to be specified on a per subsystem basis
+    (https://github.com/conformal/btcd/issues/48)
+  - Allow logging levels to be dynamically changed via RPC
+    (https://github.com/conformal/btcd/issues/15)
+  - Implement a rolling log file with a max of 10MB per file and a
+    rotation size of 3 which results in a max logging size of 30 MB
+- Correct a minor issue with the rescanning websocket call
+  (https://github.com/conformal/btcd/issues/54)
+- Fix a race with pushing address messages that could lead to a panic
+  (https://github.com/conformal/btcd/issues/58)
+- Improve which external IP address is reported to peers based on which
+  interface they are connected through
+  (https://github.com/conformal/btcd/issues/35)
+- Add --externalip option to allow an external IP address to be specified
+  for cases such as tor hidden services or advanced network configurations
+  (https://github.com/conformal/btcd/issues/38)
+- Add --upnp option to support automatic port mapping via UPnP
+  (https://github.com/conformal/btcd/issues/51)
+- Update Ctrl+C interrupt handler to properly sync address manager and
+  remove the UPnP port mapping (if needed)
+- Continue cleanup and work on implementing RPC API calls
+  - Add importprivkey (import private key) command to btcctl
+  - Update getrawtransaction to provide addresses properly, support
+    new verbose param, and match the reference implementation with the
+    exception of MULTISIG (thanks @flammit)
+  - Update getblock with new verbose flag (thanks @flammit)
+  - Add listtransactions command to btcctl
+  - Add getbalance command to btcctl
+- Add basic support for btcd to run as a native Windows service
+  (https://github.com/conformal/btcd/issues/42)
+- Package addblock utility with Windows MSIs
+- Add support for TravisCI (continuous build integration)
+- Cleanup some documentation and usage
+- Several other minor bug fixes and general code cleanup
+
+Changes in 0.3.3 (Wed Nov 13 2013)
+
+- Significantly improve initial block chain download speed
+  (https://github.com/conformal/btcd/issues/20)
+- Add a new checkpoint at block height 267300
+- Optimize most recently used inventory handling
+  (https://github.com/conformal/btcd/issues/21)
+- Optimize duplicate transaction input check
+  (https://github.com/conformal/btcchain/issues/2)
+- Optimize transaction hashing
+  (https://github.com/conformal/btcd/issues/25)
+- Rework and optimize wallet listener notifications
+  (https://github.com/conformal/btcd/issues/22)
+- Optimize serialization and deserialization
+  (https://github.com/conformal/btcd/issues/27)
+- Add support for minimum transaction fee to memory pool acceptance
+  (https://github.com/conformal/btcd/issues/29)
+- Improve leveldb database performance by removing explicit GC call
+- Fix an issue where Ctrl+C was not always finishing orderly database
+  shutdown
+- Fix an issue in the script handling for OP_CHECKSIG
+- Impose max limits on all variable length protocol entries to prevent
+  abuse from malicious peers
+- Enforce DER signatures for transactions allowed into the memory pool
+- Separate the debug profile http server from the RPC server
+- Rework of the RPC code to improve performance and make the code cleaner
+- The getrawtransaction RPC call now properly checks the memory pool
+  before consulting the db (https://github.com/conformal/btcd/issues/26)
+- Add support for the following RPC calls: getpeerinfo, getconnectedcount,
+  addnode, verifychain
+  (https://github.com/conformal/btcd/issues/13)
+  (https://github.com/conformal/btcd/issues/17)
+- Implement rescan websocket extension to allow wallet rescans
+- Use correct paths for application data storage for all supported
+  operating systems (https://github.com/conformal/btcd/issues/30)
+- Add a default redirect to the http profiling page when accessing the
+  http profile server
+- Add a new --cpuprofile option which can be used to generate CPU
+  profiling data on platforms that support it
+- Several other minor performance optimizations
+- Other minor bug fixes and general code cleanup
+
+Changes in 0.3.2 (Tue Oct 22 2013)
+
+- Fix an issue that could cause the download of the block chain to stall
+  (https://github.com/conformal/btcd/issues/12)
+- Remove deprecated sqlite as an available database backend
+- Close sqlite compile issue as sqlite has now been removed
+  (https://github.com/conformal/btcd/issues/11)
+- Change default RPC ports to 8334 (mainnet) and 18334 (testnet)
+- Continue cleanup and work on implementing RPC API calls
+- Add support for the following RPC calls: getrawmempool,
+  getbestblockhash, decoderawtransaction, getdifficulty,
+  getconnectioncount, getpeerinfo, and addnode
+- Improve the btcctl utility that is used to issue JSON-RPC commands
+- Fix an issue preventing btcd from cleanly shutting down with the RPC
+  stop command
+- Add a number of database interface tests to ensure backends implement
+  the expected interface
+- Expose some additional information from btcscript to be used for
+  identifying "standard"" transactions
+- Add support for plan9 - thanks @mischief
+  (https://github.com/conformal/btcd/pull/19)
+- Other minor bug fixes and general code cleanup
+
+Changes in 0.3.1-alpha (Tue Oct 15 2013)
+
+- Change default database to leveldb
+  NOTE: This does mean you will have to redownload the block chain. Since we
+  are still in alpha, we didn't feel writing a converter was worth the time as
+  it would take away from more important issues at this stage
+- Add a warning if there are multiple block chain databases of different types
+- Fix issue with unexpected EOF in leveldb -- https://github.com/conformal/btcd/issues/18
+- Fix issue preventing block 21066 on testnet -- https://github.com/conformal/btcchain/issues/1
+- Fix issue preventing block 96464 on testnet -- https://github.com/conformal/btcscript/issues/1
+- Optimize transaction lookups
+- Correct a few cases of list removal that could result in improper cleanup
+  of no longer needed orphans
+- Add functionality to increase ulimits on non-Windows platforms
+- Add support for mempool command which allows remote peers to query the
+  transaction memory pool via the bitcoin protocol
+- Clean up logging a bit
+- Add a flag to disable checkpoints for developers
+- Add a lot of useful debug logging such as message summaries
+- Other minor bug fixes and general code cleanup
+
+Initial Release 0.3.0-alpha (Sat Oct 05 2013):
+
+- Initial release

@@ -1141,6 +1141,13 @@ func testFetchBlockIOMissing(tc *testContext, tx database.Tx) bool {
 			return false
 		}
 
+		// Ensure FetchBlockSize returns expected error.
+		testName = fmt.Sprintf("FetchBlockSize #%d on missing block", i)
+		_, err = tx.FetchBlockSize(blockHash)
+		if !checkDbError(tc.t, testName, err, wantErrCode) {
+			return false
+		}
+
 		// Ensure FetchBlockHeader returns expected error.
 		testName = fmt.Sprintf("FetchBlockHeader #%d on missing block",
 			i)
@@ -1264,6 +1271,20 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 			return false
 		}
 
+		// Ensure the block size fetched from the database is the size
+		// of the block.
+		gotSize, err := tx.FetchBlockSize(blockHash)
+		if err != nil {
+			tc.t.Errorf("FetchBlockSize(%s): unexpected error: %v",
+				blockHash, err)
+			return false
+		}
+		if gotSize != uint32(len(blockBytes)) {
+			tc.t.Errorf("FetchBlockSize(%s): got %d, want %d",
+				blockHash, gotSize, len(blockBytes))
+			return false
+		}
+
 		// Ensure the block header fetched from the database matches the
 		// expected bytes.
 		wantHeaderBytes := blockBytes[0:wire.MaxBlockHeaderPayload]
@@ -1332,6 +1353,15 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 			return false
 		}
 
+		// Ensure fetching the size of a block that doesn't exist
+		// returns the expected error.
+		testName = fmt.Sprintf("FetchBlockSize(%s) invalid block",
+			badBlockHash)
+		_, err = tx.FetchBlockSize(badBlockHash)
+		if !checkDbError(tc.t, testName, err, wantErrCode) {
+			return false
+		}
+
 		// Ensure fetching a block header that doesn't exist returns
 		// the expected error.
 		testName = fmt.Sprintf("FetchBlockHeader(%s) invalid block",
@@ -1364,6 +1394,38 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 		if !checkDbError(tc.t, testName, err, wantErrCode) {
 			return false
 		}
+
+		// Ensure a region ending with the block is fetched, and that
+		// regions ending past it are refused as out of bounds.  The
+		// block files store a block between its length and its
+		// checksum, which such a region would reach.
+		blockLen := uint32(len(blockBytes))
+		region = database.BlockRegion{Hash: blockHash, Offset: blockLen - 1,
+			Len: 1}
+		gotRegionBytes, err = tx.FetchBlockRegion(&region)
+		if err != nil || !bytes.Equal(gotRegionBytes, blockBytes[blockLen-1:]) {
+			tc.t.Errorf("FetchBlockRegion(%s) last byte: got %x, %v, "+
+				"want %x", blockHash, gotRegionBytes, err,
+				blockBytes[blockLen-1:])
+			return false
+		}
+		for _, region := range []database.BlockRegion{
+			{Hash: blockHash, Offset: blockLen - 1, Len: 2},
+			{Hash: blockHash, Offset: blockLen, Len: 12},
+		} {
+			testName = fmt.Sprintf("FetchBlockRegion(%s) region "+
+				"%d:%d of a block of %d bytes", blockHash,
+				region.Offset, region.Len, blockLen)
+			gotRegionBytes, err = tx.FetchBlockRegion(&region)
+			if err == nil {
+				tc.t.Errorf("%s: got %x, want an error", testName,
+					gotRegionBytes)
+				return false
+			}
+			if !checkDbError(tc.t, testName, err, wantErrCode) {
+				return false
+			}
+		}
 	}
 
 	// -----------------
@@ -1382,7 +1444,7 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 			"%d, want %d", len(blockData), len(allBlockBytes))
 		return false
 	}
-	for i := 0; i < len(blockData); i++ {
+	for i := range blockData {
 		blockHash := allBlockHashes[i]
 		wantBlockBytes := allBlockBytes[i]
 		gotBlockBytes := blockData[i]
@@ -1407,7 +1469,7 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 			len(allBlockBytes))
 		return false
 	}
-	for i := 0; i < len(blockHeaderData); i++ {
+	for i := range blockHeaderData {
 		blockHash := allBlockHashes[i]
 		wantHeaderBytes := allBlockBytes[i][0:wire.MaxBlockHeaderPayload]
 		gotHeaderBytes := blockHeaderData[i]
@@ -1504,6 +1566,40 @@ func testFetchBlockIO(tc *testContext, tx database.Tx) bool {
 	}
 	wantErrCode = database.ErrBlockRegionInvalid
 	_, err = tx.FetchBlockRegions(badBlockRegions)
+	if !checkDbError(tc.t, testName, err, wantErrCode) {
+		return false
+	}
+
+	// Ensure regions of whole blocks are fetched, and that regions a byte
+	// longer are refused as out of bounds.
+	wholeBlocks := make([]database.BlockRegion, len(allBlockHashes))
+	for i := range wholeBlocks {
+		wholeBlocks[i] = database.BlockRegion{Hash: &allBlockHashes[i],
+			Len: uint32(len(allBlockBytes[i]))}
+	}
+	regionData, err := tx.FetchBlockRegions(wholeBlocks)
+	if err != nil {
+		tc.t.Errorf("FetchBlockRegions whole blocks: unexpected error: %v",
+			err)
+		return false
+	}
+	for i := range regionData {
+		if !bytes.Equal(regionData[i], allBlockBytes[i]) {
+			tc.t.Errorf("FetchBlockRegions(%s) whole block: bytes "+
+				"mismatch", &allBlockHashes[i])
+			return false
+		}
+	}
+	for i := range wholeBlocks {
+		wholeBlocks[i].Len++
+	}
+	testName = "FetchBlockRegions regions a byte past the blocks"
+	regionData, err = tx.FetchBlockRegions(wholeBlocks)
+	if err == nil {
+		tc.t.Errorf("%s: got %d regions, want an error", testName,
+			len(regionData))
+		return false
+	}
 	return checkDbError(tc.t, testName, err, wantErrCode)
 }
 
@@ -1866,6 +1962,13 @@ func testClosedTxInterface(tc *testContext, tx database.Tx) bool {
 			return false
 		}
 
+		// Ensure FetchBlockSize returns expected error.
+		testName = fmt.Sprintf("FetchBlockSize #%d on closed tx", i)
+		_, err = tx.FetchBlockSize(blockHash)
+		if !checkDbError(tc.t, testName, err, wantErrCode) {
+			return false
+		}
+
 		// Ensure FetchBlockHeader returns expected error.
 		testName = fmt.Sprintf("FetchBlockHeader #%d on closed tx", i)
 		_, err = tx.FetchBlockHeader(blockHash)
@@ -2042,10 +2145,10 @@ func testConcurrecy(tc *testContext) bool {
 	// Start up several concurrent readers for the same block and wait for
 	// the results.
 	startTime = time.Now()
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		go reader(0)
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		if result := <-resultChan; !result {
 			return false
 		}
@@ -2065,10 +2168,10 @@ func testConcurrecy(tc *testContext) bool {
 	// Start up several concurrent readers for different blocks and wait for
 	// the results.
 	startTime = time.Now()
-	for i := 0; i < numReaders; i++ {
+	for i := range numReaders {
 		go reader(i)
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		if result := <-resultChan; !result {
 			return false
 		}
@@ -2116,10 +2219,10 @@ func testConcurrecy(tc *testContext) bool {
 		}
 		resultChan <- true
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		go reader(0)
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		<-started
 	}
 
@@ -2136,7 +2239,7 @@ func testConcurrecy(tc *testContext) bool {
 	close(writeComplete)
 
 	// Wait for reader results.
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		if result := <-resultChan; !result {
 			return false
 		}
@@ -2160,10 +2263,10 @@ func testConcurrecy(tc *testContext) bool {
 	}
 	numWriters := 3
 	startTime = time.Now()
-	for i := 0; i < numWriters; i++ {
+	for range numWriters {
 		go writer()
 	}
-	for i := 0; i < numWriters; i++ {
+	for range numWriters {
 		if result := <-resultChan; !result {
 			return false
 		}
@@ -2211,10 +2314,10 @@ func testConcurrentClose(tc *testContext) bool {
 		}
 		resultChan <- true
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		go reader()
 	}
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		<-started
 	}
 
@@ -2247,7 +2350,7 @@ func testConcurrentClose(tc *testContext) bool {
 	}
 
 	// Wait for all results.
-	for i := 0; i < numReaders+1; i++ {
+	for range numReaders + 1 {
 		if result := <-resultChan; !result {
 			return false
 		}

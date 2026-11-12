@@ -75,16 +75,16 @@ func (msg *MsgCFCheckpt) BchDecode(r io.Reader, pver uint32, _ MessageEncoding) 
 		return ErrInsaneCFHeaderCount
 	}
 
-	// Create a contiguous slice of hashes to deserialize into in order to
-	// reduce the number of allocations.
-	msg.FilterHeaders = make([]*chainhash.Hash, count)
-	for i := uint64(0); i < count; i++ {
+	// Bound the allocation by the payload.
+	msg.FilterHeaders = make([]*chainhash.Hash, 0,
+		allocCount(r, count, chainhash.HashSize, count))
+	for range count {
 		var cfh chainhash.Hash
 		err := readElement(r, &cfh)
 		if err != nil {
 			return err
 		}
-		msg.FilterHeaders[i] = &cfh
+		msg.FilterHeaders = append(msg.FilterHeaders, &cfh)
 	}
 
 	return nil
@@ -147,9 +147,11 @@ func (msg *MsgCFCheckpt) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver. This is part of the Message interface implementation.
 func (msg *MsgCFCheckpt) MaxPayloadLength(pver uint32) uint32 {
-	// Message size depends on the blockchain height, so return general limit
-	// for all messages.
-	return maxMessagePayload()
+	// Filter type + stop hash + header count (varInt) + as many headers as
+	// are decoded.
+	return 1 + chainhash.HashSize +
+		uint32(VarIntSerializeSize(maxCFHeadersLen)) +
+		maxCFHeadersLen*chainhash.HashSize
 }
 
 // NewMsgCFCheckpt returns a new bitcoin cfheaders message that conforms to

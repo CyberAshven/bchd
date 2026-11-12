@@ -23,7 +23,7 @@ func TestMustRegisterPanic(t *testing.T) {
 	t.Parallel()
 
 	// Setup a defer to catch the expected panic to ensure it actually
-	// paniced.
+	// panicked.
 	defer func() {
 		if err := recover(); err == nil {
 			t.Error("mustRegister did not panic as expected")
@@ -82,6 +82,96 @@ func TestTestNet3Seeds(t *testing.T) {
 		if TestNet3Params.DNSSeeds[i] != expectedSeeds[i] {
 			t.Error("Seed values are incorrect")
 			return
+		}
+	}
+}
+
+// TestCheckpoints ensures the checkpoints are sorted and include the latest
+// checkpoint of the reference implementation for each network.
+func TestCheckpoints(t *testing.T) {
+	tests := []struct {
+		params *Params
+		height int32
+		hash   string
+	}{
+		{&MainNetParams, 970892, "000000000000000000e76270e57f4ebbd2b282db46a1695984935126c0a68cd8"},
+		{&TestNet3Params, 1730264, "000000000001ce982fa29717a4ed233b0e5a7a8b9936a17fdeeccc5c1d0af795"},
+		{&TestNet4Params, 325709, "00000000000097a6ca206aa88b45a2158eea1a9ab8a49aed8f4b193d558e74b4"},
+		{&ChipNetParams, 325627, "000000002bb8a32bd6b1022e5370b10e7dc139770d626e1a0911e6b596cf3069"},
+	}
+	for _, test := range tests {
+		checkpoints := test.params.Checkpoints
+		for i := 1; i < len(checkpoints); i++ {
+			if checkpoints[i].Height <= checkpoints[i-1].Height {
+				t.Errorf("%s: checkpoints not sorted at height %d",
+					test.params.Name, checkpoints[i].Height)
+			}
+		}
+		if len(checkpoints) == 0 {
+			t.Errorf("%s: no checkpoints", test.params.Name)
+			continue
+		}
+		last := checkpoints[len(checkpoints)-1]
+		if last.Height != test.height || last.Hash.String() != test.hash {
+			t.Errorf("%s: latest checkpoint %d %v, want %d %s",
+				test.params.Name, last.Height, last.Hash,
+				test.height, test.hash)
+		}
+	}
+}
+
+// TestMinimumChainWork ensures the minimum chain work of each network is the
+// reference implementation's.
+func TestMinimumChainWork(t *testing.T) {
+	tests := []struct {
+		params *Params
+		work   string
+	}{
+		{&MainNetParams, "30fd678912166474fe93f14"},
+		{&TestNet3Params, "11fdbbe582349040762"},
+		{&TestNet4Params, "bd5a1b5bda45b5da"},
+		{&ChipNetParams, "7a3195391c4408f2"},
+		{&RegressionNetParams, ""},
+		{&SimNetParams, ""},
+	}
+	for _, test := range tests {
+		work := test.params.MinimumChainWork
+		got := ""
+		if work != nil {
+			got = work.Text(16)
+		}
+		if got != test.work {
+			t.Errorf("%s: minimum chain work %q, want %q",
+				test.params.Name, got, test.work)
+		}
+	}
+}
+
+// TestDefaultConsensusBlockSize checks the default block size of each network
+// and, where Bitcoin Cash Node asserts the same, that ABLA starts at it.
+func TestDefaultConsensusBlockSize(t *testing.T) {
+	tests := []struct {
+		params      *Params
+		size        uint32
+		matchesABLA bool
+	}{
+		{&MainNetParams, 32000000, true},
+		{&TestNet3Params, 32000000, true},
+		{&TestNet4Params, 2000000, true},
+		{&ChipNetParams, 2000000, true},
+		{&RegressionNetParams, 32000000, false},
+		{&SimNetParams, 32000000, true},
+	}
+	for _, test := range tests {
+		size := test.params.DefaultConsensusBlockSize
+		if size != test.size {
+			t.Errorf("%s: default block size %d, want %d",
+				test.params.Name, size, test.size)
+		}
+		abla := test.params.ABLAConfig.Epsilon0 + test.params.ABLAConfig.Beta0
+		if test.matchesABLA && abla != uint64(size) {
+			t.Errorf("%s: ABLA starts at %d, not at the default block "+
+				"size %d", test.params.Name, abla, size)
 		}
 	}
 }

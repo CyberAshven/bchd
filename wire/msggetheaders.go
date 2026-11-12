@@ -23,7 +23,7 @@ import (
 //
 // The algorithm for building the block locator hashes should be to add the
 // hashes in reverse order until you reach the genesis block.  In order to keep
-// the list of locator hashes to a resonable number of entries, first add the
+// the list of locator hashes to a reasonable number of entries, first add the
 // most recent 10 block hashes, then double the step each loop iteration to
 // exponentially decrease the number of hashes the further away from head and
 // closer to the genesis block you get.
@@ -65,10 +65,11 @@ func (msg *MsgGetHeaders) BchDecode(r io.Reader, pver uint32, enc MessageEncodin
 	}
 
 	// Create a contiguous slice of hashes to deserialize into in order to
-	// reduce the number of allocations.
-	locatorHashes := make([]chainhash.Hash, count)
-	msg.BlockLocatorHashes = make([]*chainhash.Hash, 0, count)
-	for i := uint64(0); i < count; i++ {
+	// reduce the number of allocations.  Its size is bounded by the payload.
+	n := allocCount(r, count, chainhash.HashSize, count)
+	locatorHashes := make([]chainhash.Hash, n)
+	msg.BlockLocatorHashes = make([]*chainhash.Hash, 0, n)
+	for i := range count {
 		hash := &locatorHashes[i]
 		err := readElement(r, hash)
 		if err != nil {

@@ -80,7 +80,7 @@ func listCommands() {
 	categoryTitles := make([]string, numCategories)
 	categoryTitles[categoryChain] = "Chain Server Commands:"
 	categoryTitles[categoryWallet] = "Wallet Server Commands (--wallet):"
-	for category := uint8(0); category < numCategories; category++ {
+	for category := range numCategories {
 		fmt.Println(categoryTitles[category])
 		for _, usage := range categorized[category] {
 			fmt.Println(usage)
@@ -142,7 +142,7 @@ func normalizeAddress(addr string, useTestNet3, useSimNet, useWallet bool) strin
 	return addr
 }
 
-// cleanAndExpandPath expands environement variables and leading ~ in the
+// cleanAndExpandPath expands environment variables and leading ~ in the
 // passed path, cleans the result, and returns it.
 func cleanAndExpandPath(path string) string {
 	// Expand initial ~ to OS specific home directory.
