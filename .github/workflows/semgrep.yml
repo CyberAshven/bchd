@@ -1,0 +1,83 @@
+# TEST ONLY: runs Semgrep on the script filter branches in the forks and
+# reports only the findings a branch adds over its upstream. Not for upstream.
+name: semgrep-test-only
+on:
+  push:
+    branches:
+      - ci-semgrep
+permissions:
+  contents: read
+jobs:
+  scan:
+    name: semgrep ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: bchutil
+            repo: CyberAshven/bchutil
+            ref: script-all
+            upstream: gcash/bchutil
+            packs: --config p/golang --config p/security-audit --config p/trailofbits --config p/secrets
+          - name: bchd
+            repo: CyberAshven/bchd
+            ref: scriptfilter/all
+            upstream: gcash/bchd
+            packs: --config p/golang --config p/security-audit --config p/trailofbits --config p/secrets
+          - name: neutrino
+            repo: CyberAshven/neutrino
+            ref: scriptfilter/mpfilter
+            upstream: gcash/neutrino
+            packs: --config p/golang --config p/security-audit --config p/trailofbits --config p/secrets
+          - name: neutrino-rescan-gap
+            repo: CyberAshven/neutrino
+            ref: fix/rescan-subscribe-gap
+            upstream: gcash/neutrino
+            packs: --config p/golang --config p/security-audit --config p/trailofbits --config p/secrets
+          - name: bchwallet
+            repo: CyberAshven/bchwallet
+            ref: scriptfilter/mempool
+            upstream: gcash/bchwallet
+            packs: --config p/golang --config p/security-audit --config p/trailofbits --config p/secrets
+          - name: kth
+            repo: CyberAshven/kth
+            ref: test/script-filter
+            upstream: k-nuth/kth
+            packs: --config p/c --config p/security-audit --config p/secrets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          path: src
+      - name: Find the commit the branch starts from
+        working-directory: src
+        run: |
+          git remote add upstream "https://github.com/${{ matrix.upstream }}.git"
+          git fetch --quiet upstream master
+          BASE=$(git merge-base HEAD upstream/master)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "branch ${{ matrix.ref }} at $(git rev-parse --short HEAD), base $BASE"
+          git diff --stat "$BASE" HEAD | tail -1
+      - name: Install Semgrep
+        run: python3 -m pip install --quiet semgrep
+      - name: Scan what the branch adds
+        working-directory: src
+        run: |
+          semgrep --version
+          semgrep scan --metrics off --baseline-commit "$BASE" ${{ matrix.packs }} --json --output ../findings.json --quiet || echo "semgrep exit $?"
+          python3 - <<'PY'
+          import json
+          d = json.load(open('../findings.json'))
+          rs = d.get('results', [])
+          print(f"FINDINGS {len(rs)} added by the branch")
+          for r in rs:
+              print(f"FINDING {r['path']}:{r['start']['line']} [{r['extra']['severity']}] {r['check_id']}")
+              print("   " + r['extra']['message'].strip().replace('\n', ' ')[:300])
+          print(f"SCANNED {len(d.get('paths', {}).get('scanned', []))} files")
+          for e in d.get('errors', [])[:10]:
+              print("SCANERROR", str(e)[:200])
+          PY
