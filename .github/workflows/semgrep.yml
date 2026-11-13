@@ -81,3 +81,15 @@ jobs:
           for e in d.get('errors', [])[:10]:
               print("SCANERROR", str(e)[:200])
           PY
+      - name: Control, the same rules on the whole tree
+        working-directory: src
+        run: |
+          semgrep scan --metrics off ${{ matrix.packs }} --json --output ../all.json --quiet || echo "semgrep exit $?"
+          python3 - <<'PY'
+          import json, collections
+          d = json.load(open('../all.json'))
+          rs = d.get('results', [])
+          print(f"CONTROL {len(rs)} findings in the whole tree, {len(d.get('paths', {}).get('scanned', []))} files scanned")
+          for rule, n in collections.Counter(r['check_id'] for r in rs).most_common(5):
+              print(f"CONTROLRULE {n} x {rule}")
+          PY
