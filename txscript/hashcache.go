@@ -22,6 +22,12 @@ type TxSigHashes struct {
 	HashOutputs   chainhash.Hash
 	HashUTXOS     chainhash.Hash
 	tokenDataList [][]byte
+	hasUtxos      bool
+
+	// missingUtxos lists the inputs whose spent outputs were not in the
+	// UtxoCache the spent outputs were added from, so signing can refuse
+	// the signatures that would leave them out.
+	missingUtxos []int
 }
 
 // NewTxSigHashes computes, and returns the cached sighashes of the given
@@ -35,10 +41,28 @@ func NewTxSigHashes(tx *wire.MsgTx) *TxSigHashes {
 	}
 }
 
+// AddTxSigHashUtxoFromUtxoCache adds the hash of the outputs spent by the
+// transaction and their token data to the sighashes.
 func (txSighashes *TxSigHashes) AddTxSigHashUtxoFromUtxoCache(tx *wire.MsgTx, utxoCache *UtxoCache) {
 	hash := calcHashUtxos(tx, utxoCache)
 	txSighashes.HashUTXOS = hash
-	txSighashes.tokenDataList = calUtxoTokenData(tx, utxoCache)
+	txSighashes.tokenDataList, txSighashes.missingUtxos =
+		calUtxoTokenData(tx, utxoCache)
+	txSighashes.hasUtxos = true
+}
+
+// hasAllUtxos returns whether the sighashes include the outputs spent by all
+// the inputs of the transaction, as a hash with SigHashUTXO covers them all.
+func (txSighashes *TxSigHashes) hasAllUtxos() bool {
+	return txSighashes.hasUtxos && len(txSighashes.missingUtxos) == 0
+}
+
+// WithUtxos returns a copy of the sighashes with the outputs spent by the
+// transaction added.
+func (txSighashes *TxSigHashes) WithUtxos(tx *wire.MsgTx, utxoCache *UtxoCache) *TxSigHashes {
+	sigHashes := *txSighashes
+	sigHashes.AddTxSigHashUtxoFromUtxoCache(tx, utxoCache)
+	return &sigHashes
 }
 
 // HashCache houses a set of partial sighashes keyed by txid. The set of partial
@@ -47,25 +71,45 @@ func (txSighashes *TxSigHashes) AddTxSigHashUtxoFromUtxoCache(tx *wire.MsgTx, ut
 // multiple goroutines can safely re-use the pre-computed partial sighashes
 // speeding up validation time amongst all inputs found within a block.
 type HashCache struct {
-	sigHashes map[chainhash.Hash]*TxSigHashes
+	sigHashes  map[chainhash.Hash]*TxSigHashes
+	maxEntries uint
 
 	sync.RWMutex
 }
 
 // NewHashCache returns a new instance of the HashCache given a maximum number
-// of entries which may exist within it at anytime.
+// of entries which may exist within it at anytime.  Random entries are
+// evicted to make room for new entries that would cause the number of
+// entries in the cache to exceed the max.
 func NewHashCache(maxSize uint) *HashCache {
 	return &HashCache{
-		sigHashes: make(map[chainhash.Hash]*TxSigHashes, maxSize),
+		sigHashes:  make(map[chainhash.Hash]*TxSigHashes, maxSize),
+		maxEntries: maxSize,
 	}
 }
 
 // AddSigHashes computes, then adds the partial sighashes for the passed
-// transaction.
-func (h *HashCache) AddSigHashes(tx *wire.MsgTx) {
+// transaction, and returns them.  When the cache is full, a random entry is
+// evicted to make room, as in SigCache.  Entries are purged once a block
+// holding their transactions passes validation, but those of transactions
+// that fail validation or leave the memory pool unmined stay until evicted.
+func (h *HashCache) AddSigHashes(tx *wire.MsgTx) *TxSigHashes {
+	sigHashes := NewTxSigHashes(tx)
+	if h.maxEntries == 0 {
+		return sigHashes
+	}
+	txid := tx.TxHash()
+
 	h.Lock()
-	h.sigHashes[tx.TxHash()] = NewTxSigHashes(tx)
+	if uint(len(h.sigHashes)+1) > h.maxEntries {
+		for evict := range h.sigHashes {
+			delete(h.sigHashes, evict)
+			break
+		}
+	}
+	h.sigHashes[txid] = sigHashes
 	h.Unlock()
+	return sigHashes
 }
 
 // ContainsHashes returns true if the partial sighashes for the passed
@@ -122,13 +166,13 @@ func (u *UtxoCache) AddEntry(i int, output wire.TxOut) {
 	u.Unlock()
 }
 
-// GetEntry adds a utxo entry for the given input index.
+// GetEntry returns the utxo entry for the given input index.
 func (u *UtxoCache) GetEntry(i int) (wire.TxOut, error) {
 	u.RLock()
 	utxo, ok := u.utxos[i]
+	u.RUnlock()
 	if !ok {
 		return wire.TxOut{}, errors.New("not found")
 	}
-	u.RUnlock()
 	return utxo, nil
 }

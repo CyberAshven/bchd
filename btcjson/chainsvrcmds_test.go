@@ -42,6 +42,91 @@ func TestChainSvrCmds(t *testing.T) {
 			unmarshalled: &btcjson.AddNodeCmd{Addr: "127.0.0.1", SubCmd: btcjson.ANRemove},
 		},
 		{
+			name: "clearbanned",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("clearbanned")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewClearBannedCmd(nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"clearbanned","params":[],"id":1}`,
+			unmarshalled: &btcjson.ClearBannedCmd{
+				Manual:    btcjson.Bool(true),
+				Automatic: btcjson.Bool(true),
+			},
+		},
+		{
+			name: "clearbanned optional",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("clearbanned", false, true)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewClearBannedCmd(btcjson.Bool(false), btcjson.Bool(true))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"clearbanned","params":[false,true],"id":1}`,
+			unmarshalled: &btcjson.ClearBannedCmd{
+				Manual:    btcjson.Bool(false),
+				Automatic: btcjson.Bool(true),
+			},
+		},
+		{
+			name: "clearbanned second only",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("clearbanned", true, false)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewClearBannedCmd(nil, btcjson.Bool(false))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"clearbanned","params":[true,false],"id":1}`,
+			unmarshalled: &btcjson.ClearBannedCmd{
+				Manual:    btcjson.Bool(true),
+				Automatic: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "listbanned",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("listbanned")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewListBannedCmd()
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"listbanned","params":[],"id":1}`,
+			unmarshalled: &btcjson.ListBannedCmd{},
+		},
+		{
+			name: "setban",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("setban", "192.168.0.0/24", btcjson.SBAdd)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewSetBanCmd("192.168.0.0/24", btcjson.SBAdd, nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"setban","params":["192.168.0.0/24","add"],"id":1}`,
+			unmarshalled: &btcjson.SetBanCmd{
+				Subnet:   "192.168.0.0/24",
+				Command:  btcjson.SBAdd,
+				BanTime:  btcjson.Int64(0),
+				Absolute: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "setban optional",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("setban", "1.2.3.4", btcjson.SBRemove, 86400, true)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewSetBanCmd("1.2.3.4", btcjson.SBRemove, btcjson.Int64(86400), btcjson.Bool(true))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"setban","params":["1.2.3.4","remove",86400,true],"id":1}`,
+			unmarshalled: &btcjson.SetBanCmd{
+				Subnet:   "1.2.3.4",
+				Command:  btcjson.SBRemove,
+				BanTime:  btcjson.Int64(86400),
+				Absolute: btcjson.Bool(true),
+			},
+		},
+		{
 			name: "createrawtransaction",
 			newCmd: func() (interface{}, error) {
 				return btcjson.NewCmd("createrawtransaction", `[{"txid":"123","vout":1}]`,
@@ -101,6 +186,31 @@ func TestChainSvrCmds(t *testing.T) {
 				LockTime:   btcjson.Int64(12312333333),
 			},
 		},
+		{
+			name: "createrawtransaction cashtokens",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("createrawtransaction", `[]`,
+					`{"456":0.0123}`, `[{"address":"456","category":"00",`+
+						`"amount":5,"capability":"none","commitment":"ab"}]`)
+			},
+			staticCmd: func() interface{} {
+				amounts := map[string]float64{"456": .0123}
+				cashTokens := &[]btcjson.TransactionOutputCashToken{{
+					Address: "456", Category: "00", Amount: 5,
+					Capability: "none", Commitment: "ab",
+				}}
+				return btcjson.NewCreateRawTransactionCmd(nil, amounts, cashTokens, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"createrawtransaction","params":[[],{"456":0.0123},[{"address":"456","category":"00","amount":5,"capability":"none","commitment":"ab"}]],"id":1}`,
+			unmarshalled: &btcjson.CreateRawTransactionCmd{
+				Inputs:  []btcjson.TransactionInput{},
+				Amounts: map[string]float64{"456": .0123},
+				CashTokens: &[]btcjson.TransactionOutputCashToken{{
+					Address: "456", Category: "00", Amount: 5,
+					Capability: "none", Commitment: "ab",
+				}},
+			},
+		},
 
 		{
 			name: "decoderawtransaction",
@@ -147,6 +257,62 @@ func TestChainSvrCmds(t *testing.T) {
 			unmarshalled: &btcjson.GetAddedNodeInfoCmd{
 				DNS:  true,
 				Node: btcjson.String("127.0.0.1"),
+			},
+		},
+		{
+			name: "listbcmridentities",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("listbcmridentities")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewListBcmrIdentitiesCmd(nil, nil)
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"listbcmridentities","params":[],"id":1}`,
+			unmarshalled: &btcjson.ListBcmrIdentitiesCmd{},
+		},
+		{
+			name: "listbcmridentities limit alone",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("listbcmridentities", "", 10)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewListBcmrIdentitiesCmd(nil, btcjson.Int(10))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"listbcmridentities","params":["",10],"id":1}`,
+			unmarshalled: &btcjson.ListBcmrIdentitiesCmd{
+				After: btcjson.String(""),
+				Limit: btcjson.Int(10),
+			},
+		},
+		{
+			name: "getbcmridentity",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getbcmridentity", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetBcmrIdentityCmd("123", nil, nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getbcmridentity","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.GetBcmrIdentityCmd{
+				Authbase:         "123",
+				IncludeAuthchain: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "getbcmridentity optional",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getbcmridentity", "123", true, "456", 10)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetBcmrIdentityCmd("123", btcjson.Bool(true),
+					btcjson.String("456"), btcjson.Int(10))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getbcmridentity","params":["123",true,"456",10],"id":1}`,
+			unmarshalled: &btcjson.GetBcmrIdentityCmd{
+				Authbase:         "123",
+				IncludeAuthchain: btcjson.Bool(true),
+				After:            btcjson.String("456"),
+				Limit:            btcjson.Int(10),
 			},
 		},
 		{
@@ -466,6 +632,76 @@ func TestChainSvrCmds(t *testing.T) {
 			},
 			marshalled:   `{"jsonrpc":"1.0","method":"getdifficulty","params":[],"id":1}`,
 			unmarshalled: &btcjson.GetDifficultyCmd{},
+		},
+		{
+			name: "getdsproof",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getdsproof", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetDSProofCmd(btcjson.DSProofQuery("123"), nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getdsproof","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.GetDSProofCmd{
+				Query:     btcjson.DSProofQuery("123"),
+				Verbosity: btcjson.DSProofVerbosityPtr(2),
+				Recursive: btcjson.Bool(true),
+			},
+		},
+		{
+			name: "getdsproof outpoint",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getdsproof", `{"txid":"123","vout":1}`, 2, false)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetDSProofCmd(btcjson.DSProofQuery(`{"txid":"123","vout":1}`),
+					btcjson.DSProofVerbosityPtr(2), btcjson.Bool(false))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getdsproof","params":[{"txid":"123","vout":1},2,false],"id":1}`,
+			unmarshalled: &btcjson.GetDSProofCmd{
+				Query:     btcjson.DSProofQuery(`{"txid":"123","vout":1}`),
+				Verbosity: btcjson.DSProofVerbosityPtr(2),
+				Recursive: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "getdsprooflist",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getdsprooflist", 1, true)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetDSProofListCmd(btcjson.DSProofVerbosityPtr(1), btcjson.Bool(true))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getdsprooflist","params":[1,true],"id":1}`,
+			unmarshalled: &btcjson.GetDSProofListCmd{
+				Verbosity:      btcjson.DSProofVerbosityPtr(1),
+				IncludeOrphans: btcjson.Bool(true),
+			},
+		},
+		{
+			name: "getdsprooflist defaults",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getdsprooflist")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetDSProofListCmd(nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"getdsprooflist","params":[],"id":1}`,
+			unmarshalled: &btcjson.GetDSProofListCmd{
+				Verbosity:      btcjson.DSProofVerbosityPtr(0),
+				IncludeOrphans: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "getdsproofscore",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getdsproofscore", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetDSProofScoreCmd("123")
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"getdsproofscore","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.GetDSProofScoreCmd{TxID: "123"},
 		},
 		{
 			name: "getgenerate",
@@ -802,6 +1038,30 @@ func TestChainSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			name: "finalizeblock",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("finalizeblock", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewFinalizeBlockCmd("123")
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"finalizeblock","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.FinalizeBlockCmd{
+				BlockHash: "123",
+			},
+		},
+		{
+			name: "getfinalizedblockhash",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("getfinalizedblockhash")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewGetFinalizedBlockHashCmd()
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"getfinalizedblockhash","params":[],"id":1}`,
+			unmarshalled: &btcjson.GetFinalizedBlockHashCmd{},
+		},
+		{
 			name: "invalidateblock",
 			newCmd: func() (interface{}, error) {
 				return btcjson.NewCmd("invalidateblock", "123")
@@ -1110,6 +1370,34 @@ func TestChainSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			name: "testmempoolaccept",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("testmempoolaccept", []string{"1122"})
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewTestMempoolAcceptCmd([]string{"1122"}, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"testmempoolaccept","params":[["1122"]],"id":1}`,
+			unmarshalled: &btcjson.TestMempoolAcceptCmd{
+				RawTxs:        []string{"1122"},
+				AllowHighFees: btcjson.Bool(false),
+			},
+		},
+		{
+			name: "testmempoolaccept optional",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("testmempoolaccept", []string{"1122"}, true)
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewTestMempoolAcceptCmd([]string{"1122"}, btcjson.Bool(true))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"testmempoolaccept","params":[["1122"],true],"id":1}`,
+			unmarshalled: &btcjson.TestMempoolAcceptCmd{
+				RawTxs:        []string{"1122"},
+				AllowHighFees: btcjson.Bool(true),
+			},
+		},
+		{
 			name: "uptime",
 			newCmd: func() (interface{}, error) {
 				return btcjson.NewCmd("uptime")
@@ -1321,6 +1609,189 @@ func TestChainSvrCmdErrors(t *testing.T) {
 					gotErrorCode, terr, terr.ErrorCode)
 				continue
 			}
+		}
+	}
+}
+
+// TestVerbosityLevelUnmarshal ensures the getblock verbosity accepts a boolean
+// or a non-negative integer and passes any level above 3 through for the
+// command to treat as level 3.
+func TestVerbosityLevelUnmarshal(t *testing.T) {
+	t.Parallel()
+
+	// A wanted level of -1 means the value must be rejected.
+	tests := []struct {
+		marshalled string
+		want       btcjson.VerbosityLevel
+	}{
+		{"false", 0}, {"true", 1}, {"0", 0}, {"1", 1}, {"2", 2},
+		{"3", 3}, {"4", 4}, {"-1", -1}, {"2.5", -1}, {`"3"`, -1},
+		{"4294967296", -1},
+	}
+	for _, test := range tests {
+		var level btcjson.VerbosityLevel
+		err := json.Unmarshal([]byte(test.marshalled), &level)
+		if (err != nil) != (test.want < 0) ||
+			(err == nil && level != test.want) {
+
+			t.Errorf("%s: unexpected result - got level %d, "+
+				"error %v", test.marshalled, level, err)
+		}
+	}
+}
+
+// TestCreateRawTransactionTokenAmount ensures a token amount is kept exact
+// from the request to the command, whether it is sent as a JSON integer or a
+// string, and that amounts that are not whole non-negative numbers are
+// rejected.
+func TestCreateRawTransactionTokenAmount(t *testing.T) {
+	t.Parallel()
+
+	// A wanted amount of -1 means the value must be rejected.
+	tests := []struct {
+		amount string
+		want   int64
+	}{
+		{`9007199254740993`, 9007199254740993},
+		{`"9007199254740993"`, 9007199254740993},
+		{`9223372036854775807`, 9223372036854775807},
+		{`"9223372036854775807"`, 9223372036854775807},
+		{`0`, 0},
+		{`1.5`, -1},
+		{`-1`, -1},
+		{`"abc"`, -1},
+	}
+	for _, test := range tests {
+		raw := `{"jsonrpc":"1.0","method":"createrawtransaction","params":` +
+			`[[],{},[{"address":"a","category":"00","amount":` +
+			test.amount + `}]],"id":1}`
+		var req btcjson.Request
+		if err := json.Unmarshal([]byte(raw), &req); err != nil {
+			t.Errorf("%s: %v", test.amount, err)
+			continue
+		}
+		cmd, err := btcjson.UnmarshalCmd(&req)
+		if test.want < 0 {
+			if err == nil {
+				t.Errorf("%s: expected an error", test.amount)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", test.amount, err)
+			continue
+		}
+		tokens := *cmd.(*btcjson.CreateRawTransactionCmd).CashTokens
+		if len(tokens) != 1 || tokens[0].Amount != uint64(test.want) ||
+			tokens[0].Address != "a" || tokens[0].Category != "00" {
+
+			t.Errorf("%s: got %+v", test.amount, tokens)
+		}
+	}
+}
+
+// TestTransactionOutputCashTokenJSON ensures a cashtokens entry is marshalled
+// with the names bchd documents and reads, without the capability and the
+// commitment when they are empty, as for no NFT, and that an entry with Go's
+// field names, as earlier clients sent it, still decodes to the same entry,
+// with the amount as an integer or a string.
+func TestTransactionOutputCashTokenJSON(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		token btcjson.TransactionOutputCashToken
+		want  string
+	}{{
+		btcjson.TransactionOutputCashToken{Address: "a", Category: "00",
+			Amount: 5},
+		`{"address":"a","category":"00","amount":5}`,
+	}, {
+		btcjson.TransactionOutputCashToken{Address: "a", Category: "00",
+			Capability: "mutable", Commitment: "ab"},
+		`{"address":"a","category":"00","amount":0,"capability":"mutable",` +
+			`"commitment":"ab"}`,
+	}} {
+		got, err := json.Marshal(test.token)
+		if err != nil || string(got) != test.want {
+			t.Errorf("%+v: got %s, err %v, want %s", test.token, got, err,
+				test.want)
+		}
+		var back btcjson.TransactionOutputCashToken
+		if err := json.Unmarshal(got, &back); err != nil || back != test.token {
+			t.Errorf("%s: decoded %+v, err %v", got, back, err)
+		}
+	}
+
+	want := btcjson.TransactionOutputCashToken{Address: "a", Category: "00",
+		Amount: 18446744073709551615, Capability: "minting", Commitment: "ab"}
+	for _, entry := range []string{
+		`{"Address":"a","Category":"00","Amount":18446744073709551615,` +
+			`"Capability":"minting","Commitment":"ab"}`,
+		`{"Address":"a","Category":"00","Amount":"18446744073709551615",` +
+			`"Capability":"minting","Commitment":"ab"}`,
+		`{"address":"a","category":"00","amount":"18446744073709551615",` +
+			`"capability":"minting","commitment":"ab"}`,
+	} {
+		var got btcjson.TransactionOutputCashToken
+		if err := json.Unmarshal([]byte(entry), &got); err != nil || got != want {
+			t.Errorf("%s: got %+v, err %v, want %+v", entry, got, err, want)
+		}
+	}
+}
+
+// TestGetDSProofParams checks the bool form of the verbosity, which maps
+// true to 2, and the outpoint form of the query.
+func TestGetDSProofParams(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		params    string
+		outPoint  *btcjson.DSProofQueryOutPoint
+		hash      string
+		verbosity int
+		wantErr   bool
+	}{
+		{`["ab", true]`, nil, "ab", 2, false},
+		{`["ab", false]`, nil, "ab", 0, false},
+		{`["ab", 3]`, nil, "ab", 3, false},
+		{`[{"txid": "ab", "vout": 7}]`, &btcjson.DSProofQueryOutPoint{TxID: "ab", Vout: 7}, "", 2, false},
+		{`[{"txid": "ab", "vout": -1}]`, &btcjson.DSProofQueryOutPoint{TxID: "ab", Vout: -1}, "", 2, false},
+		{`[{"txid": "ab"}]`, nil, "", 2, true},
+		{`[{"vout": 1}]`, nil, "", 2, true},
+		{`[{"txid": "ab", "vout": 1.5}]`, nil, "", 2, true},
+		{`[5]`, nil, "", 0, true},
+		{`["ab", "x"]`, nil, "", 0, true},
+	}
+	for i, test := range tests {
+		var params []json.RawMessage
+		if err := json.Unmarshal([]byte(test.params), &params); err != nil {
+			t.Fatal(err)
+		}
+		req := &btcjson.Request{Jsonrpc: "1.0", Method: "getdsproof", ID: 1, Params: params}
+		cmd, err := btcjson.UnmarshalCmd(req)
+		if err != nil {
+			if !test.wantErr {
+				t.Errorf("#%d: error %v", i, err)
+			}
+			continue
+		}
+		c := cmd.(*btcjson.GetDSProofCmd)
+		if int(*c.Verbosity) != test.verbosity {
+			t.Errorf("#%d: verbosity %d", i, *c.Verbosity)
+		}
+		if !c.Query.IsOutPoint() {
+			if test.wantErr || string(c.Query) != test.hash {
+				t.Errorf("#%d: query %q", i, c.Query)
+			}
+			continue
+		}
+		op, err := c.Query.OutPoint()
+		if (err != nil) != test.wantErr {
+			t.Errorf("#%d: outpoint error %v", i, err)
+			continue
+		}
+		if err == nil && !reflect.DeepEqual(op, test.outPoint) {
+			t.Errorf("#%d: outpoint %+v", i, op)
 		}
 	}
 }

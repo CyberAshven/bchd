@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +23,37 @@ type txValidateItem struct {
 	txIn        *wire.TxIn
 	tx          *bchutil.Tx
 	sigHashes   *txscript.TxSigHashes
+	spent       *txSpentOutputs
 	txSigChecks *uint32
+}
+
+// txSpentOutputs holds the outputs spent by a transaction, built once and
+// shared by the validation of all of its inputs.
+type txSpentOutputs struct {
+	utxos *txscript.UtxoCache
+
+	// missing is the index of the first input whose spent output is not
+	// in the view, or -1 when all of them are.
+	missing int
+
+	tokensOnce sync.Once
+	tokensErr  error
+}
+
+// newTxSpentOutputs looks up the outputs spent by the passed transaction.
+func newTxSpentOutputs(tx *bchutil.Tx, utxoView *UtxoViewpoint) *txSpentOutputs {
+	spent := &txSpentOutputs{utxos: txscript.NewUtxoCache(), missing: -1}
+	for i, in := range tx.MsgTx().TxIn {
+		u := utxoView.LookupEntry(in.PreviousOutPoint)
+		if u == nil {
+			if spent.missing < 0 {
+				spent.missing = i
+			}
+			continue
+		}
+		spent.utxos.AddEntry(i, *wire.NewTxOut(u.amount, u.pkScript, u.tokenData))
+	}
+	return spent
 }
 
 // txValidator provides a type which asynchronously validates transaction
@@ -73,30 +104,20 @@ out:
 				v.sendResult(err)
 				break out
 			}
-			// Create a new script engine for the script pair.
-			sigScript := txIn.SignatureScript
+			// The script and amount of the spent output.
 			pkScript := utxo.PkScript()
 			inputAmount := utxo.Amount()
-			tokenData := utxo.tokenData
 
-			utxoEntryCache := txscript.NewUtxoCache()
-			for i, in := range txVI.tx.MsgTx().TxIn {
-				if i == txVI.txInIndex {
-					utxoEntryCache.AddEntry(i, *wire.NewTxOut(utxo.amount, utxo.pkScript, tokenData))
-					continue
-				}
-				u := v.utxoView.LookupEntry(in.PreviousOutPoint)
-				if u == nil {
-					str := fmt.Sprintf("unable to find unspent "+
-						"output %v referenced from "+
-						"transaction %s:%d",
-						in.PreviousOutPoint, txVI.tx.Hash(),
-						i)
-					err := ruleError(ErrMissingTxOut, str)
-					v.sendResult(err)
-					break out
-				}
-				utxoEntryCache.AddEntry(i, *wire.NewTxOut(u.amount, u.pkScript, u.tokenData))
+			spent := txVI.spent
+			if i := spent.missing; i >= 0 {
+				str := fmt.Sprintf("unable to find unspent "+
+					"output %v referenced from "+
+					"transaction %s:%d",
+					txVI.tx.MsgTx().TxIn[i].PreviousOutPoint,
+					txVI.tx.Hash(), i)
+				err := ruleError(ErrMissingTxOut, str)
+				v.sendResult(err)
+				break out
 			}
 
 			isPATFO := IsPATFO(
@@ -118,44 +139,27 @@ out:
 			}
 
 			if v.flags.HasFlag(txscript.ScriptAllowCashTokens) {
-				_, err := wire.RunCashTokensValidityAlgorithm(
-					utxoEntryCache, txVI.tx.MsgTx(), v.flags.HasFlag(txscript.ScriptAllowMay2026))
-				if err != nil {
-					v.sendResult(err)
+				spent.tokensOnce.Do(func() {
+					_, spent.tokensErr = wire.RunCashTokensValidityAlgorithm(
+						spent.utxos, txVI.tx.MsgTx(), v.flags.HasFlag(txscript.ScriptAllowMay2026))
+				})
+				if err := spent.tokensErr; err != nil {
+					str := fmt.Sprintf("transaction %s fails the "+
+						"token validity algorithm: %v",
+						txVI.tx.Hash(), err)
+					v.sendResult(ruleError(ErrCashTokensValidation, str))
+					break out
 				}
 			}
 
-			vm, err := txscript.NewEngine(pkScript, txVI.tx.MsgTx(),
-				txVI.txInIndex, v.flags, v.sigCache, txVI.sigHashes,
-				utxoEntryCache, inputAmount)
+			inputSigChecks, err := checkInputScript(txVI, pkScript,
+				inputAmount, v.flags, v.sigCache)
 			if err != nil {
-				str := fmt.Sprintf("failed to parse input "+
-					"%s:%d which references output %v - "+
-					"%v (input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptMalformed, str)
 				v.sendResult(err)
 				break out
 			}
 
-			// Execute the script pair.
-			if err := vm.Execute(); err != nil {
-				str := fmt.Sprintf("failed to validate input "+
-					"%s:%d which references output %v - "+
-					"%v (input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptValidation, str)
-				v.sendResult(err)
-				break out
-			}
-
-			txSigChecks := atomic.AddUint32(txVI.txSigChecks, uint32(vm.SigChecks()))
+			txSigChecks := atomic.AddUint32(txVI.txSigChecks, uint32(inputSigChecks))
 
 			if v.flags.HasFlag(txscript.ScriptReportSigChecks) && txSigChecks > MaxTransactionSigChecks {
 				str := fmt.Sprintf("transaction %s too many sig checks",
@@ -166,7 +170,7 @@ out:
 			}
 
 			if v.maxSigChecks > 0 && v.flags.HasFlag(txscript.ScriptReportSigChecks) {
-				if v.sigChecks.Add(uint32(vm.SigChecks())) > v.maxSigChecks {
+				if v.sigChecks.Add(uint32(inputSigChecks)) > v.maxSigChecks {
 					str := "block too many sig checks"
 					err := ruleError(ErrTooManySigChecks, str)
 					v.sendResult(err)
@@ -181,6 +185,47 @@ out:
 			break out
 		}
 	}
+}
+
+// checkInputScript runs the script of the input txVI describes, which spends
+// an output with the passed script and amount, and returns the number of
+// sigchecks it did.  A script that fails gives an ErrScriptMalformed or
+// ErrScriptValidation rule error holding the script engine's error and the
+// index of the input.
+func checkInputScript(txVI *txValidateItem, pkScript []byte, inputAmount int64,
+	flags txscript.ScriptFlags, sigCache *txscript.SigCache) (int, error) {
+
+	txIn := txVI.txIn
+	vm, err := txscript.NewEngine(pkScript, txVI.tx.MsgTx(),
+		txVI.txInIndex, flags, sigCache, txVI.sigHashes,
+		txVI.spent.utxos, inputAmount)
+	if err != nil {
+		str := fmt.Sprintf("failed to parse input "+
+			"%s:%d which references output %v - "+
+			"%v (input script "+
+			"bytes %x, prev output script bytes %x)",
+			txVI.tx.Hash(), txVI.txInIndex,
+			txIn.PreviousOutPoint, err,
+			txIn.SignatureScript, pkScript)
+		return 0, RuleError{ErrorCode: ErrScriptMalformed,
+			Description: str, ScriptErr: err,
+			InputIndex: txVI.txInIndex}
+	}
+
+	// Execute the script pair.
+	if err := vm.Execute(); err != nil {
+		str := fmt.Sprintf("failed to validate input "+
+			"%s:%d which references output %v - "+
+			"%v (input script "+
+			"bytes %x, prev output script bytes %x)",
+			txVI.tx.Hash(), txVI.txInIndex,
+			txIn.PreviousOutPoint, err,
+			txIn.SignatureScript, pkScript)
+		return 0, RuleError{ErrorCode: ErrScriptValidation,
+			Description: str, ScriptErr: err,
+			InputIndex: txVI.txInIndex}
+	}
+	return vm.SigChecks(), nil
 }
 
 // Validate validates the scripts for all of the passed transaction inputs using
@@ -203,7 +248,7 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 
 	// Start up validation handlers that are used to asynchronously
 	// validate each transaction input.
-	for i := 0; i < maxGoRoutines; i++ {
+	for range maxGoRoutines {
 		go v.validateHandler()
 	}
 
@@ -258,65 +303,67 @@ func newTxValidator(utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
 	}
 }
 
-// ValidateTransactionScripts validates the scripts for the passed transaction
-// using multiple goroutines. It returns the number of sigchecks in the transaction.
-func ValidateTransactionScripts(tx *bchutil.Tx, utxoView *UtxoViewpoint,
-	flags txscript.ScriptFlags, sigCache *txscript.SigCache,
-	hashCache *txscript.HashCache, upgrade9ForkHeight int32) (uint32, error) {
+// txValidateItems returns the inputs of the passed transaction to validate,
+// sharing the sighashes and spent outputs of the transaction.
+func txValidateItems(tx *bchutil.Tx, utxoView *UtxoViewpoint,
+	flags txscript.ScriptFlags, hashCache *txscript.HashCache,
+	sigChecks *uint32) []*txValidateItem {
 
 	// If the HashCache is present, and it doesn't yet contain the
 	// partial sighashes for this transaction, then we add the
 	// sighashes for the transaction. This allows us to take
 	// advantage of the potential speed savings due to the new
-	// digest algorithm (BIP0143).
+	// digest algorithm (BIP0143).  The sighashes added are used
+	// directly, since another transaction's entry may evict them.
 	hash := tx.Hash()
-	if flags.HasFlag(txscript.ScriptVerifyBip143SigHash) && hashCache != nil &&
-		!hashCache.ContainsHashes(hash) {
-
-		hashCache.AddSigHashes(tx.MsgTx())
-	}
-
 	var cachedHashes *txscript.TxSigHashes
 	if hashCache != nil {
 		cachedHashes, _ = hashCache.GetSigHashes(hash)
+		if cachedHashes == nil &&
+			flags.HasFlag(txscript.ScriptVerifyBip143SigHash) {
+
+			cachedHashes = hashCache.AddSigHashes(tx.MsgTx())
+		}
 	} else {
 		cachedHashes = txscript.NewTxSigHashes(tx.MsgTx())
 	}
 
+	spent := newTxSpentOutputs(tx, utxoView)
 	if cachedHashes != nil {
-		utxoCache := txscript.NewUtxoCache()
-		for i, in := range tx.MsgTx().TxIn {
-			u := utxoView.LookupEntry(in.PreviousOutPoint)
-			if u == nil {
-				break // Raise error?
-			}
-			utxoCache.AddEntry(i, *wire.NewTxOut(u.amount, u.pkScript, u.tokenData))
-		}
+		// Add the spent outputs to a copy, leaving the cached entry as is.
 		if flags.HasFlag(txscript.ScriptAllowCashTokens) {
-			cachedHashes.AddTxSigHashUtxoFromUtxoCache(tx.MsgTx(), utxoCache)
+			cachedHashes = cachedHashes.WithUtxos(tx.MsgTx(), spent.utxos)
 		}
 	}
 
-	// Collect all of the transaction inputs and required information for
-	// validation.
-	sigChecks := uint32(0)
 	txIns := tx.MsgTx().TxIn
-	txValItems := make([]*txValidateItem, 0, len(txIns))
+	items := make([]*txValidateItem, 0, len(txIns))
 	for txInIdx, txIn := range txIns {
 		// Skip coinbases.
 		if txIn.PreviousOutPoint.Index == math.MaxUint32 {
 			continue
 		}
 
-		txVI := &txValidateItem{
+		items = append(items, &txValidateItem{
 			txInIndex:   txInIdx,
 			txIn:        txIn,
 			tx:          tx,
-			txSigChecks: &sigChecks,
 			sigHashes:   cachedHashes,
-		}
-		txValItems = append(txValItems, txVI)
+			spent:       spent,
+			txSigChecks: sigChecks,
+		})
 	}
+	return items
+}
+
+// ValidateTransactionScripts validates the scripts for the passed transaction
+// using multiple goroutines. It returns the number of sigchecks in the transaction.
+func ValidateTransactionScripts(tx *bchutil.Tx, utxoView *UtxoViewpoint,
+	flags txscript.ScriptFlags, sigCache *txscript.SigCache,
+	hashCache *txscript.HashCache, upgrade9ForkHeight int32) (uint32, error) {
+
+	sigChecks := uint32(0)
+	txValItems := txValidateItems(tx, utxoView, flags, hashCache, &sigChecks)
 
 	// Validate all of the inputs.
 	validator := newTxValidator(utxoView, flags, sigCache, hashCache, 0, upgrade9ForkHeight)
@@ -326,14 +373,45 @@ func ValidateTransactionScripts(tx *bchutil.Tx, utxoView *UtxoViewpoint,
 	return sigChecks, nil
 }
 
+// ValidateTransactionInputScript runs the script of the input at index
+// txInIdx of the passed transaction alone, with the passed flags and no limit
+// on the sigchecks of the transaction.  The memory pool runs an input whose
+// script failed again with other flags to tell what made it fail.
+func ValidateTransactionInputScript(tx *bchutil.Tx, txInIdx int,
+	utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
+	sigCache *txscript.SigCache, hashCache *txscript.HashCache) error {
+
+	for _, item := range txValidateItems(tx, utxoView, flags, hashCache,
+		new(uint32)) {
+
+		if item.txInIndex != txInIdx {
+			continue
+		}
+		utxo := utxoView.LookupEntry(item.txIn.PreviousOutPoint)
+		if utxo == nil {
+			str := fmt.Sprintf("unable to find unspent output %v "+
+				"referenced from transaction %s:%d",
+				item.txIn.PreviousOutPoint, tx.Hash(), txInIdx)
+			return ruleError(ErrMissingTxOut, str)
+		}
+		_, err := checkInputScript(item, utxo.PkScript(), utxo.Amount(),
+			flags, sigCache)
+		return err
+	}
+	return AssertError(fmt.Sprintf("transaction %s has no input %d to "+
+		"validate", tx.Hash(), txInIdx))
+}
+
 // Checks if the input contains pre-activation token-forgery output.
 // PATFOs are provably unspendable so a better place to check for them might be inside
-// txscript.IsUnspendable() but since we need to check for block heights, to mimimize
+// txscript.IsUnspendable() but since we need to check for block heights, to minimize
 // changes in the codebase, we handle it here. It might be a good idea to change this later.
+// Tokens are enabled from the block after upgrade9ForkHeight, so an output
+// created at or below that height is a PATFO.
 func IsPATFO(tokenData wire.TokenData, pkScript []byte, utxoBlockHeight int32, upgrade9ForkHeight int32) bool {
 	isPATFO := false
 	if !tokenData.IsEmpty() || (len(pkScript) > 0 && pkScript[0] == 0xef) {
-		if utxoBlockHeight < upgrade9ForkHeight {
+		if utxoBlockHeight <= upgrade9ForkHeight {
 			isPATFO = true
 		}
 	}
@@ -355,55 +433,8 @@ func checkBlockScripts(block *bchutil.Block, utxoView *UtxoViewpoint,
 	txValItems := make([]*txValidateItem, 0, numInputs)
 	for _, tx := range block.Transactions() {
 		sigChecks := uint32(0)
-
-		// If the HashCache is present, and it doesn't yet contain the
-		// partial sighashes for this transaction, then we add the
-		// sighashes for the transaction. This allows us to take
-		// advantage of the potential speed savings due to the new
-		// digest algorithm (BIP0143).
-		hash := tx.Hash()
-		if scriptFlags.HasFlag(txscript.ScriptVerifyBip143SigHash) && hashCache != nil &&
-			!hashCache.ContainsHashes(hash) {
-
-			hashCache.AddSigHashes(tx.MsgTx())
-		}
-
-		var cachedHashes *txscript.TxSigHashes
-		if hashCache != nil {
-			cachedHashes, _ = hashCache.GetSigHashes(hash)
-		} else {
-			cachedHashes = txscript.NewTxSigHashes(tx.MsgTx())
-		}
-
-		if cachedHashes != nil {
-			utxoCache := txscript.NewUtxoCache()
-			for i, in := range tx.MsgTx().TxIn {
-				u := utxoView.LookupEntry(in.PreviousOutPoint)
-				if u == nil {
-					break // Raise error?
-				}
-				utxoCache.AddEntry(i, *wire.NewTxOut(u.amount, u.pkScript, u.tokenData))
-			}
-			if scriptFlags.HasFlag(txscript.ScriptAllowCashTokens) {
-				cachedHashes.AddTxSigHashUtxoFromUtxoCache(tx.MsgTx(), utxoCache)
-			}
-		}
-
-		for txInIdx, txIn := range tx.MsgTx().TxIn {
-			// Skip coinbases.
-			if txIn.PreviousOutPoint.Index == math.MaxUint32 {
-				continue
-			}
-
-			txVI := &txValidateItem{
-				txInIndex:   txInIdx,
-				txIn:        txIn,
-				tx:          tx,
-				sigHashes:   cachedHashes,
-				txSigChecks: &sigChecks,
-			}
-			txValItems = append(txValItems, txVI)
-		}
+		txValItems = append(txValItems, txValidateItems(tx, utxoView,
+			scriptFlags, hashCache, &sigChecks)...)
 	}
 
 	// Validate all of the inputs.

@@ -14,6 +14,7 @@ import (
 	"github.com/gcash/bchd/blockchain"
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/database"
+	"github.com/gcash/bchd/wire"
 	"github.com/gcash/bchutil"
 )
 
@@ -31,6 +32,13 @@ var (
 // requires the ability to look up inputs for a transaction.
 type NeedsInputser interface {
 	NeedsInputs() bool
+}
+
+// ChainUser is the interface of an index that reads the chain itself, beyond
+// the blocks and spent outputs the index manager hands it.  The manager hands
+// it the chain before it initializes the index.
+type ChainUser interface {
+	UseChain(chain *blockchain.BlockChain)
 }
 
 // Indexer provides a generic interface for an indexer that is managed by an
@@ -121,4 +129,29 @@ func interruptRequested(interrupted <-chan struct{}) bool {
 	}
 
 	return false
+}
+
+// blockTxLocs returns the offset and length of each transaction within the
+// serialized block.  It returns what block.TxLoc does without decoding a copy
+// of the block.
+func blockTxLocs(block *bchutil.Block) ([]wire.TxLoc, error) {
+	serialized, err := block.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	return wire.BlockTxLocs(serialized)
+}
+
+// deleteBucketsIfExist deletes those of the passed buckets that exist in the
+// parent bucket.
+func deleteBucketsIfExist(parent database.Bucket, names ...[]byte) error {
+	for _, name := range names {
+		if parent.Bucket(name) == nil {
+			continue
+		}
+		if err := parent.DeleteBucket(name); err != nil {
+			return err
+		}
+	}
+	return nil
 }

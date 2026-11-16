@@ -8,9 +8,11 @@ package txscript
 import (
 	"fmt"
 	"math/big"
+	"slices"
 
 	"github.com/gcash/bchd/bchec"
 	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchlog"
 )
 
 // ScriptFlags is a bitmask defining additional operations or tests that will be
@@ -168,6 +170,31 @@ const (
 	MaxFunctionIdentifierLength = 7
 )
 
+// definedFunction is a function body stored by OP_DEFINE.  The body is parsed
+// the first time the function is invoked and the result is reused by later
+// invocations.
+type definedFunction struct {
+	body     []byte
+	ops      []parsedOpcode
+	parseErr error
+	parsed   bool
+}
+
+// parse returns the parsed opcodes of the function body.
+func (f *definedFunction) parse() ([]parsedOpcode, error) {
+	if !f.parsed {
+		ops, err := parseScript(f.body)
+		if err == nil {
+			// Drop the spare capacity parseScript reserves.
+			f.ops = make([]parsedOpcode, len(ops))
+			copy(f.ops, ops)
+		}
+		f.parseErr = err
+		f.parsed = true
+	}
+	return f.ops, f.parseErr
+}
+
 type stackFrame struct {
 	script       []parsedOpcode
 	scriptOff    int
@@ -195,12 +222,14 @@ type Engine struct {
 	flags                ScriptFlags
 	sigCache             *SigCache
 	hashCache            *TxSigHashes
+	sigHashes            *TxSigHashes // sighashes used for signature checks
 	utxoCache            *UtxoCache
 	bip16                bool     // treat execution as pay-to-script-hash
+	p2sh32               bool     // spent output is P2SH32
 	savedFirstStack      [][]byte // stack from first script for bip16 scripts
 	inputAmount          int64
 	sigChecks            int
-	functionTable        map[string][]byte
+	functionTable        map[string]*definedFunction // made by the first OP_DEFINE
 	definedFunctionCount int
 	frameStack           []stackFrame
 }
@@ -230,9 +259,9 @@ func (vm *Engine) IsBranchExecuting() bool {
 		return true
 	}
 	//return vm.condStack[len(vm.condStack)-1] == OpCondTrue
-	for i := len(vm.condStack) - 1; i >= 0; i-- {
-		if !isCondStackLoop(vm.condStack[i]) {
-			return vm.condStack[i] == OpCondTrue
+	for _, cond := range slices.Backward(vm.condStack) {
+		if !isCondStackLoop(cond) {
+			return cond == OpCondTrue
 		}
 	}
 	return true
@@ -391,23 +420,14 @@ func (vm *Engine) CheckErrorCondition(finalScript bool) error {
 		return nil
 	}
 
-	if finalScript && vm.hasFlag(ScriptVerifyCleanStack) && vm.dstack.Depth() != 1 {
-		str := fmt.Sprintf("stack contains %d unexpected items",
-			vm.dstack.Depth()-1)
-		return scriptError(ErrCleanStack, str)
-	} else if vm.dstack.Depth() < 1 {
+	// The checks run in BCHN's order: the top item, then the clean stack
+	// and the signature density, which BCHN checks once the scripts have
+	// all run.
+	if vm.dstack.Depth() < 1 {
 		return scriptError(ErrEmptyStack,
 			"stack empty at end of script execution")
 	}
-
-	if vm.hasFlag(ScriptVerifyInputSigChecks) {
-		if len(vm.tx.TxIn[vm.txIdx].SignatureScript) < vm.sigChecks*43-60 {
-			return scriptError(ErrInputSigChecks,
-				"script exceeds maximum signature density")
-		}
-	}
-
-	v, err := vm.dstack.PopBool(false)
+	v, err := vm.dstack.PeekBool(0)
 	if err != nil {
 		return err
 	}
@@ -422,7 +442,36 @@ func (vm *Engine) CheckErrorCondition(finalScript bool) error {
 		return scriptError(ErrEvalFalse,
 			"false stack entry at end of script execution")
 	}
-	return nil
+
+	if finalScript && vm.hasFlag(ScriptVerifyCleanStack) && vm.dstack.Depth() != 1 {
+		str := fmt.Sprintf("stack contains %d unexpected items",
+			vm.dstack.Depth()-1)
+		return scriptError(ErrCleanStack, str)
+	}
+
+	if finalScript && vm.hasFlag(ScriptVerifyInputSigChecks) {
+		if len(vm.tx.TxIn[vm.txIdx].SignatureScript) < vm.sigChecks*43-60 {
+			return scriptError(ErrInputSigChecks,
+				"script exceeds maximum signature density")
+		}
+	}
+
+	_, err = vm.dstack.PopByteArray()
+	return err
+}
+
+// unbalancedEndError returns the error for the end of a script reached with
+// a conditional or loop open.  As in BCHN, an open conditional is an
+// unbalanced conditional, and only open loops an unbalanced control flow.
+func (vm *Engine) unbalancedEndError() error {
+	for _, cond := range vm.condStack {
+		if !isCondStackLoop(cond) {
+			return scriptError(ErrUnbalancedConditional,
+				"end of script reached in conditional execution")
+		}
+	}
+	return scriptError(ErrUnbalancedControlFlow,
+		"end of script reached in a loop")
 }
 
 // Step will execute the next instruction and move the program counter to the
@@ -449,6 +498,23 @@ func (vm *Engine) Step() (done bool, err error) {
 		return true, err
 	}
 
+	// The number of elements in the combination of the data and alt stacks
+	// must not exceed the maximum number of stack elements allowed.  BCHN
+	// checks this before the VM limits.
+	combinedStackSize := vm.dstack.Depth() + vm.astack.Depth()
+	if vm.hasFlag(ScriptAllowMay2026) {
+		// After the May 2026 upgrade, the existing cumulative stack and altstack
+		// depth limit is modified to incorporate Defined Function Count: the sum
+		// of stack depth, alternate stack depth, and Defined Function Count must
+		// be less than Maximum Memory Slots, set to 1000.
+		combinedStackSize += int32(vm.definedFunctionCount)
+	}
+	if combinedStackSize > MaxStackSize {
+		str := fmt.Sprintf("combined stack size %d > max allowed %d",
+			combinedStackSize, MaxStackSize)
+		return false, scriptError(ErrStackOverflow, str)
+	}
+
 	// Enforce VM limits CHIP.
 	if vm.hasFlag(ScriptAllowMay2025) {
 		// Check that this opcode did not cause us to to exceed opCost and/or hash iterations limits.
@@ -467,36 +533,24 @@ func (vm *Engine) Step() (done bool, err error) {
 
 		// Control stack may not exceed depth of 100. Post-upgrade12 this includes
 		// OP_INVOKE frames and saved conditionals from outer frames, not just the
-		// current frame's condStack.
+		// current frame's condStack, and BCHN names the limit after the
+		// control stack.
 		if depth := vm.controlStackDepth(); depth > MaxConditionalStackDepth {
 			str := fmt.Sprintf("control stack depth %d is larger than max allowed depth: %d",
 				depth, MaxConditionalStackDepth)
-			return false, scriptError(ErrConditionalStackDepth, str)
+			code := ErrConditionalStackDepth
+			if vm.hasFlag(ScriptAllowMay2026) {
+				code = ErrControlStackDepth
+			}
+			return false, scriptError(code, str)
 		}
-	}
-
-	// The number of elements in the combination of the data and alt stacks
-	// must not exceed the maximum number of stack elements allowed.
-	combinedStackSize := vm.dstack.Depth() + vm.astack.Depth()
-	if vm.hasFlag(ScriptAllowMay2026) {
-		// After the May 2026 upgrade, the existing cumulative stack and altstack
-		// depth limit is modified to incorporate Defined Function Count: the sum
-		// of stack depth, alternate stack depth, and Defined Function Count must
-		// be less than Maximum Memory Slots, set to 1000.
-		combinedStackSize += int32(vm.definedFunctionCount)
-	}
-	if combinedStackSize > MaxStackSize {
-		str := fmt.Sprintf("combined stack size %d > max allowed %d",
-			combinedStackSize, MaxStackSize)
-		return false, scriptError(ErrStackOverflow, str)
 	}
 
 	// Prepare for next instruction.
 	if vm.scriptOff >= len(vm.scripts[vm.scriptIdx]) {
 		// Illegal to have an `if' that straddles two scripts.
 		if len(vm.condStack) != 0 {
-			return false, scriptError(ErrUnbalancedConditional,
-				"end of script reached in conditional execution")
+			return false, vm.unbalancedEndError()
 		}
 
 		if vm.hasFlag(ScriptAllowMay2026) {
@@ -504,6 +558,14 @@ func (vm *Engine) Step() (done bool, err error) {
 			if len(vm.frameStack) > 0 {
 				for vm.scriptOff >= len(vm.scripts[vm.scriptIdx]) && len(vm.frameStack) > 0 {
 					vm.returnFromInvoke()
+
+					// The restored frame may be at its end too, so it
+					// must not leave a conditional or loop open either.
+					if vm.scriptOff >= len(vm.scripts[vm.scriptIdx]) &&
+						len(vm.condStack) != 0 {
+
+						return false, vm.unbalancedEndError()
+					}
 				}
 				if !(vm.scriptOff >= len(vm.scripts[vm.scriptIdx])) {
 					return false, nil
@@ -512,7 +574,7 @@ func (vm *Engine) Step() (done bool, err error) {
 		}
 
 		// Alt stack doesn't persist.
-		_ = vm.astack.DropN(vm.astack.Depth())
+		vm.astack.clear()
 
 		vm.numOps = 0 // number of ops is per script.
 		vm.scriptOff = 0
@@ -527,6 +589,14 @@ func (vm *Engine) Step() (done bool, err error) {
 			err := vm.CheckErrorCondition(false)
 			if err != nil {
 				return false, err
+			}
+
+			// Only accept input scripts that push data for P2SH.
+			// BCHN checks this once the public key script has
+			// passed, so a failure before is reported first.
+			if !IsPushOnlyScript(vm.tx.TxIn[vm.txIdx].SignatureScript) {
+				return false, scriptError(ErrNotPushOnly,
+					"pay to script hash is not push only")
 			}
 
 			script := vm.savedFirstStack[len(vm.savedFirstStack)-1]
@@ -548,7 +618,7 @@ func (vm *Engine) Step() (done bool, err error) {
 		}
 		vm.lastCodeSep = 0
 		if vm.hasFlag(ScriptAllowMay2026) {
-			vm.functionTable = make(map[string][]byte)
+			vm.functionTable = nil
 			vm.definedFunctionCount = 0
 		}
 		if vm.scriptIdx >= len(vm.scripts) {
@@ -581,36 +651,62 @@ func (vm *Engine) returnFromInvoke() bool {
 // Execute will execute all scripts in the script engine and return either nil
 // for successful validation or an error if one occurred.
 func (vm *Engine) Execute() (err error) {
+	// The trace closures allocate on every step, so only build them when
+	// trace logging is on.
+	trace := log.Level() <= bchlog.LevelTrace
 	done := false
 	for !done {
-		log.Tracef("%v", newLogClosure(func() string {
-			dis, err := vm.DisasmPC()
-			if err != nil {
-				return fmt.Sprintf("stepping (%v)", err)
-			}
-			return fmt.Sprintf("stepping %v", dis)
-		}))
+		if trace {
+			log.Tracef("%v", newLogClosure(func() string {
+				dis, err := vm.DisasmPC()
+				if err != nil {
+					return fmt.Sprintf("stepping (%v)", err)
+				}
+				return fmt.Sprintf("stepping %v", dis)
+			}))
+		}
 
 		done, err = vm.Step()
 		if err != nil {
 			return err
 		}
-		log.Tracef("%v", newLogClosure(func() string {
-			var dstr, astr string
+		if trace {
+			log.Tracef("%v", newLogClosure(func() string {
+				var dstr, astr string
 
-			// if we're tracing, dump the stacks.
-			if vm.dstack.Depth() != 0 {
-				dstr = "Stack:\n" + vm.dstack.String()
-			}
-			if vm.astack.Depth() != 0 {
-				astr = "AltStack:\n" + vm.astack.String()
-			}
+				// if we're tracing, dump the stacks.
+				if vm.dstack.Depth() != 0 {
+					dstr = "Stack:\n" + vm.dstack.String()
+				}
+				if vm.astack.Depth() != 0 {
+					astr = "AltStack:\n" + vm.astack.String()
+				}
 
-			return dstr + astr
-		}))
+				return dstr + astr
+			}))
+		}
 	}
 
 	return vm.CheckErrorCondition(true)
+}
+
+// txSigHashes returns the signature hash fragments of the transaction,
+// including the spent outputs when tokens are enabled.  They are computed at
+// most once per engine, and the passed hash cache is not modified.
+func (vm *Engine) txSigHashes() *TxSigHashes {
+	if vm.sigHashes != nil {
+		return vm.sigHashes
+	}
+
+	sigHashes := vm.hashCache
+	if sigHashes == nil {
+		sigHashes = NewTxSigHashes(&vm.tx)
+	}
+	if vm.hasFlag(ScriptAllowCashTokens) && !sigHashes.hasUtxos {
+		sigHashes = sigHashes.WithUtxos(&vm.tx, vm.utxoCache)
+	}
+	vm.sigHashes = sigHashes
+	return sigHashes
 }
 
 // subScript returns the script since the last OP_CODESEPARATOR.
@@ -625,32 +721,35 @@ func (vm *Engine) checkHashTypeEncoding(hashType SigHashType) error {
 		return nil
 	}
 
-	sigHashType := hashType & ^SigHashAnyOneCanPay
-	if vm.hasFlag(ScriptVerifyBip143SigHash) {
-		sigHashType ^= SigHashForkID
-		if hashType&SigHashForkID == 0 {
-			str := fmt.Sprintf("hash type does not contain uahf forkID 0x%x", hashType)
-			return scriptError(ErrInvalidSigHashType, str)
-		}
+	// The checks run in the order of BCHN's CheckSighashEncoding, so a
+	// hash type that breaks several gets BCHN's error: the base type, the
+	// fork id bit, then SIGHASH_UTXOS.
+	baseType := hashType &^ (SigHashForkID | SigHashAnyOneCanPay | SigHashUTXO)
+	if baseType < SigHashAll || baseType > SigHashSingle {
+		str := fmt.Sprintf("invalid hash type 0x%x", hashType)
+		return scriptError(ErrInvalidSigHashType, str)
 	}
 
-	if vm.hasFlag(ScriptAllowCashTokens) {
-		sigHashType &= ^SigHashUTXO
-	} else {
-		if hashType&SigHashUTXO != 0 {
+	hasForkID := hashType&SigHashForkID != 0
+	if vm.hasFlag(ScriptVerifyBip143SigHash) {
+		if !hasForkID {
+			str := fmt.Sprintf("hash type does not contain uahf forkID 0x%x", hashType)
+			return scriptError(ErrMustUseForkID, str)
+		}
+	} else if hasForkID {
+		str := fmt.Sprintf("hash type contains uahf forkID 0x%x", hashType)
+		return scriptError(ErrIllegalForkID, str)
+	}
+
+	if hashType&SigHashUTXO != 0 {
+		if !vm.hasFlag(ScriptAllowCashTokens) {
 			str := fmt.Sprintf("invalid hash type containing SIGHASH_UTXOS 0x%x", hashType)
 			return scriptError(ErrInvalidSigHashType, str)
 		}
-	}
-
-	if hashType&SigHashUTXO != 0 && hashType&SigHashAnyOneCanPay != 0 {
-		str := fmt.Sprintf("invalid hash type containing both SIGHASH_UTXOS and SIGHASH_ANYONECANPAY 0x%x", hashType)
-		return scriptError(ErrInvalidSigHashType, str)
-	}
-
-	if sigHashType < SigHashAll || sigHashType > SigHashSingle {
-		str := fmt.Sprintf("invalid hash type 0x%x", hashType)
-		return scriptError(ErrInvalidSigHashType, str)
+		if hashType&SigHashAnyOneCanPay != 0 {
+			str := fmt.Sprintf("invalid hash type containing both SIGHASH_UTXOS and SIGHASH_ANYONECANPAY 0x%x", hashType)
+			return scriptError(ErrInvalidSigHashType, str)
+		}
 	}
 	return nil
 }
@@ -681,6 +780,27 @@ func (vm *Engine) checkPubKeyEncoding(pubKey []byte) error {
 	}
 
 	return nil
+}
+
+// CheckTransactionSignatureEncoding returns an error if the passed signature,
+// which ends with its hash type byte, does not adhere to the encoding rules
+// the flags enable.  An empty signature passes.
+func CheckTransactionSignatureEncoding(sig []byte, flags ScriptFlags) error {
+	if len(sig) == 0 {
+		return nil
+	}
+	vm := Engine{flags: flags}
+	if err := vm.checkHashTypeEncoding(SigHashType(sig[len(sig)-1])); err != nil {
+		return err
+	}
+	return vm.checkSignatureEncoding(sig[:len(sig)-1])
+}
+
+// CheckPubKeyEncoding returns an error if the passed public key does not
+// adhere to the encoding rules the flags enable.
+func CheckPubKeyEncoding(pubKey []byte, flags ScriptFlags) error {
+	vm := Engine{flags: flags}
+	return vm.checkPubKeyEncoding(pubKey)
 }
 
 // checkSignatureEncoding returns whether or not the passed signature adheres to
@@ -898,8 +1018,7 @@ func getStack(stack *stack) [][]byte {
 // setStack sets the stack to the contents of the array where the last item in
 // the array is the top item in the stack.
 func setStack(stack *stack, data [][]byte) {
-	// This can not error. Only errors are for invalid arguments.
-	_ = stack.DropN(stack.Depth())
+	stack.clear()
 
 	for i := range data {
 		stack.PushByteArray(data[i])
@@ -938,14 +1057,17 @@ func isSegwitScript(scriptSig []parsedOpcode) bool {
 }
 
 // isSegwitExemption returns true if ScriptVerifyAllowSegwitRecovery
-// is set and this is a bip16 (P2SH) input and the script passes the
-// isSegwitScript checks.
+// is set and this is a P2SH20 input and the script passes the
+// isSegwitScript checks.  It never applies to P2SH32.
 func (vm *Engine) isSegwitExemption() bool {
-	return vm.hasFlag(ScriptVerifyAllowSegwitRecovery) && vm.bip16 && isSegwitScript(vm.scripts[0])
+	return vm.hasFlag(ScriptVerifyAllowSegwitRecovery) && vm.bip16 && !vm.p2sh32 &&
+		isSegwitScript(vm.scripts[0])
 }
 
 // GetStack returns the contents of the primary stack as an array. where the
 // last item in the array is the top of the stack.
+// The items are the engine's own slices, which may be shared with the
+// scripts and with other engines, so they must not be modified.
 func (vm *Engine) GetStack() [][]byte {
 	return getStack(&vm.dstack)
 }
@@ -958,6 +1080,8 @@ func (vm *Engine) SetStack(data [][]byte) {
 
 // GetAltStack returns the contents of the alternate stack as an array where the
 // last item in the array is the top of the stack.
+// The items are the engine's own slices, which may be shared with the
+// scripts and with other engines, so they must not be modified.
 func (vm *Engine) GetAltStack() [][]byte {
 	return getStack(&vm.astack)
 }
@@ -968,8 +1092,9 @@ func (vm *Engine) SetAltStack(data [][]byte) {
 	setStack(&vm.astack, data)
 }
 
-// Clone deep copies the state of the vm into a new instance
-// and returns it.
+// Clone copies the state of the vm into a new instance and returns it.
+// Defined function bodies and their parsed opcodes are never modified, so
+// they are shared with the copy.
 func (vm *Engine) Clone() *Engine {
 	if vm == nil {
 		return nil
@@ -982,12 +1107,14 @@ func (vm *Engine) Clone() *Engine {
 		lastCodeSep:          vm.lastCodeSep,
 		tx:                   vm.tx,
 		bip16:                vm.bip16,
+		p2sh32:               vm.p2sh32,
 		flags:                vm.flags,
 		maxScriptElementSize: vm.maxScriptElementSize,
 		inputAmount:          vm.inputAmount,
 		sigChecks:            vm.sigChecks,
 		sigCache:             vm.sigCache,
 		hashCache:            vm.hashCache,
+		sigHashes:            vm.sigHashes,
 		utxoCache:            vm.utxoCache,
 		definedFunctionCount: vm.definedFunctionCount,
 	}
@@ -1026,11 +1153,13 @@ func (vm *Engine) Clone() *Engine {
 		copy(newVM.dstack.stk[i], data)
 	}
 
-	newVM.functionTable = make(map[string][]byte, len(vm.functionTable))
+	// Function bodies and their parsed opcodes are never modified, so
+	// they are shared.
+	newVM.functionTable = make(map[string]*definedFunction,
+		len(vm.functionTable))
 	for k, v := range vm.functionTable {
-		b := make([]byte, len(v))
-		copy(b, v)
-		newVM.functionTable[k] = b
+		f := *v
+		newVM.functionTable[k] = &f
 	}
 
 	newVM.frameStack = make([]stackFrame, len(vm.frameStack))
@@ -1136,22 +1265,18 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 		vm.scriptIdx++
 	}
 
-	if vm.hasFlag(ScriptBip16) && isScriptHash(vm.scripts[1]) {
-		// Only accept input scripts that push data for P2SH.
-		if !isPushOnly(vm.scripts[0]) {
-			return nil, scriptError(ErrNotPushOnly,
-				"pay to script hash is not push only")
-		}
+	// The input script of a P2SH or P2SH32 spend must only push data,
+	// which Step checks once the public key script has passed.
+	if vm.hasFlag(ScriptBip16) && IsPayToScriptHash(scriptPubKey) {
 		vm.bip16 = true
 	}
 
-	if vm.hasFlag(ScriptBip16) && isScriptHash32(vm.scripts[1]) {
-		// Only accept input scripts that push data for P2SH32.
-		if !isPushOnly(vm.scripts[0]) {
-			return nil, scriptError(ErrNotPushOnly,
-				"pay to script hash is not push only")
-		}
+	// P2SH32 was enabled together with tokens.
+	if vm.hasFlag(ScriptBip16) && vm.hasFlag(ScriptAllowCashTokens) &&
+		IsPayToScriptHash32(scriptPubKey) {
+
 		vm.bip16 = true
+		vm.p2sh32 = true
 	}
 
 	if vm.hasFlag(ScriptVerifyMinimalData) {
@@ -1173,12 +1298,6 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 	} else {
 		vm.dstack.defaultScriptNumLen = defaultSmallScriptNumLen
 		vm.astack.defaultScriptNumLen = defaultSmallScriptNumLen
-	}
-
-	if vm.hasFlag(ScriptAllowMay2026) {
-		vm.functionTable = make(map[string][]byte)
-		vm.definedFunctionCount = 0
-		vm.frameStack = nil
 	}
 
 	vm.tx = *tx
