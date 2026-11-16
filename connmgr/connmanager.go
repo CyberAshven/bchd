@@ -172,8 +172,14 @@ type handleFailed struct {
 }
 
 // checkDuplicate is used to poll the connHandler to see if an
-// open connection to the address already exists.
+// open connection to the address already exists.  When the address is not a
+// duplicate the connHandler also assigns it to c.  The assignment is done by
+// the connHandler rather than the caller because c is already registered as
+// pending by this point, so the connHandler may concurrently read c.Addr, and
+// because it makes the check and the assignment atomic with respect to other
+// callers racing for the same address.
 type checkDuplicate struct {
+	c    *ConnReq
 	addr net.Addr
 	resp chan bool
 }
@@ -262,6 +268,9 @@ out:
 						}
 					}
 				}
+				if !dup {
+					msg.c.Addr = msg.addr
+				}
 				msg.resp <- dup
 
 			case registerPending:
@@ -340,17 +349,25 @@ out:
 
 				// Otherwise, we will attempt a reconnection if
 				// we do not have enough peers, or if this is a
-				// persistent peer. The connection request is
-				// re added to the pending map, so that
-				// subsequent processing of connections and
-				// failures do not ignore the request.
+				// persistent peer. A persistent peer's request
+				// is retried, so it is re added to the pending
+				// map, so that subsequent processing of
+				// connections and failures do not ignore it.
+				// Any other request is replaced by a new one,
+				// as in handleFailed, and left in the pending
+				// map it would make its address a duplicate
+				// that no new request could connect to again.
 				if uint32(len(conns)) < cm.cfg.TargetOutbound ||
 					connReq.Permanent {
 
-					connReq.updateState(ConnPending)
-					log.Debugf("Reconnecting to %v",
-						connReq)
-					pending[msg.id] = connReq
+					if connReq.Permanent {
+						connReq.updateState(ConnPending)
+						log.Debugf("Reconnecting to %v",
+							connReq)
+						pending[msg.id] = connReq
+					} else {
+						connReq.updateState(ConnDisconnected)
+					}
 					cm.handleFailedConn(connReq)
 				}
 
@@ -422,8 +439,14 @@ func (cm *ConnManager) NewConnReq() {
 		return
 	}
 
-	resp := make(chan bool)
-	cm.requests <- checkDuplicate{addr: addr, resp: resp}
+	// The reply is buffered so the handler never blocks on it if this
+	// request is abandoned because the manager is shutting down.
+	resp := make(chan bool, 1)
+	select {
+	case cm.requests <- checkDuplicate{c: c, addr: addr, resp: resp}:
+	case <-cm.quit:
+		return
+	}
 	select {
 	case dup := <-resp:
 		if dup {
@@ -437,7 +460,9 @@ func (cm *ConnManager) NewConnReq() {
 		return
 	}
 
-	c.Addr = addr
+	// NOTE: c.Addr was assigned by the connHandler as part of the duplicate
+	// check above; assigning it here would race with the connHandler reading
+	// it while c sits in the pending map.
 
 	cm.Connect(c)
 }

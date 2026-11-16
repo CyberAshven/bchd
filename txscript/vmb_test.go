@@ -89,6 +89,7 @@ func TestMay2026Standard(t *testing.T) {
 		"bch_2026_standard/core.signature-checking.multisig.m-of-3.vmb_tests.json",
 		"bch_2026_standard/core.signature-checking.multisig.pubkey-validation.vmb_tests.json",
 		"bch_2026_standard/core.signature-checking.multisig.signing-serialization.vmb_tests.json",
+		"bch_2026_standard/core.signing-serialization.vmb_tests.json",
 	}
 
 	for _, testFileName := range BCH2025Standard {
@@ -98,7 +99,7 @@ func TestMay2026Standard(t *testing.T) {
 			t.Fatalf("reading %s: %v", testFileName, err)
 		}
 
-		var tests [][]interface{}
+		var tests [][]any
 		err = json.Unmarshal(testFile, &tests)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testFileName, err)
@@ -111,7 +112,7 @@ func TestMay2026Standard(t *testing.T) {
 			t.Fatalf("reading %s: %v", testLimitsFileName, err)
 		}
 
-		var testLimits map[string]interface{}
+		var testLimits map[string]any
 		err = json.Unmarshal(testLimitsFile, &testLimits)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testLimitsFileName, err)
@@ -137,7 +138,7 @@ func TestMay2026Standard(t *testing.T) {
 			utxos := make([]wire.TxOut, utxoCount)
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -189,12 +190,12 @@ func TestMay2026Standard(t *testing.T) {
 				fatalf(t, err.Error(), test, i)
 			}
 
-			densityControl := int64(testLimits[test[0].(string)].([]interface{})[0].(float64))
+			densityControl := int64(testLimits[test[0].(string)].([]any)[0].(float64))
 
 			// Fixture schema: [effectiveInputSize (41+sigScriptSize), maxOpCost, opCost, description].
 			// Field [0] is the input byte budget, not hash-iter count — verified by maxOpCost == [0]*800.
-			maximumOperationCost := int64(testLimits[test[0].(string)].([]interface{})[1].(float64))
-			operationCost := int64(testLimits[test[0].(string)].([]interface{})[2].(float64))
+			maximumOperationCost := int64(testLimits[test[0].(string)].([]any)[1].(float64))
+			operationCost := int64(testLimits[test[0].(string)].([]any)[2].(float64))
 
 			if vm.GetMetrics().GetCompositeOPCost(true) != operationCost {
 				str := fmt.Sprintf("test opcost: %d, script opcost: %d",
@@ -203,10 +204,27 @@ func TestMay2026Standard(t *testing.T) {
 				fatalf(t, "operation cost did not match. "+str, test, i)
 			}
 
-			if vm.GetMetrics().GetHashDigestIterations() != densityControl {
-				if err != nil {
-					fatalf(t, "number of hash digest iterations did not match", test, i)
-				}
+			// CHIP-2021-05 maximum hashing density: an input's hash digest
+			// iteration budget is (41 + scriptSigSize) / 2, with a 7x bonus for
+			// non-standard (block) transactions.  Fixture field [0] is exactly
+			// 41 + scriptSigSize, so the expected limit follows from it.
+			hashIterBonus := int64(txscript.HashIterBonusForNonStandardTxns)
+			if flags.HasFlag(txscript.ScriptAllowMay2025StandardOnly) {
+				hashIterBonus = 1
+			}
+			expectedHashIterLimit := (densityControl * hashIterBonus) / 2
+
+			if vm.GetMetrics().GetMaxDigestIterationLimit() != expectedHashIterLimit {
+				str := fmt.Sprintf("test hash iteration limit: %d, script hash iteration limit: %d",
+					expectedHashIterLimit,
+					vm.GetMetrics().GetMaxDigestIterationLimit())
+				fatalf(t, "hash digest iteration limit did not match. "+str, test, i)
+			}
+
+			if vm.GetMetrics().GetHashDigestIterations() > expectedHashIterLimit {
+				str := fmt.Sprintf("hash iterations: %d, limit: %d",
+					vm.GetMetrics().GetHashDigestIterations(), expectedHashIterLimit)
+				fatalf(t, "hash digest iterations exceeded the limit. "+str, test, i)
 			}
 
 			if vm.GetMetrics().GetMaxOpCostLimit() != maximumOperationCost {
@@ -262,6 +280,7 @@ func TestMay2026NonStandard(t *testing.T) {
 		"bch_2026_nonstandard/core.nop.vmb_tests.json",
 		"bch_2026_nonstandard/core.push.data.vmb_tests.json",
 		"bch_2026_nonstandard/core.signature-checking.multisig.m-of-15.vmb_tests.json",
+		"bch_2026_nonstandard/core.signature-checking.multisig.m-of-20.vmb_tests.json",
 	}
 
 	for _, testFileName := range BCH2025NonStandard {
@@ -271,7 +290,7 @@ func TestMay2026NonStandard(t *testing.T) {
 			t.Fatalf("reading %s: %v", testFileName, err)
 		}
 
-		var tests [][]interface{}
+		var tests [][]any
 		err = json.Unmarshal(testFile, &tests)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testFileName, err)
@@ -284,7 +303,7 @@ func TestMay2026NonStandard(t *testing.T) {
 			t.Fatalf("reading %s: %v", testLimitsFileName, err)
 		}
 
-		var testLimits map[string]interface{}
+		var testLimits map[string]any
 		err = json.Unmarshal(testLimitsFile, &testLimits)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testLimitsFileName, err)
@@ -311,7 +330,7 @@ func TestMay2026NonStandard(t *testing.T) {
 			utxos := make([]wire.TxOut, utxoCount)
 			viewPoint := blockchain.NewUtxoViewpoint()
 
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					t.Fatal(err)
@@ -324,6 +343,7 @@ func TestMay2026NonStandard(t *testing.T) {
 
 			flags := txscript.StandardVerifyFlags | txscript.ScriptAllowCashTokens | txscript.ScriptAllowMay2025
 			flags &^= txscript.ScriptDiscourageUpgradableNops
+			flags &^= txscript.ScriptVerifyInputSigChecks
 			flags |= txscript.ScriptAllowMay2026
 
 			err = blockchain.CheckTransactionSanity(bchutilTx, true, true, flags)
@@ -361,8 +381,8 @@ func TestMay2026NonStandard(t *testing.T) {
 
 			// Fixture schema: [effectiveInputSize (41+sigScriptSize), maxOpCost, opCost, description].
 			// Field [0] is the input byte budget, not hash-iter count — verified by maxOpCost == [0]*800.
-			maximumOperationCost := int64(testLimits[test[0].(string)].([]interface{})[1].(float64))
-			operationCost := int64(testLimits[test[0].(string)].([]interface{})[2].(float64))
+			maximumOperationCost := int64(testLimits[test[0].(string)].([]any)[1].(float64))
+			operationCost := int64(testLimits[test[0].(string)].([]any)[2].(float64))
 
 			if vm.GetMetrics().GetCompositeOPCost(false) != operationCost {
 				str := fmt.Sprintf("test opcost: %d, script opcost: %d",
@@ -447,7 +467,7 @@ func TestMay2026Invalid(t *testing.T) {
 			t.Fatalf("reading %s: %v", testFileName, err)
 		}
 
-		var tests [][]interface{}
+		var tests [][]any
 		err = json.Unmarshal(testFile, &tests)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testFileName, err)
@@ -461,7 +481,7 @@ func TestMay2026Invalid(t *testing.T) {
 			t.Fatalf("TestScripts: %v\n", err)
 		}
 
-		var testLimits map[string]interface{}
+		var testLimits map[string]any
 		err = json.Unmarshal(testLimitsFile, &testLimits)
 		if err != nil {
 			t.Fatalf("unmarshalling %s: %v", testLimitsFileName, err)
@@ -490,7 +510,7 @@ func TestMay2026Invalid(t *testing.T) {
 			viewPoint := blockchain.NewUtxoViewpoint()
 
 			readUtxosOK := true
-			for i := uint64(0); i < utxoCount; i++ {
+			for i := range utxoCount {
 				utxos[i] = wire.TxOut{}
 				if _, err := wire.ReadTxOut(r, 0, 0, &utxos[i]); err != nil {
 					readUtxosOK = false
@@ -538,29 +558,10 @@ func TestMay2026Invalid(t *testing.T) {
 				continue
 			}
 
-			if testLimits[test[0].(string)] != nil {
-				densityControl := int64(testLimits[test[0].(string)].([]interface{})[0].(float64))
-				maximumOperationCost := int64(testLimits[test[0].(string)].([]interface{})[1].(float64))
-				operationCost := int64(testLimits[test[0].(string)].([]interface{})[2].(float64))
-
-				if vm.GetMetrics().GetCompositeOPCost(true) != operationCost {
-					continue
-				}
-
-				if vm.GetMetrics().GetHashDigestIterations() != densityControl {
-					if err != nil {
-						continue
-					}
-				}
-
-				if vm.GetMetrics().GetMaxOpCostLimit() != maximumOperationCost {
-					continue
-				}
-			}
-
-			if err == nil {
-				t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
-			}
+			// The vector asserts this script is invalid, so reaching here --
+			// execution succeeded -- is a failure.  Metric mismatches must not
+			// excuse it: they can only mask a real divergence, never catch one.
+			t.Fatalf("Error! Test %d - %s executed without error! Test description: %s", i, test[0].(string), test[1].(string))
 		}
 	}
 }

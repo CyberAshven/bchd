@@ -384,7 +384,7 @@ func BenchmarkDecodeGetHeaders(b *testing.B) {
 	// Create a message with the maximum number of block locators.
 	pver := ProtocolVersion
 	var m MsgGetHeaders
-	for i := 0; i < MaxBlockLocatorsPerMsg; i++ {
+	for i := range MaxBlockLocatorsPerMsg {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -414,7 +414,7 @@ func BenchmarkDecodeHeaders(b *testing.B) {
 	// Create a message with the maximum number of headers.
 	pver := ProtocolVersion
 	var m MsgHeaders
-	for i := 0; i < MaxBlockHeadersPerMsg; i++ {
+	for i := range MaxBlockHeadersPerMsg {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -444,7 +444,7 @@ func BenchmarkDecodeGetBlocks(b *testing.B) {
 	// Create a message with the maximum number of block locators.
 	pver := ProtocolVersion
 	var m MsgGetBlocks
-	for i := 0; i < MaxBlockLocatorsPerMsg; i++ {
+	for i := range MaxBlockLocatorsPerMsg {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -475,7 +475,7 @@ func BenchmarkDecodeAddr(b *testing.B) {
 	pver := ProtocolVersion
 	ip := net.ParseIP("127.0.0.1")
 	ma := NewMsgAddr()
-	for port := uint16(0); port < MaxAddrPerMsg; port++ {
+	for port := range uint16(MaxAddrPerMsg) {
 		_ = ma.AddAddress(NewNetAddressIPPort(ip, port, SFNodeNetwork))
 	}
 
@@ -501,7 +501,7 @@ func BenchmarkDecodeInv(b *testing.B) {
 	// Create a message with the maximum number of entries.
 	pver := ProtocolVersion
 	var m MsgInv
-	for i := 0; i < MaxInvPerMsg; i++ {
+	for i := range MaxInvPerMsg {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -531,7 +531,7 @@ func BenchmarkDecodeNotFound(b *testing.B) {
 	// Create a message with the maximum number of entries.
 	pver := ProtocolVersion
 	var m MsgNotFound
-	for i := 0; i < MaxInvPerMsg; i++ {
+	for i := range MaxInvPerMsg {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -566,7 +566,7 @@ func BenchmarkDecodeMerkleBlock(b *testing.B) {
 		b.Fatalf("NewHashFromStr: unexpected error: %v", err)
 	}
 	m.Header = *NewBlockHeader(1, hash, hash, 0, uint32(10000))
-	for i := 0; i < 105; i++ {
+	for i := range 105 {
 		hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%x", i))
 		if err != nil {
 			b.Fatalf("NewHashFromStr: unexpected error: %v", err)
@@ -601,6 +601,62 @@ func BenchmarkTxHash(b *testing.B) {
 	}
 }
 
+// benchHashTx returns a tx with the given number of p2pkh-sized inputs and
+// outputs, with token data on the outputs when tokens is set.
+func benchHashTx(n int, tokens bool) *MsgTx {
+	tx := NewMsgTx(2)
+	for i := range n {
+		tx.AddTxIn(&TxIn{
+			PreviousOutPoint: OutPoint{Hash: chainhash.Hash{byte(i)}, Index: uint32(i)},
+			SignatureScript:  bytes.Repeat([]byte{0x30}, 107),
+			Sequence:         0xffffffff,
+		})
+		out := &TxOut{Value: int64(i) * 1000, PkScript: bytes.Repeat([]byte{0x76}, 25)}
+		if tokens {
+			out.TokenData = TokenData{
+				CategoryID: [32]byte{byte(i)},
+				Commitment: []byte{1, 2, 3},
+				Amount:     1000,
+				BitField:   HAS_AMOUNT | HAS_NFT | HAS_COMMITMENT_LENGTH,
+			}
+		}
+		tx.AddTxOut(out)
+	}
+	return tx
+}
+
+// BenchmarkTxHashSizes measures hashing txs of several sizes.
+func BenchmarkTxHashSizes(b *testing.B) {
+	for _, c := range []struct {
+		name   string
+		n      int
+		tokens bool
+	}{
+		{"1in1out", 1, false},
+		{"20in20out", 20, false},
+		{"20in20out-tokens", 20, true},
+		{"1000in1000out", 1000, false},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			tx := benchHashTx(c.n, c.tokens)
+			b.SetBytes(int64(tx.SerializeSize()))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = tx.TxHash()
+			}
+		})
+	}
+}
+
+// BenchmarkBlockHash measures hashing a block header.
+func BenchmarkBlockHash(b *testing.B) {
+	header := blockOne.Header
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = header.BlockHash()
+	}
+}
+
 // BenchmarkDoubleHashB performs a benchmark on how long it takes to perform a
 // double hash returning a byte slice.
 func BenchmarkDoubleHashB(b *testing.B) {
@@ -628,5 +684,60 @@ func BenchmarkDoubleHashH(b *testing.B) {
 
 	for b.Loop() {
 		_ = chainhash.DoubleHashH(txBytes)
+	}
+}
+
+// cmpctBenchBlock returns a 5000 tx block and a known inventory holding
+// every tx in it.
+func cmpctBenchBlock() (*MsgBlock, map[chainhash.Hash]bool) {
+	block := &MsgBlock{Header: blockOne.Header}
+	known := make(map[chainhash.Hash]bool)
+	for i := range 5000 {
+		tx := genesisCoinbaseTx.Copy()
+		tx.LockTime = uint32(i)
+		block.Transactions = append(block.Transactions, tx)
+		known[tx.TxHash()] = true
+	}
+	return block, known
+}
+
+// BenchmarkNewMsgCmpctBlockFromBlock performs a benchmark on how long it
+// takes to build a cmpctblock for a peer that knows every transaction.
+func BenchmarkNewMsgCmpctBlockFromBlock(b *testing.B) {
+	block, known := cmpctBenchBlock()
+	for b.Loop() {
+		_, _ = NewMsgCmpctBlockFromBlock(block, known)
+	}
+}
+
+// BenchmarkCmpctBlockRelayPerPeer performs a benchmark on how long it takes
+// to build cmpctblocks for 8 peers, hashing the block's txs for each peer.
+func BenchmarkCmpctBlockRelayPerPeer(b *testing.B) {
+	block, known := cmpctBenchBlock()
+	for b.Loop() {
+		for range 8 {
+			_, _ = NewMsgCmpctBlockFromBlock(block, known)
+		}
+	}
+}
+
+// BenchmarkBlockTxHashes performs a benchmark on how long it takes to hash
+// every tx of a block of 226 byte txs, as relaying a block did per peer.
+func BenchmarkBlockTxHashes(b *testing.B) {
+	for _, n := range []int{5000, 140000} {
+		block := &MsgBlock{Header: blockOne.Header}
+		for i := range n {
+			tx := NewMsgTx(1)
+			tx.AddTxIn(NewTxIn(&OutPoint{Index: uint32(i)}, make([]byte, 107)))
+			tx.AddTxOut(NewTxOut(int64(i), make([]byte, 25), TokenData{}))
+			tx.AddTxOut(NewTxOut(int64(i), make([]byte, 25), TokenData{}))
+			block.Transactions = append(block.Transactions, tx)
+		}
+		b.Run(fmt.Sprintf("%.0fMB", float64(block.SerializeSize())/1e6), func(b *testing.B) {
+			b.SetBytes(int64(block.SerializeSize()))
+			for b.Loop() {
+				_, _ = block.TxHashes()
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ package txscript
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gcash/bchd/chaincfg"
@@ -291,7 +292,7 @@ func TestExtractPkScriptAddrs(t *testing.T) {
 			class:   NonStandardTy,
 		},
 		// from real tx 691dd277dc0e90a462a3d652a1171686de49cf19067cd33c7df0392833fb986a, vout 0
-		// invalid public keys
+		// invalid public keys, so not multisig as BCHN matches it
 		{
 			name: "1 of 3 multisig with invalid pubkeys",
 			script: hexToBytes("51411c2200007353455857696b696c656" +
@@ -304,12 +305,12 @@ func TestExtractPkScriptAddrs(t *testing.T) {
 				"16e20626520666f756e6420696e207472616e7361637" +
 				"4696f6e2036633533636439383731313965663739376" +
 				"435616463636453ae"),
-			addrs:   []bchutil.Address{},
-			reqSigs: 1,
-			class:   MultiSigTy,
+			addrs:   nil,
+			reqSigs: 0,
+			class:   NonStandardTy,
 		},
 		// from real tx: 691dd277dc0e90a462a3d652a1171686de49cf19067cd33c7df0392833fb986a, vout 44
-		// invalid public keys
+		// invalid public keys, so not multisig as BCHN matches it
 		{
 			name: "1 of 3 multisig with invalid pubkeys 2",
 			script: hexToBytes("514134633365633235396337346461636" +
@@ -320,9 +321,9 @@ func TestExtractPkScriptAddrs(t *testing.T) {
 				"13963663463303363363039633539336333653931666" +
 				"56465373032392131323364643432643235363339643" +
 				"338613663663530616234636434340a00000053ae"),
-			addrs:   []bchutil.Address{},
-			reqSigs: 1,
-			class:   MultiSigTy,
+			addrs:   nil,
+			reqSigs: 0,
+			class:   NonStandardTy,
 		},
 		{
 			name:    "empty script",
@@ -405,6 +406,16 @@ func TestCalcScriptInfo(t *testing.T) {
 			scriptInfoErr: scriptError(ErrMalformedPush, ""),
 		},
 		{
+			// A pay-to-script-hash output spent by an empty
+			// signature script has no redeem script.
+			name:      "p2sh with an empty sigScript",
+			sigScript: "",
+			pkScript: "HASH160 DATA_20 0xfe441065b6532231de2fac56" +
+				"3152205ec4f59c74 EQUAL",
+			bip16:         true,
+			scriptInfoErr: scriptError(ErrInvalidStackOperation, ""),
+		},
+		{
 			// Invented scripts, the hashes do not match
 			name: "p2sh standard script",
 			sigScript: "1 81 DATA_25 DUP HASH160 DATA_20 0x010203" +
@@ -435,15 +446,16 @@ func TestCalcScriptInfo(t *testing.T) {
 			},
 		},
 		{
-			// Script is invented, numbers all fake.
+			// Script is invented, numbers all fake, but the keys
+			// start with 0x02 so it is multisig as BCHN matches it.
 			name: "multisig script",
 			// Extra 0 arg on the end for OP_CHECKMULTISIG bug.
 			sigScript: "1 1 1 0",
 			pkScript: "3 " +
-				"DATA_33 0x0102030405060708090a0b0c0d0e0f1011" +
+				"DATA_33 0x0202030405060708090a0b0c0d0e0f1011" +
 				"12131415161718191a1b1c1d1e1f2021 DATA_33 " +
-				"0x0102030405060708090a0b0c0d0e0f101112131415" +
-				"161718191a1b1c1d1e1f2021 DATA_33 0x010203040" +
+				"0x0202030405060708090a0b0c0d0e0f101112131415" +
+				"161718191a1b1c1d1e1f2021 DATA_33 0x020203040" +
 				"5060708090a0b0c0d0e0f101112131415161718191a1" +
 				"b1c1d1e1f2021 3 CHECKMULTISIG",
 			bip16: true,
@@ -479,7 +491,7 @@ func TestCalcScriptInfo(t *testing.T) {
 
 		if *si != test.scriptInfo {
 			t.Errorf("%s: scriptinfo doesn't match expected. "+
-				"got: %q expected %q", test.name, *si,
+				"got: %+v expected %+v", test.name, *si,
 				test.scriptInfo)
 			continue
 		}
@@ -527,7 +539,7 @@ func TestPayToAddrScript(t *testing.T) {
 
 	// Taken from transaction:
 	// b0539a45de13b3e0403909b8bd1a555b8cbe45fd4e3f3fda76f3a5f52835c29d
-	p2shMain, _ := bchutil.NewAddressScriptHashFromHash(hexToBytes("e8c300"+
+	p2shMain, err := bchutil.NewAddressScriptHashFromHash(hexToBytes("e8c300"+
 		"c87986efa84c37c0519929019ef86eb5b4"), &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatalf("Unable to create script hash address: %v", err)
@@ -973,6 +985,64 @@ var scriptClassTests = []struct {
 			"3 CHECKMULTISIG",
 		class: NonStandardTy,
 	},
+	// BCHN only matches pay pubkey and multisig scripts whose keys are
+	// pushed directly and have a first byte that fits their length.
+	{
+		name: "pay pubkey with a non-minimal push",
+		script: "PUSHDATA1 0x21 0x0232abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a CHECKSIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "pay pubkey with an invalid key prefix",
+		script: "DATA_33 0x0532abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a CHECKSIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "pay pubkey with an uncompressed prefix on 33 bytes",
+		script: "DATA_33 0x0432abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a CHECKSIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "pay pubkey with a compressed prefix on 65 bytes",
+		script: "DATA_65 0x0211db93e1dcdb8a016b49840f8c53bc1eb68a382e" +
+			"97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e16" +
+			"0bfa9b8b64f9d4c03f999b8643f656b412a3 CHECKSIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "multisig with a hybrid key",
+		script: "1 DATA_65 0x0611db93e1dcdb8a016b49840f8c53bc1eb68a382e" +
+			"97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e16" +
+			"0bfa9b8b64f9d4c03f999b8643f656b412a3 1 CHECKMULTISIG",
+		class: MultiSigTy,
+	},
+	{
+		name: "multisig requiring no signatures",
+		script: "0 DATA_33 0x0232abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a 1 CHECKMULTISIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "multisig requiring more signatures than keys",
+		script: "2 DATA_33 0x0232abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a 1 CHECKMULTISIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "multisig with a non-minimal key push",
+		script: "1 PUSHDATA1 0x21 0x0232abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a 1 CHECKMULTISIG",
+		class: NonStandardTy,
+	},
+	{
+		name: "multisig with an invalid key prefix",
+		script: "1 DATA_33 0x0532abdc893e7f0631364d7fd01cb33d24da45" +
+			"329a00357b3a7886211ab414d55a 1 CHECKMULTISIG",
+		class: NonStandardTy,
+	},
 }
 
 // TestScriptClass ensures all the scripts in scriptClassTests have the expected
@@ -1022,6 +1092,11 @@ func TestStringifyClass(t *testing.T) {
 			stringed: "scripthash",
 		},
 		{
+			name:     "scripthash32",
+			class:    ScriptHash32Ty,
+			stringed: "scripthash",
+		},
+		{
 			name:     "multisigty",
 			class:    MultiSigTy,
 			stringed: "multisig",
@@ -1034,6 +1109,11 @@ func TestStringifyClass(t *testing.T) {
 		{
 			name:     "broken",
 			class:    ScriptClass(255),
+			stringed: "Invalid",
+		},
+		{
+			name:     "one past the last class",
+			class:    NullDataTy + 1,
 			stringed: "Invalid",
 		},
 	}
@@ -1166,4 +1246,72 @@ func TestNullDataScript(t *testing.T) {
 			continue
 		}
 	}
+}
+
+// TestScriptTypeName ensures scripts are named by the rules of the RPC
+// results, including pay to script and data carriers of any length.
+func TestScriptTypeName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		script []byte
+		want   string
+	}{
+		{"p2pkh", mustParseShortForm("DUP HASH160 DATA_20 " +
+			"0x" + strings.Repeat("ab", 20) + " EQUALVERIFY CHECKSIG"),
+			"pubkeyhash"},
+		{"p2sh32", mustParseShortForm("HASH256 DATA_32 " +
+			"0x" + strings.Repeat("ab", 32) + " EQUAL"), "scripthash"},
+		{"p2pk", mustParseShortForm("DATA_33 0x02" +
+			strings.Repeat("11", 32) + " CHECKSIG"), "pubkey"},
+		{"p2pk with a non-minimal push", mustParseShortForm(
+			"PUSHDATA1 0x21 0x02" + strings.Repeat("11", 32) +
+				" CHECKSIG"), "script"},
+		{"multisig", mustParseShortForm("1 DATA_33 0x02" +
+			strings.Repeat("11", 32) + " 1 CHECKMULTISIG"), "multisig"},
+		{"multisig with an invalid key prefix", mustParseShortForm(
+			"1 DATA_33 0x05" + strings.Repeat("11", 32) +
+				" 1 CHECKMULTISIG"), "script"},
+		{"multisig of 201 bytes", mustParseShortForm("1" +
+			strings.Repeat(" DATA_65 0x04"+strings.Repeat("22", 64), 3) +
+			" 3 CHECKMULTISIG"), "multisig"},
+		{"non-minimal multisig of 204 bytes", mustParseShortForm("1" +
+			strings.Repeat(" PUSHDATA1 0x41 0x04"+strings.Repeat("22", 64), 3) +
+			" 3 CHECKMULTISIG"), "nonstandard"},
+		{"nulldata", mustParseShortForm("RETURN DATA_4 0x01020304"),
+			"nulldata"},
+		{"nulldata max length", nullDataOfLength(MaxDataCarrierSize),
+			"nulldata"},
+		{"nulldata past max length",
+			nullDataOfLength(MaxDataCarrierSize + 1), "nulldata"},
+		{"long nulldata", nullDataOfLength(MaxScriptSize), "nulldata"},
+		{"return then non-push", mustParseShortForm("RETURN 1 ADD"),
+			"script"},
+		{"long return then non-push",
+			append(nullDataOfLength(300), OP_ADD), "nonstandard"},
+		{"empty", nil, "script"},
+		{"bare script", mustParseShortForm("1 ADD 2 EQUAL"), "script"},
+		{"does not parse", []byte{OP_DATA_5, 0x01}, "script"},
+		{"max length", bytes.Repeat([]byte{OP_1}, MaxP2SScriptSize),
+			"script"},
+		{"past max length",
+			bytes.Repeat([]byte{OP_1}, MaxP2SScriptSize+1),
+			"nonstandard"},
+		{"long and does not parse",
+			append(bytes.Repeat([]byte{OP_1}, MaxP2SScriptSize),
+				OP_DATA_5), "nonstandard"},
+	}
+
+	for _, test := range tests {
+		if got := ScriptTypeName(test.script); got != test.want {
+			t.Errorf("%s: got %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// nullDataOfLength returns a script of the given length of OP_RETURN and
+// pushes.
+func nullDataOfLength(length int) []byte {
+	return append([]byte{OP_RETURN}, bytes.Repeat([]byte{OP_0}, length-1)...)
 }

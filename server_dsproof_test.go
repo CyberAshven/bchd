@@ -1,0 +1,457 @@
+// Copyright (c) 2026 The bchd developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package main
+
+import (
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gcash/bchd/chaincfg/chainhash"
+	"github.com/gcash/bchd/mempool"
+	"github.com/gcash/bchd/peer"
+	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchutil"
+	"github.com/gcash/bchutil/bloom"
+)
+
+// newDSProofServerPeer returns a server peer on a server whose memory pool
+// holds a transaction with a double spend proof, and that proof.
+func newDSProofServerPeer(t *testing.T) (*serverPeer, *wire.MsgDSProof) {
+	t.Helper()
+	useTestConfig(t, &config{BanThreshold: defaultBanThreshold})
+	h := newMempoolTestHarness(t, 1)
+	pool := h.server.cfg.TxMemPool
+	tx1 := h.spend(t, h.outputs[0], 1000)
+	tx2 := h.spend(t, h.outputs[0], 2000)
+	if _, err := pool.ProcessTransaction(bchutil.NewTx(tx1), false, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.ProcessTransaction(bchutil.NewTx(tx2), false, 0)
+	descs := pool.DSProofs(false)
+	if len(descs) != 1 {
+		t.Fatalf("%d proofs", len(descs))
+	}
+	sp := &serverPeer{
+		Peer:   peer.NewInboundPeer(&peer.Config{}),
+		server: &server{txMemPool: pool, quit: make(chan struct{})},
+		filter: bloom.LoadFilter(nil),
+	}
+	return sp, descs[0].Proof
+}
+
+// invalidCopy returns a copy of proof for another outpoint with its spenders
+// swapped, which puts them out of order.
+func invalidCopy(proof *wire.MsgDSProof) *wire.MsgDSProof {
+	return wire.NewMsgDSProof(wire.OutPoint{Hash: chainhash.Hash{9}},
+		proof.DoubleSpender, proof.FirstSpender)
+}
+
+// TestOnDSProofBanScore checks that an invalid proof adds 10 to the sender's
+// ban score, that a known one adds nothing, and that whitelisted peers are
+// exempt.
+func TestOnDSProofBanScore(t *testing.T) {
+	sp, proof := newDSProofServerPeer(t)
+	sp.OnDSProof(nil, proof)
+	if score := sp.banScore.Int(); score != 0 {
+		t.Fatalf("ban score %d for a known proof", score)
+	}
+	sp.OnDSProof(nil, invalidCopy(proof))
+	if score := sp.banScore.Int(); score != 10 {
+		t.Fatalf("ban score %d for an invalid proof", score)
+	}
+
+	white, proof2 := newDSProofServerPeer(t)
+	white.isWhitelisted = true
+	white.OnDSProof(nil, invalidCopy(proof2))
+	if score := white.banScore.Int(); score != 0 {
+		t.Fatalf("ban score %d for a whitelisted peer", score)
+	}
+}
+
+// servePeers answers the server's peer queries with peers until the test
+// ends.
+func servePeers(t *testing.T, s *server, peers ...*serverPeer) {
+	s.query = make(chan interface{})
+	go func() {
+		for {
+			select {
+			case q := <-s.query:
+				if m, ok := q.(getPeersMsg); ok {
+					m.reply <- peers
+				}
+			case <-s.quit:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { close(s.quit) })
+}
+
+// waitBanScore waits for the ban score of sp to reach want.
+func waitBanScore(t *testing.T, sp *serverPeer, want uint32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for sp.banScore.Int() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("ban score %d, want %d", sp.banScore.Int(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAddDSProofBanScore checks that the ban score of orphan senders, such as
+// expired orphans, is raised by peer id, summed over their orphans and
+// applied once per peer, so a peer passing the threshold is banned once.
+func TestAddDSProofBanScore(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	// The first sum stays at the warning level, half the threshold.
+	cfg.BanThreshold = 5
+	s := sp.server
+	s.banPeers = make(chan *serverPeer, 10)
+	servePeers(t, s, sp)
+
+	id := mempool.Tag(sp.ID())
+	s.addDSProofBanScore([]mempool.Tag{id, id + 1, id}, 1, 0, "dsproof-orphan-expired")
+	waitBanScore(t, sp, 2)
+
+	// A sum passing the threshold bans the peer once.
+	s.addDSProofBanScore([]mempool.Tag{id, id, id, id, id}, 1, 0, "dsproof-orphan-expired")
+	select {
+	case <-s.banPeers:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer not banned")
+	}
+	select {
+	case <-s.banPeers:
+		t.Fatal("peer banned twice")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if score := sp.banScore.Int(); score != 7 {
+		t.Fatalf("ban score %d", score)
+	}
+}
+
+// TestPushDSProofMsg checks that getdata for a known proof is answered and an
+// unknown one is reported as not found, signalling completion either way.
+func TestPushDSProofMsg(t *testing.T) {
+	sp, proof := newDSProofServerPeer(t)
+	known := proof.ProofHash()
+	for _, test := range []struct {
+		hash  chainhash.Hash
+		found bool
+	}{{known, true}, {chainhash.Hash{1}, false}} {
+		done := make(chan struct{}, 1)
+		err := sp.server.pushDSProofMsg(sp, &test.hash, done, nil, wire.BaseEncoding)
+		if (err == nil) != test.found {
+			t.Fatalf("%v: error %v", test.hash, err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%v: no completion signal", test.hash)
+		}
+	}
+
+	// A getdata with only an unknown proof returns.
+	msg := wire.NewMsgGetData()
+	_ = msg.AddInvVect(wire.NewInvVect(wire.InvTypeDSProof, &chainhash.Hash{2}))
+	done := make(chan struct{})
+	go func() {
+		sp.OnGetData(nil, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("getdata handler did not return")
+	}
+}
+
+// TestWantsDSProof checks which peers are told about a proof: not those with
+// transaction relay disabled, nor those whose bloom filter does not match
+// the double spent transaction.
+func TestWantsDSProof(t *testing.T) {
+	useTestConfig(t, &config{BanThreshold: defaultBanThreshold})
+	h := newMempoolTestHarness(t, 1)
+	tx := bchutil.NewTx(h.spend(t, h.outputs[0], 1000))
+	txHash := tx.Hash()
+
+	sp := newBloomTestPeer()
+	if !sp.wantsDSProof(tx) {
+		t.Fatal("peer without a filter not told")
+	}
+	sp.setDisableRelayTx(true)
+	if sp.wantsDSProof(tx) {
+		t.Fatal("peer with transaction relay disabled told")
+	}
+	sp.setDisableRelayTx(false)
+
+	other := bloom.NewFilter(10, 0, 0.0001, wire.BloomUpdateNone)
+	other.Add([]byte{1, 2, 3})
+	sp.filter = other
+	if sp.wantsDSProof(tx) {
+		t.Fatal("peer with a filter not matching told")
+	}
+	match := bloom.NewFilter(10, 0, 0.0001, wire.BloomUpdateNone)
+	match.AddHash(txHash)
+	sp.filter = match
+	if !sp.wantsDSProof(tx) {
+		t.Fatal("peer with a matching filter not told")
+	}
+}
+
+// TestDSProofBadOrphanBanScore checks that the sender of an orphan proof
+// that turns out invalid once its transaction arrives gets a ban score of
+// 10, unless it is whitelisted.
+func TestDSProofBadOrphanBanScore(t *testing.T) {
+	for _, whitelisted := range []bool{false, true} {
+		useTestConfig(t, &config{BanThreshold: defaultBanThreshold})
+		s := &server{quit: make(chan struct{})}
+		h := newMempoolTestHarness(t, 2, func(c *mempool.Config) {
+			c.OnBadDSProofs = s.onBadDSProofs
+		})
+		pool := h.server.cfg.TxMemPool
+		s.txMemPool = pool
+		sp := &serverPeer{
+			Peer:          peer.NewInboundPeer(&peer.Config{}),
+			server:        s,
+			filter:        bloom.LoadFilter(nil),
+			isWhitelisted: whitelisted,
+		}
+		servePeers(t, s, sp)
+
+		tx1 := h.spend(t, h.outputs[0], 1000)
+		tx2 := h.spend(t, h.outputs[0], 2000)
+		if _, err := pool.ProcessTransaction(bchutil.NewTx(tx1), false, 0); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = pool.ProcessTransaction(bchutil.NewTx(tx2), false, 0)
+		descs := pool.DSProofs(false)
+		if len(descs) != 1 {
+			t.Fatalf("%d proofs", len(descs))
+		}
+
+		// The signatures are for the first output, so the proof is
+		// an orphan for the second until a transaction spends it.
+		proof := descs[0].Proof
+		bad := wire.NewMsgDSProof(h.outputs[1], proof.FirstSpender, proof.DoubleSpender)
+		sp.OnDSProof(nil, bad)
+		if hash := bad.ProofHash(); !pool.HaveDSProof(&hash) || sp.banScore.Int() != 0 {
+			t.Fatal("orphan not stored")
+		}
+		tx3 := h.spend(t, h.outputs[1], 1000)
+		if _, err := pool.ProcessTransaction(bchutil.NewTx(tx3), false, 0); err != nil {
+			t.Fatal(err)
+		}
+		if whitelisted {
+			time.Sleep(100 * time.Millisecond)
+			if sp.banScore.Int() != 0 {
+				t.Fatal("whitelisted peer scored")
+			}
+			continue
+		}
+		waitBanScore(t, sp, 10)
+	}
+}
+
+// TestOnDSProofBlocksOnly checks that proofs are dropped in blocks only
+// mode without touching the memory pool.
+func TestOnDSProofBlocksOnly(t *testing.T) {
+	sp, proof := newDSProofServerPeer(t)
+	cfg.BlocksOnly = true
+	sp.server.txMemPool = nil
+	sp.OnDSProof(nil, invalidCopy(proof))
+	if sp.banScore.Int() != 0 {
+		t.Fatal("proof processed in blocks only mode")
+	}
+}
+
+// readDSProofInv reads messages from remote until it times out and returns
+// whether an inv for hash was among them.
+func readDSProofInv(t *testing.T, remote net.Conn, hash *chainhash.Hash) bool {
+	t.Helper()
+	_ = remote.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		msg, _, err := wire.ReadMessage(remote, wire.ProtocolVersion, wire.MainNet)
+		if err != nil {
+			return false
+		}
+		if inv, ok := msg.(*wire.MsgInv); ok {
+			for _, iv := range inv.InvList {
+				if iv.Type == wire.InvTypeDSProof && iv.Hash == *hash {
+					return true
+				}
+			}
+		}
+	}
+}
+
+// TestRelayDSProofInv checks that a proof is announced only to peers that
+// want it: not to those with transaction relay disabled or a bloom filter
+// not matching the double spent transaction.
+func TestRelayDSProofInv(t *testing.T) {
+	useTestConfig(t, &config{BanThreshold: defaultBanThreshold})
+	h := newMempoolTestHarness(t, 1)
+	tx := bchutil.NewTx(h.spend(t, h.outputs[0], 1000))
+	s := &server{}
+
+	full, fullRemote := connectAddrV2Peer(t, s, false)
+	noRelay, noRelayRemote := connectAddrV2Peer(t, s, false)
+	noRelay.setDisableRelayTx(true)
+	filtered, filteredRemote := connectAddrV2Peer(t, s, false)
+	other := bloom.NewFilter(10, 0, 0.0001, wire.BloomUpdateNone)
+	other.Add([]byte{1, 2, 3})
+	filtered.filter = other
+
+	state := &peerState{inboundPeers: map[int32]*serverPeer{
+		1: full, 2: noRelay, 3: filtered,
+	}}
+	hash := chainhash.Hash{7}
+	s.handleRelayInvMsg(state, relayMsg{
+		invVect: wire.NewInvVect(wire.InvTypeDSProof, &hash),
+		data:    tx,
+	})
+	if !readDSProofInv(t, fullRemote, &hash) {
+		t.Fatal("full relay peer not told")
+	}
+	if readDSProofInv(t, noRelayRemote, &hash) {
+		t.Fatal("peer with transaction relay disabled told")
+	}
+	if readDSProofInv(t, filteredRemote, &hash) {
+		t.Fatal("peer with a filter not matching told")
+	}
+}
+
+// TestExpireDSProofOrphansOnce checks that each expired orphan adds 1 to the
+// decaying ban score of the peer that sent it.  The score decays by the
+// second, so its parts are compared rather than its value.
+func TestExpireDSProofOrphansOnce(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	s := sp.server
+	servePeers(t, s, sp)
+	s.expireDSProofOrphansOnce(func() []mempool.Tag { return nil })
+	s.expireDSProofOrphansOnce(func() []mempool.Tag {
+		return []mempool.Tag{mempool.Tag(sp.ID())}
+	})
+	const want = "persistent 0 + transient 1 at "
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.HasPrefix(sp.banScore.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("ban score %v", sp.banScore.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if score := sp.banScore.String(); !strings.HasPrefix(score, want) {
+		t.Fatalf("ban score %v", score)
+	}
+}
+
+// TestExpireDSProofOrphansBurst ensures one expiry raises the decaying ban
+// score of a peer by at most a quarter of the default ban threshold, however
+// many of its orphans expire, so a burst of them does not ban it.
+func TestExpireDSProofOrphansBurst(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	s := sp.server
+	s.banPeers = make(chan *serverPeer, 1)
+	servePeers(t, s, sp)
+	id := mempool.Tag(sp.ID())
+	peers := []mempool.Tag{id + 1}
+	for range 2 * defaultBanThreshold {
+		peers = append(peers, id)
+	}
+	s.expireDSProofOrphansOnce(func() []mempool.Tag { return peers })
+	want := fmt.Sprintf("persistent 0 + transient %d at ", defaultBanThreshold/4)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.HasPrefix(sp.banScore.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("ban score %v, want %s...", sp.banScore.String(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-s.banPeers:
+		t.Fatal("peer banned")
+	default:
+	}
+}
+
+// TestDSProofDisabledServer checks that getdata for a proof is refused with
+// a completion signal when proofs are disabled.
+func TestDSProofDisabledServer(t *testing.T) {
+	sp, proof := newDSProofServerPeer(t)
+	cfg.NoDoubleSpendProof = true
+	hash := proof.ProofHash()
+	done := make(chan struct{}, 1)
+	if err := sp.server.pushDSProofMsg(sp, &hash, done, nil, wire.BaseEncoding); err == nil {
+		t.Fatal("proof sent while disabled")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no completion signal")
+	}
+}
+
+// TestOnInvBlocksOnlyDSProof checks that proof invs are dropped in blocks
+// only mode without reaching the sync manager.
+func TestOnInvBlocksOnlyDSProof(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	cfg.BlocksOnly = true
+	msg := wire.NewMsgInv()
+	_ = msg.AddInvVect(wire.NewInvVect(wire.InvTypeDSProof, &chainhash.Hash{1}))
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("proof inv reached the sync manager: %v", r)
+		}
+	}()
+	// The server has no sync manager, so queueing anything panics.
+	sp.OnInv(nil, msg)
+}
+
+// TestBanAtThreshold ensures that a score that reaches the ban threshold bans
+// the peer, as the 100 that BCHN gives the worst offenses is meant to, and
+// that one below it doesn't.
+func TestBanAtThreshold(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	s := sp.server
+	s.banPeers = make(chan *serverPeer, 10)
+
+	sp.addBanScore(defaultBanThreshold-1, 0, "test")
+	select {
+	case <-s.banPeers:
+		t.Fatal("peer banned below the threshold")
+	default:
+	}
+	sp.addBanScore(1, 0, "test")
+	select {
+	case <-s.banPeers:
+	default:
+		t.Fatal("peer not banned at the threshold")
+	}
+}
+
+// TestPersistentPeerNotBanned ensures that a peer the node connected to by hand
+// isn't banned, on any path to the ban score.
+func TestPersistentPeerNotBanned(t *testing.T) {
+	sp, _ := newDSProofServerPeer(t)
+	sp.persistent = true
+	s := sp.server
+	s.banPeers = make(chan *serverPeer, 10)
+
+	sp.addBanScore(defaultBanThreshold, 0, "test")
+	sp.addBanScore(0, defaultBanThreshold, "test")
+	select {
+	case <-s.banPeers:
+		t.Fatal("persistent peer banned")
+	default:
+	}
+	if score := sp.banScore.Int(); score != 0 {
+		t.Fatalf("persistent peer has ban score %d", score)
+	}
+}

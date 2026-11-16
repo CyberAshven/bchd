@@ -1,10 +1,14 @@
 package blockchain
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"reflect"
 	"runtime"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,14 +32,15 @@ var (
 )
 
 // uniqueOpReturnScript returns a standard provably-pruneable OP_RETURN script
-// with a random uint64 encoded as the data.
+// with a random uint64 encoded as the data.  The data is padded so that the
+// spending transactions built by addBlock reach the minimum transaction size.
 func uniqueOpReturnScript() []byte {
 	rand, err := wire.RandomUint64()
 	if err != nil {
 		panic(err)
 	}
 
-	data := make([]byte, 8)
+	data := make([]byte, 28)
 	binary.LittleEndian.PutUint64(data[0:8], rand)
 
 	builder := txscript.NewScriptBuilder()
@@ -87,7 +92,7 @@ func solveBlock(header *wire.BlockHeader) bool {
 	stopNonce := uint32(math.MaxUint32)
 	numCores := uint32(runtime.NumCPU())
 	noncesPerCore := (stopNonce - startNonce) / numCores
-	for i := uint32(0); i < numCores; i++ {
+	for i := range numCores {
 		rangeStart := startNonce + (noncesPerCore * i)
 		rangeStop := startNonce + (noncesPerCore * (i + 1)) - 1
 		if i == numCores-1 {
@@ -95,7 +100,7 @@ func solveBlock(header *wire.BlockHeader) bool {
 		}
 		go solver(*header, rangeStart, rangeStop)
 	}
-	for i := uint32(0); i < numCores; i++ {
+	for range numCores {
 		result := <-results
 		if result.found {
 			close(quit)
@@ -153,6 +158,10 @@ func addBlock(chain *BlockChain, prev *bchutil.Block, spends []*spendableOut) (*
 		Value:    CalcBlockSubsidy(blockHeight, chain.chainParams),
 		PkScript: opTrueScript,
 	})
+	if size := cb.SerializeSize(); size < MagneticAnomalyMinTransactionSize {
+		cb.TxIn[0].SignatureScript = append(cb.TxIn[0].SignatureScript,
+			make([]byte, MagneticAnomalyMinTransactionSize-size)...)
+	}
 	txns = append(txns, cb)
 
 	// Spend all txs to be spent.
@@ -171,6 +180,12 @@ func addBlock(chain *BlockChain, prev *bchutil.Block, spends []*spendableOut) (*
 		cb.TxOut[0].Value += int64(lowFee)
 		txns = append(txns, spendTx)
 	}
+
+	// Put the spends in canonical order.
+	slices.SortFunc(txns[1:], func(a, b *wire.MsgTx) int {
+		ha, hb := a.TxHash(), b.TxHash()
+		return ha.Compare(&hb)
+	})
 
 	// Create spendable outs to return at the end.
 	outs := make([]*spendableOut, len(txns))
@@ -315,7 +330,7 @@ func TestUtxoCache_SimpleFlush(t *testing.T) {
 	}
 
 	// First, add 10 utxos without flushing.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tip, _ = addBlock(chain, tip, nil)
 	}
 	if len(cache.cachedEntries) != 10 {
@@ -362,7 +377,7 @@ func TestUtxoCache_ThresholdPeriodicFlush(t *testing.T) {
 
 	// Add 10 elems and let it exceed the threshold.
 	var flushedAt *chainhash.Hash
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tip, _ = addBlock(chain, tip, nil)
 		if len(cache.cachedEntries) == 0 {
 			flushedAt = tip.Hash()
@@ -507,7 +522,7 @@ func TestUtxoCache_InitConsistentState(t *testing.T) {
 		// Reset the utxo cache
 		chain.utxoCache = newUtxoCache(chain.db, 10*1024*1024)
 
-		err := chain.utxoCache.InitConsistentState(chain.bestChain.Tip(), false, nil)
+		err := chain.utxoCache.InitConsistentState(chain.bestChain.Tip(), chain.index, false, nil)
 		if err != nil {
 			t.Fatalf("failed to init utxo cache: %v", err)
 		}
@@ -596,7 +611,7 @@ func TestUtxoCache_InitConsistentState(t *testing.T) {
 		// Reset the utxo cache
 		chain.utxoCache = newUtxoCache(chain.db, 10*1024*1024)
 
-		err = chain.utxoCache.InitConsistentState(chain.bestChain.Tip(), false, nil)
+		err = chain.utxoCache.InitConsistentState(chain.bestChain.Tip(), chain.index, false, nil)
 		if err != nil {
 			t.Fatalf("failed to init utxo cache: %v", err)
 		}
@@ -610,4 +625,538 @@ func TestUtxoCache_InitConsistentState(t *testing.T) {
 		assertConsistencyState(t, chain, ucsConsistent, b4.Hash())
 		assertNbEntriesOnDisk(t, chain, len(spendableOuts4))
 	})
+
+	// A status hash that is not in the best chain must be reported as an
+	// error rather than walked past the genesis block.
+	t.Run("Status hash not in best chain", func(t *testing.T) {
+		chain, params, tearDown := utxoCacheTestChain("TestUtxoCache_InitConsistentState")
+		defer tearDown()
+		tip := bchutil.NewBlock(params.GenesisBlock)
+
+		var emptySpendableOuts []*spendableOut
+		addBlock(chain, tip, emptySpendableOuts)
+
+		unknownHash := chainhash.Hash{0x01}
+		err := chain.db.Update(func(dbTx database.Tx) error {
+			return dbPutUtxoStateConsistency(dbTx, ucsConsistent, &unknownHash)
+		})
+		if err != nil {
+			t.Fatalf("unexpected error while puting utxo state to db: %v", err)
+		}
+
+		chain.utxoCache = newUtxoCache(chain.db, 10*1024*1024)
+		err = chain.utxoCache.InitConsistentState(chain.bestChain.Tip(), chain.index, false, nil)
+		if _, ok := err.(AssertError); !ok {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestUtxoCache_FlushReleasesMap checks that a full flush does not keep the
+// memory of the cache's map once the map is empty.
+func TestUtxoCache_FlushReleasesMap(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestUtxoCache_FlushReleasesMap")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	heapAlloc := func() uint64 {
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	before := heapAlloc()
+
+	const n = 200000
+	pkScript := []byte{0x51}
+	for i := range n {
+		var op wire.OutPoint
+		binary.LittleEndian.PutUint64(op.Hash[:], uint64(i))
+		entry := NewUtxoEntry(&wire.TxOut{Value: 1, PkScript: pkScript}, 1, false)
+		if err := cache.addEntry(op, entry, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	filled := heapAlloc()
+
+	// Any hash other than the last flushed one makes flush run.
+	if err := cache.flush(&BestState{Hash: chainhash.Hash{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cache.cachedEntries) != 0 {
+		t.Fatalf("expected empty cache, got %d entries", len(cache.cachedEntries))
+	}
+	after := heapAlloc()
+
+	// The flushed entries stay in the database write cache until it is
+	// flushed, so measure only what dropping the cache's map would free.
+	cache.cachedEntries = make(map[wire.OutPoint]*UtxoEntry)
+	mapKept := int64(after) - int64(heapAlloc())
+	grown := filled - before
+	t.Logf("cache grew by %d KiB, its emptied map still held %d KiB",
+		grown/1024, mapKept/1024)
+	if mapKept > int64(grown/10) {
+		t.Fatalf("emptied map still held %d KiB after a full flush",
+			mapKept/1024)
+	}
+}
+
+// TestUtxoCache_FetchEntryUncached ensures FetchUtxoEntryUncached returns
+// the same entries as FetchUtxoEntry without adding to the cache.
+func TestUtxoCache_FetchEntryUncached(t *testing.T) {
+	chain, params, tearDown := utxoCacheTestChain("TestUtxoCache_FetchEntryUncached")
+	defer tearDown()
+	cache := chain.utxoCache
+	tip := bchutil.NewBlock(params.GenesisBlock)
+
+	tip, flushedOuts := addBlock(chain, tip, nil)
+	if err := chain.FlushCachedState(FlushRequired); err != nil {
+		t.Fatalf("FlushCachedState: %v", err)
+	}
+	_, cachedOuts := addBlock(chain, tip, nil)
+	if len(cache.cachedEntries) != 1 {
+		t.Fatalf("got %d cached entries, want 1", len(cache.cachedEntries))
+	}
+
+	missing := wire.OutPoint{Hash: chainhash.Hash{1}}
+	outpoints := []wire.OutPoint{
+		flushedOuts[0].prevOut,
+		cachedOuts[0].prevOut,
+		missing,
+	}
+	entries := make([]*UtxoEntry, len(outpoints))
+	for i, op := range outpoints {
+		entry, err := chain.FetchUtxoEntryUncached(op)
+		if err != nil {
+			t.Fatalf("FetchUtxoEntryUncached(%v): %v", op, err)
+		}
+		entries[i] = entry
+	}
+	if len(cache.cachedEntries) != 1 {
+		t.Fatalf("got %d cached entries after FetchUtxoEntryUncached, "+
+			"want 1", len(cache.cachedEntries))
+	}
+
+	for i, op := range outpoints {
+		entry := entries[i]
+		want, err := chain.FetchUtxoEntry(op)
+		if err != nil {
+			t.Fatalf("FetchUtxoEntry(%v): %v", op, err)
+		}
+		if (entry == nil) != (op == missing) || (want == nil) != (op == missing) {
+			t.Fatalf("%v: got %v, want %v", op, entry, want)
+		}
+		if entry != nil && (entry.Amount() != want.Amount() ||
+			entry.BlockHeight() != want.BlockHeight() ||
+			entry.IsCoinBase() != want.IsCoinBase() ||
+			!bytes.Equal(entry.PkScript(), want.PkScript())) {
+
+			t.Fatalf("%v: got %+v, want %+v", op, entry, want)
+		}
+	}
+}
+
+// viewCountingDB is a database that counts its read transactions.
+type viewCountingDB struct {
+	database.DB
+	views int
+}
+
+func (db *viewCountingDB) View(fn func(database.Tx) error) error {
+	db.views++
+	return db.DB.View(fn)
+}
+
+// TestUtxoCache_FetchUnspentOutputOfTx ensures FetchUnspentOutputOfTx finds an
+// unspent output of a transaction at any index, in the cache or in the
+// database, where the cache's state overrides the database's, that it reads
+// the database once, and that it adds nothing to the cache.
+func TestUtxoCache_FetchUnspentOutputOfTx(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestUtxoCache_FetchUnspentOutputOfTx")
+	defer tearDown()
+	cache := chain.utxoCache
+	db := &viewCountingDB{DB: cache.db}
+	cache.db = db
+	defer func() { cache.db = db.DB }()
+
+	newEntry := func(height int32) *UtxoEntry {
+		return NewUtxoEntry(wire.NewTxOut(1000, opTrueScript, wire.TokenData{}),
+			height, false)
+	}
+	outpoint := func(hash byte, index uint32) wire.OutPoint {
+		return wire.OutPoint{Hash: chainhash.Hash{hash}, Index: index}
+	}
+	spent := newEntry(20)
+	spent.Spend()
+	next := chainhash.Hash{4}
+	next[chainhash.HashSize-1] = 1
+
+	// 1: in the database only.  2: in the database, its first output
+	// spent in the cache.  3: in the database and loaded into the cache
+	// during the call.  4: none, with outputs of the next hash in the
+	// database.  5 and 6: in the cache only, past the first chunk and at
+	// the last index a transaction can have.  7: spent in the cache.
+	stored := map[wire.OutPoint]*UtxoEntry{
+		outpoint(1, 5): newEntry(10),
+		outpoint(2, 0): newEntry(20),
+		outpoint(2, 2): newEntry(21),
+		outpoint(3, 1): newEntry(30),
+		{Hash: next}:   newEntry(40),
+	}
+	err := cache.db.Update(func(dbTx database.Tx) error {
+		return dbPutUtxoEntries(dbTx, stored)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.cachedEntries[outpoint(2, 0)] = spent
+	cache.cachedEntries[outpoint(5, utxoScanChunk+44)] = newEntry(50)
+	cache.cachedEntries[outpoint(6, maxTxOutputs-1)] = newEntry(60)
+	cache.cachedEntries[outpoint(7, 0)] = nil
+	numCached := len(cache.cachedEntries)
+
+	for _, test := range []struct {
+		hash   byte
+		height int32
+		load   bool
+	}{
+		{1, 10, false},
+		{2, 21, false},
+		{3, 30, true},
+		{4, 0, false},
+		{5, 50, false},
+		{6, 60, false},
+		{7, 0, false},
+	} {
+		if test.load {
+			unspentOutputScanHook = func() {
+				cache.cachedEntries[outpoint(3, 1)] = stored[outpoint(3, 1)].Clone()
+				numCached++
+			}
+		}
+		db.views = 0
+		entry, err := chain.FetchUnspentOutputOfTx(&chainhash.Hash{test.hash})
+		unspentOutputScanHook = nil
+		if err != nil {
+			t.Fatalf("%d: %v", test.hash, err)
+		}
+		if (entry == nil) != (test.height == 0) || entry != nil && entry.BlockHeight() != test.height {
+			t.Fatalf("%d: got %+v, want height %d", test.hash, entry, test.height)
+		}
+		if db.views > 1 {
+			t.Fatalf("%d: %d database reads", test.hash, db.views)
+		}
+		if len(cache.cachedEntries) != numCached {
+			t.Fatalf("%d: %d cached entries, want %d", test.hash,
+				len(cache.cachedEntries), numCached)
+		}
+	}
+}
+
+// dbHasUtxoEntry returns whether the utxo set in the database holds the
+// output, whatever the cache holds for it.
+func dbHasUtxoEntry(t *testing.T, db database.DB, outpoint wire.OutPoint) bool {
+	t.Helper()
+	var entry *UtxoEntry
+	err := db.View(func(dbTx database.Tx) error {
+		var err error
+		entry, err = dbFetchUtxoEntry(dbTx, outpoint)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to read the utxo set: %v", err)
+	}
+	return entry != nil
+}
+
+// TestUtxoCacheReaddedOutputSpent ensures that the output of a transaction,
+// whose block is removed from the best chain after a flush and which a block
+// of the new best chain mines again, is removed from the utxo set in the
+// database once a later block spends it, so that spending it again is
+// rejected.  The transaction is mined again in a block the reorg attaches or
+// in a later one, and the cache is flushed at different points.
+func TestUtxoCacheReaddedOutputSpent(t *testing.T) {
+	tests := []struct {
+		name string
+
+		// invalidate removes the old block with InvalidateBlock, after
+		// which the new branch extends the best chain block by block.
+		// Otherwise the second block of the new branch causes a reorg,
+		// which attaches the first two.
+		invalidate bool
+
+		// remine and spend are the blocks of the new branch, counted from
+		// 0, that mine the transaction again and spend its output.
+		remine, spend int
+
+		// flushAfter is the block of the new branch after which the
+		// cache is flushed, or -1.
+		flushAfter int
+	}{
+		{name: "mined again in a block the reorg attaches",
+			remine: 0, spend: 2, flushAfter: -1},
+		{name: "mined again in the block causing the reorg",
+			remine: 1, spend: 2, flushAfter: -1},
+		{name: "mined again after the reorg",
+			remine: 2, spend: 3, flushAfter: -1},
+		{name: "mined again and spent in one block after the reorg",
+			remine: 2, spend: 2, flushAfter: -1},
+		{name: "flushed before it is mined again",
+			remine: 2, spend: 3, flushAfter: 1},
+		{name: "flushed before it is spent",
+			remine: 2, spend: 3, flushAfter: 2},
+		{name: "mined again after invalidateblock", invalidate: true,
+			remine: 0, spend: 1, flushAfter: -1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			params := chaincfg.RegressionNetParams
+			m := newRuleTestMiner(t, &params)
+			flush := func() {
+				t.Helper()
+				if err := m.chain.FlushCachedState(FlushRequired); err != nil {
+					t.Fatalf("flush: %v", err)
+				}
+			}
+
+			// The transaction spends the coinbase of the first block and
+			// is mined in the next one, which is flushed.
+			b1 := m.build(nil)
+			m.mustAccept(b1)
+			value := b1.MsgBlock().Transactions[0].TxOut[0].Value - 1000
+			tx := ruleTestSpend(wire.OutPoint{Hash: *b1.Transactions()[0].Hash()},
+				value, 1)
+			out := wire.OutPoint{Hash: tx.TxHash()}
+			cb := m.coinbase(2)
+			cb.TxOut[1] = ruleTestPadding(1)
+			old := m.build(cb, tx)
+			m.mustAccept(old)
+			flush()
+			if !dbHasUtxoEntry(t, m.chain.db, out) {
+				t.Fatal("output not flushed to the database")
+			}
+
+			// Build the new branch on the first block.
+			if test.invalidate {
+				if err := m.chain.InvalidateBlock(old.Hash()); err != nil {
+					t.Fatalf("InvalidateBlock: %v", err)
+				}
+			}
+			m.tip, m.height = b1.MsgBlock(), 1
+			for i := 0; i <= test.spend; i++ {
+				cb := m.coinbase(m.height + 1)
+				cb.TxOut[1] = ruleTestPadding(2)
+				var txs []*wire.MsgTx
+				if i == test.remine {
+					txs = append(txs, tx)
+				}
+				if i == test.spend {
+					txs = append(txs, ruleTestSpend(out, value-1000, 2))
+				}
+				m.mustAccept(m.build(cb, txs...))
+				if i == test.flushAfter {
+					flush()
+				}
+			}
+			if m.chain.BestSnapshot().Hash != m.tip.BlockHash() {
+				t.Fatal("the new branch is not the best chain")
+			}
+
+			// The spent output is gone from the database after the next
+			// flush, and a block spending it again is rejected.
+			flush()
+			if dbHasUtxoEntry(t, m.chain.db, out) {
+				t.Errorf("spent output %v left in the database", out)
+			}
+			err := m.accept(m.build(nil, ruleTestSpend(out, value-1000, 3)))
+			if err == nil {
+				t.Fatalf("block spending %v a second time accepted", out)
+			}
+			requireRuleError(t, err, ErrMissingTxOut)
+		})
+	}
+}
+
+// TestUtxoCacheMemoryAccounting checks the cache's memory usage against the
+// heap it really uses, at sizes across the map's growth: just before it grows it
+// takes about 69 bytes per entry, and just after, its peak of about 119.  The
+// count can't be far under the heap at any of them, nor much over it.
+func TestUtxoCacheMemoryAccounting(t *testing.T) {
+	for _, n := range []int{13000, 15400, 55000, 61500, 214000, 241000, 428000} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			testUtxoCacheMemoryAccounting(t, n)
+		})
+	}
+}
+
+func testUtxoCacheMemoryAccounting(t *testing.T, n int) {
+	var category [32]byte
+	category[0] = 1
+	token := wire.TokenData{CategoryID: category, BitField: wire.HAS_NFT |
+		wire.HAS_COMMITMENT_LENGTH | wire.HAS_AMOUNT, Amount: 1 << 40}
+
+	// Entries the cache creates from transaction outputs.
+	t.Run("created", func(t *testing.T) {
+		checkUtxoCacheMemory(t, n, func(i int) *UtxoEntry {
+			txOut := wire.NewTxOut(int64(i), make([]byte, 25), wire.TokenData{})
+			if i%10 == 0 {
+				txOut.TokenData = token
+				txOut.TokenData.Commitment = make([]byte, 40)
+			}
+			return NewUtxoEntry(txOut, 1, false)
+		})
+	})
+
+	// Token entries read from the database, which stores the token data
+	// in front of the script.
+	t.Run("loaded", func(t *testing.T) {
+		src := NewUtxoEntry(wire.NewTxOut(1000, make([]byte, 25), token), 1, false)
+		src.tokenData.Commitment = make([]byte, 40)
+		serialized, err := serializeUtxoEntry(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkUtxoCacheMemory(t, n, func(int) *UtxoEntry {
+			entry, err := DeserializeUtxoEntry(serialized)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return entry
+		})
+	})
+}
+
+// checkUtxoCacheMemory adds n entries to a cache and checks its memory usage
+// against the heap growth.
+func checkUtxoCacheMemory(t *testing.T, n int, newEntry func(i int) *UtxoEntry) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	cache := newUtxoCache(nil, math.MaxUint64)
+	for i := range n {
+		op := wire.OutPoint{Hash: chainhash.Hash{byte(i), byte(i >> 8), byte(i >> 16)}}
+		if err := cache.addEntry(op, newEntry(i), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	heap := after.HeapAlloc - before.HeapAlloc
+	counted := cache.totalMemoryUsage()
+
+	// utxoMapEntrySize is below the map's measured peak, so the count can fall
+	// a little under the heap just after the map grows.
+	if counted < heap*96/100 || counted > heap*5/4 {
+		t.Fatalf("%d entries: cache counts %d bytes, heap grew %d", n, counted, heap)
+	}
+	runtime.KeepAlive(cache)
+}
+
+// TestDeserializeTokenUtxoScript checks that token entries read back keep
+// their script and token data, and that the script doesn't share the
+// serialized buffer.
+func TestDeserializeTokenUtxoScript(t *testing.T) {
+	var category [32]byte
+	category[0] = 1
+	token := wire.TokenData{CategoryID: category, BitField: wire.HAS_NFT |
+		wire.HAS_COMMITMENT_LENGTH, Commitment: []byte{1, 2, 3}}
+	pkScript := hexToBytes("76a914ee8bd501094a7d5ca318da2506de35e1cb025ddc88ac")
+
+	prefix := token.TokenDataBuffer()
+	script := append(prefix.Bytes(), pkScript...)
+	serialized := make([]byte, 52, 52+len(script))
+	binary.LittleEndian.PutUint32(serialized[36:], 100)
+	binary.LittleEndian.PutUint64(serialized[40:], 1000)
+	binary.LittleEndian.PutUint32(serialized[48:], uint32(len(script)))
+	serialized = append(serialized, script...)
+
+	_, entry, err := deserializeUtxoCommitmentFormat(serialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(serialized)
+	if !bytes.Equal(entry.PkScript(), pkScript) {
+		t.Fatalf("script %x, want %x", entry.PkScript(), pkScript)
+	}
+	if !reflect.DeepEqual(entry.tokenData, token) {
+		t.Fatalf("token data %v, want %v", entry.tokenData, token)
+	}
+
+	src := NewUtxoEntry(wire.NewTxOut(1000, pkScript, token), 100, false)
+	serialized, err = serializeUtxoEntry(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err = DeserializeUtxoEntry(serialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(entry.PkScript(), pkScript) ||
+		!reflect.DeepEqual(entry.tokenData, token) {
+		t.Fatalf("got script %x, token data %v", entry.PkScript(),
+			entry.tokenData)
+	}
+}
+
+// TestDisconnectTokenUtxoScript checks that a token output restored from the
+// spend journal keeps its script, and that the script doesn't share the
+// journal's buffer.
+func TestDisconnectTokenUtxoScript(t *testing.T) {
+	var category [32]byte
+	category[0] = 1
+	token := wire.TokenData{CategoryID: category, BitField: wire.HAS_NFT |
+		wire.HAS_COMMITMENT_LENGTH, Commitment: []byte{1, 2, 3}}
+	pkScript := hexToBytes("76a914ee8bd501094a7d5ca318da2506de35e1cb025ddc88ac")
+	prefix := token.TokenDataBuffer()
+	stxos := []SpentTxOut{{Amount: 1000,
+		PkScript: append(prefix.Bytes(), pkScript...), Height: 100}}
+
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{},
+		math.MaxUint32), nil))
+	coinbase.AddTxOut(wire.NewTxOut(1000, opTrueScript, wire.TokenData{}))
+	spent := wire.OutPoint{Hash: chainhash.Hash{1}}
+	spend := wire.NewMsgTx(1)
+	spend.AddTxIn(wire.NewTxIn(&spent, nil))
+	spend.AddTxOut(wire.NewTxOut(900, opTrueScript, wire.TokenData{}))
+	block := bchutil.NewBlock(&wire.MsgBlock{
+		Transactions: []*wire.MsgTx{coinbase, spend}})
+
+	view := NewUtxoViewpoint()
+	if err := disconnectTransactions(view, block, stxos); err != nil {
+		t.Fatal(err)
+	}
+	clear(stxos[0].PkScript)
+	entry := view.LookupEntry(spent)
+	if entry == nil || !bytes.Equal(entry.PkScript(), pkScript) ||
+		!reflect.DeepEqual(entry.tokenData, token) {
+		t.Fatalf("restored entry %v, want script %x", entry, pkScript)
+	}
+}
+
+// TestSizeClassesMatchRuntime checks the copy of Go's size classes against the
+// runtime, as append rounds an allocation up to its size class, so that a Go
+// upgrade that changes them fails here.
+func TestSizeClassesMatchRuntime(t *testing.T) {
+	previous := 0
+	for _, class := range sizeClasses {
+		// The first size past the class before finds a class the copy lacks.
+		for _, n := range []int{previous + 1, int(class) - 1, int(class)} {
+			if got, want := allocSize(n), uint64(cap(append([]byte(nil), make([]byte, n)...))); got != want {
+				t.Errorf("allocSize(%d) = %d, the runtime allocates %d", n, got, want)
+			}
+		}
+		previous = int(class)
+	}
+}
+
+// TestAllocSize checks allocSize against some of Go's size classes.
+func TestAllocSize(t *testing.T) {
+	for n, want := range map[int]uint64{0: 0, 1: 8, 25: 32, 120: 128,
+		1025: 1152, 4097: 4864, 8193: 9472, 10000: 10240, 32768: 32768,
+		32769: 40960} {
+		if got := allocSize(n); got != want {
+			t.Errorf("allocSize(%d) = %d, want %d", n, got, want)
+		}
+	}
 }

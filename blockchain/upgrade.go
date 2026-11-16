@@ -387,9 +387,9 @@ func deserializeUtxoEntryV0(serialized []byte) (map[uint32]*UtxoEntry, error) {
 
 	// Decode the unspentness bitmap adding a sparse output for each unspent
 	// output.
-	for i := uint32(0); i < uint32(numBitmapBytes); i++ {
+	for i := range uint32(numBitmapBytes) {
 		unspentBits := serialized[offset]
-		for j := uint32(0); j < 8; j++ {
+		for j := range uint32(8) {
 			if unspentBits&0x01 != 0 {
 				// The first 2 outputs are encoded via the
 				// header code, so adjust the output number
@@ -423,16 +423,13 @@ func deserializeUtxoEntryV0(serialized []byte) (map[uint32]*UtxoEntry, error) {
 		offset += bytesRead
 
 		// Create a new utxo entry with the details deserialized above.
+		tokenData, pkScript := wire.SplitPkScript(pkScript)
 		entries[outputIndex] = &UtxoEntry{
 			amount:      int64(amount),
 			pkScript:    pkScript,
+			tokenData:   tokenData,
 			blockHeight: int32(blockHeight),
 			packedFlags: packedFlags,
-		}
-		entries[outputIndex].pkScript, err = entries[outputIndex].tokenData.SeparateTokenDataFromPKScriptIfExists(entries[outputIndex].pkScript, 0)
-		if err != nil {
-			return nil, errDeserialize(fmt.Sprintf("unable to "+
-				"decode utxo at index %d: %v, Could not parse token data", i, err))
 		}
 	}
 
