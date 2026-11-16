@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -47,6 +48,25 @@ const fixedExcessiveBlockSize uint32 = 42111000
 func init() {
 	// Wire package requires initialization
 	SetLimits(fixedExcessiveBlockSize)
+}
+
+// maxBoundedDecodeAlloc is the maximum number of bytes a decode of the
+// truncated inputs used by the length bound tests is allowed to allocate.
+// Those inputs claim lengths or counts that would require hundreds of
+// megabytes if memory were sized from them up front, while decoding them
+// correctly needs at most a few tens of kilobytes, so 1 MiB separates the two
+// cases with plenty of margin for unrelated runtime allocations.
+const maxBoundedDecodeAlloc = 1 << 20
+
+// decodeAlloc runs the passed function and returns the number of bytes that
+// were allocated on the heap while it ran.
+func decodeAlloc(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 // Read returns the fake reader error and the lesser of the fake reader value
@@ -159,7 +179,7 @@ func TestElementWire(t *testing.T) {
 		// Read from wire format.
 		rbuf := bytes.NewReader(test.buf)
 		val := test.in
-		if reflect.ValueOf(test.in).Kind() != reflect.Ptr {
+		if reflect.ValueOf(test.in).Kind() != reflect.Pointer {
 			val = reflect.New(reflect.TypeOf(test.in)).Interface()
 		}
 		err = readElement(rbuf, val)
@@ -168,7 +188,7 @@ func TestElementWire(t *testing.T) {
 			continue
 		}
 		ival := val
-		if reflect.ValueOf(test.in).Kind() != reflect.Ptr {
+		if reflect.ValueOf(test.in).Kind() != reflect.Pointer {
 			ival = reflect.Indirect(reflect.ValueOf(val)).Interface()
 		}
 		if !reflect.DeepEqual(ival, test.in) {
@@ -235,7 +255,7 @@ func TestElementWireErrors(t *testing.T) {
 		// Decode from wire format.
 		r := newFixedReader(test.max, nil)
 		val := test.in
-		if reflect.ValueOf(test.in).Kind() != reflect.Ptr {
+		if reflect.ValueOf(test.in).Kind() != reflect.Pointer {
 			val = reflect.New(reflect.TypeOf(test.in)).Interface()
 		}
 		err = readElement(r, val)
@@ -729,7 +749,7 @@ func TestRandomUint64(t *testing.T) {
 		"when only %d was expected"
 
 	numHits := 0
-	for i := 0; i < tries; i++ {
+	for i := range tries {
 		nonce, err := RandomUint64()
 		if err != nil {
 			t.Errorf("RandomUint64 iteration %d failed - err %v",
@@ -760,5 +780,71 @@ func TestRandomUint64Errors(t *testing.T) {
 	}
 	if nonce != 0 {
 		t.Errorf("Nonce is not 0 [%v]", nonce)
+	}
+}
+
+// TestVarIntBufReuse checks that the scratch buffer variants encode like
+// WriteVarInt and decode their own output when one buffer is reused.
+func TestVarIntBufReuse(t *testing.T) {
+	vals := []uint64{0, 0xfc, 0xfd, 0xffff, 0x10000, 0xffffffff,
+		0x100000000, 0xffffffffffffffff}
+	buf := make([]byte, scratchSize)
+	for _, val := range vals {
+		var want, got bytes.Buffer
+		if err := WriteVarInt(&want, 0, val); err != nil {
+			t.Fatalf("WriteVarInt %d: %v", val, err)
+		}
+		if err := WriteVarIntBuf(&got, 0, val, buf); err != nil {
+			t.Fatalf("WriteVarIntBuf %d: %v", val, err)
+		}
+		if !bytes.Equal(got.Bytes(), want.Bytes()) {
+			t.Fatalf("WriteVarIntBuf %d: got %x, want %x", val,
+				got.Bytes(), want.Bytes())
+		}
+		rv, err := ReadVarIntBuf(&got, 0, buf)
+		if err != nil || rv != val {
+			t.Fatalf("ReadVarIntBuf %d: got %d, err %v", val, rv, err)
+		}
+	}
+}
+
+// TestAppendVarInt compares AppendVarInt, putVarInt and WriteVarIntToHasher
+// with WriteVarInt.
+func TestAppendVarInt(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []uint64{0, 1, 0xfc, 0xfd, 0xfe, 0xff, 0x100, 0xffff,
+		0x10000, 0xffffffff, 0x100000000, 1<<64 - 1} {
+		var want bytes.Buffer
+		if err := WriteVarInt(&want, 0, v); err != nil {
+			t.Fatal(err)
+		}
+		if got := AppendVarInt([]byte{9}, v); !bytes.Equal(got[1:], want.Bytes()) || got[0] != 9 {
+			t.Errorf("AppendVarInt(%d) = %x, want %x", v, got[1:], want.Bytes())
+		}
+		var buf [9]byte
+		if got := putVarInt(buf[:], v); !bytes.Equal(got, want.Bytes()) {
+			t.Errorf("putVarInt(%d) = %x, want %x", v, got, want.Bytes())
+		}
+		d := chainhash.NewDoubleHasher()
+		WriteVarIntToHasher(d, v)
+		if got, wantHash := d.Finish(), chainhash.DoubleHashH(want.Bytes()); got != wantHash {
+			t.Errorf("WriteVarIntToHasher(%d) hashes to %v, want %v", v, got, wantHash)
+		}
+	}
+}
+
+// TestReadVarIntBufCapacity ensures a buffer of no length and enough capacity
+// works, as ReadVarIntBuf's documentation says, for each size of encoding.
+func TestReadVarIntBufCapacity(t *testing.T) {
+	for _, want := range []uint64{1, 0xfd, 0x10000, 0x100000000} {
+		var buf bytes.Buffer
+		if err := WriteVarInt(&buf, 0, want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ReadVarIntBuf(&buf, 0, make([]byte, 0, 8))
+		if err != nil || got != want {
+			t.Fatalf("got %d, %v, want %d", got, err, want)
+		}
 	}
 }

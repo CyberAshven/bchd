@@ -24,7 +24,7 @@ func TestBlockTxns(t *testing.T) {
 	}
 
 	// Ensure max payload is expected value.
-	wantPayload := maxMessagePayload()
+	wantPayload := MaxBlockPayload()
 	maxPayload := msg.MaxPayloadLength(pver)
 	if maxPayload != wantPayload {
 		t.Errorf("MaxPayloadLength: wrong max payload length for "+
@@ -224,7 +224,7 @@ func TestBlockTxnsWire(t *testing.T) {
 // AbsoluteIndexes method is correct.
 func TestMsgBlockTxns_AbsoluteIndexes(t *testing.T) {
 	txs := make([]*MsgTx, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		tx := *multiTx
 		tx.Version = int32(i)
 		txs[i] = &tx

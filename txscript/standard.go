@@ -16,6 +16,11 @@ const (
 	// data to be considered a nulldata transaction
 	MaxDataCarrierSize = 223
 
+	// MaxP2SScriptSize is the maximum length of a public key script of no
+	// recognized form that is standard since the May 2026 upgrade (pay to
+	// script).
+	MaxP2SScriptSize = 201
+
 	// StandardVerifyFlags are the script flags which are used when
 	// executing transaction scripts to enforce additional checks which
 	// are required for the script to be considered standard.  These checks
@@ -48,6 +53,15 @@ const (
 		ScriptVerifyInputSigChecks |
 		ScriptVerify64BitIntegers |
 		ScriptVerifyNativeIntrospection
+
+	// RelayVerifyFlags are the script flags a transaction must pass to be
+	// relayed once all the upgrades this version knows are active, as the
+	// memory pool sets them by default on mainnet: StandardVerifyFlags
+	// with the CashTokens, May 2025 and May 2026 rules.  The memory pool's
+	// tests keep them its default.
+	RelayVerifyFlags = StandardVerifyFlags | ScriptAllowCashTokens |
+		ScriptAllowMay2025 | ScriptAllowMay2025StandardOnly |
+		ScriptAllowMay2026
 )
 
 // ScriptClass is an enumeration for the list of standard types of script.
@@ -67,153 +81,172 @@ const (
 // scriptClassToName houses the human-readable strings which describe each
 // script class.
 var scriptClassToName = []string{
-	NonStandardTy: "nonstandard",
-	PubKeyTy:      "pubkey",
-	PubKeyHashTy:  "pubkeyhash",
-	ScriptHashTy:  "scripthash",
-	MultiSigTy:    "multisig",
-	NullDataTy:    "nulldata",
+	NonStandardTy:  "nonstandard",
+	PubKeyTy:       "pubkey",
+	PubKeyHashTy:   "pubkeyhash",
+	ScriptHashTy:   "scripthash",
+	ScriptHash32Ty: "scripthash",
+	MultiSigTy:     "multisig",
+	NullDataTy:     "nulldata",
 }
 
 // String implements the Stringer interface by returning the name of
 // the enum script class. If the enum is invalid then "Invalid" will be
 // returned.
 func (t ScriptClass) String() string {
-	if int(t) > len(scriptClassToName) || int(t) < 0 {
+	if int(t) >= len(scriptClassToName) || int(t) < 0 {
 		return "Invalid"
 	}
 	return scriptClassToName[t]
 }
 
-// isPubkey returns true if the script passed is a pay-to-pubkey transaction,
-// false otherwise.
-func isPubkey(pops []parsedOpcode) bool {
-	// Valid pubkeys are either 33 or 65 bytes.
-	return len(pops) == 2 &&
-		(len(pops[0].data) == 33 || len(pops[0].data) == 65) &&
-		pops[1].opcode.value == OP_CHECKSIG
+// isValidPubKeySize returns whether the length of a public key fits its first
+// byte, as BCHN requires of the keys in the pubkey and multisig templates: 33
+// bytes after 0x02 or 0x03, and 65 bytes after 0x04, 0x06 or 0x07.
+func isValidPubKeySize(pubKey []byte) bool {
+	if len(pubKey) == 0 {
+		return false
+	}
+	switch pubKey[0] {
+	case 0x02, 0x03:
+		return len(pubKey) == 33
+	case 0x04, 0x06, 0x07:
+		return len(pubKey) == 65
+	}
+	return false
 }
 
-// isPubkeyHash returns true if the script passed is a pay-to-pubkey-hash
-// transaction, false otherwise.
-func isPubkeyHash(pops []parsedOpcode) bool {
-	return len(pops) == 5 &&
-		pops[0].opcode.value == OP_DUP &&
-		pops[1].opcode.value == OP_HASH160 &&
-		pops[2].opcode.value == OP_DATA_20 &&
-		pops[3].opcode.value == OP_EQUALVERIFY &&
-		pops[4].opcode.value == OP_CHECKSIG
-
+// isPubKeyScript returns whether the script is a pay-to-pubkey script, as
+// BCHN matches one: a direct push of a public key whose length fits its first
+// byte, followed by OP_CHECKSIG.
+func isPubKeyScript(script []byte) bool {
+	// The key must be pushed directly, so the opcode is its length.
+	n := len(script)
+	return n >= 2 && int(script[0]) == n-2 &&
+		isValidPubKeySize(script[1:n-1]) && script[n-1] == OP_CHECKSIG
 }
 
-// isMultiSig returns true if the passed script is a multisig transaction, false
-// otherwise.
-func isMultiSig(pops []parsedOpcode) bool {
-	// The absolute minimum is 1 pubkey:
-	// OP_0/OP_1-16 <pubkey> OP_1 OP_CHECKMULTISIG
-	l := len(pops)
-	if l < 4 {
-		return false
-	}
-	if !isSmallInt(pops[0].opcode) {
-		return false
-	}
-	if !isSmallInt(pops[l-2].opcode) {
-		return false
-	}
-	if pops[l-1].opcode.value != OP_CHECKMULTISIG {
-		return false
-	}
+// isPubKeyHashScript returns whether the script is a pay-to-pubkey-hash
+// script.
+func isPubKeyHashScript(script []byte) bool {
+	return len(script) == 25 &&
+		script[0] == OP_DUP &&
+		script[1] == OP_HASH160 &&
+		script[2] == OP_DATA_20 &&
+		script[23] == OP_EQUALVERIFY &&
+		script[24] == OP_CHECKSIG
+}
 
-	// Verify the number of pubkeys specified matches the actual number
-	// of pubkeys provided.
-	if l-2-1 != asSmallInt(pops[l-2].opcode) {
+// isMultiSigScript returns whether the script is a multisig script, as BCHN
+// matches one: OP_1 to OP_16 for the number of signatures, direct pushes of
+// one or more public keys whose lengths fit their first bytes, OP_1 to OP_16
+// for the number of keys, which may not be less than the number of
+// signatures, and OP_CHECKMULTISIG.
+func isMultiSigScript(script []byte) bool {
+	n := len(script)
+	if n < 4 || script[0] < OP_1 || script[0] > OP_16 ||
+		script[n-2] < OP_1 || script[n-2] > OP_16 ||
+		script[n-1] != OP_CHECKMULTISIG {
+
 		return false
 	}
+	numPubKeys := 0
+	for i := 1; i < n-2; {
+		// Keys must be pushed directly, so each opcode is the length of
+		// its key.
+		end := i + 1 + int(script[i])
+		if end > n-2 || !isValidPubKeySize(script[i+1:end]) {
+			return false
+		}
+		numPubKeys++
+		i = end
+	}
+	numSigs := asSmallInt(&opcodeArray[script[0]])
+	return asSmallInt(&opcodeArray[script[n-2]]) == numPubKeys &&
+		numSigs <= numPubKeys
+}
 
-	for _, pop := range pops[1 : l-2] {
-		// Valid pubkeys are either 33 or 65 bytes.
-		if len(pop.data) != 33 && len(pop.data) != 65 {
+// isNullDataScript returns whether the script is a null data script:
+// OP_RETURN followed only by pushes, and no longer than MaxDataCarrierSize.
+func isNullDataScript(script []byte) bool {
+	return len(script) <= MaxDataCarrierSize && isDataCarrierScript(script)
+}
+
+// isDataCarrierScript returns whether the script is OP_RETURN followed only
+// by pushes, whatever its length.
+func isDataCarrierScript(script []byte) bool {
+	if len(script) < 1 || script[0] != OP_RETURN {
+		return false
+	}
+	tokenizer := MakeScriptTokenizer(script[1:])
+	for tokenizer.Next() {
+		if tokenizer.Opcode() > OP_16 {
 			return false
 		}
 	}
-	return true
-}
-
-// isNullData returns true if the passed script is a null data transaction,
-// false otherwise.
-func isNullData(pops []parsedOpcode) bool {
-	// A nulldata transaction is either a single OP_RETURN or an
-	// OP_RETURN SMALLDATA (where SMALLDATA is a data push up to
-	// MaxDataCarrierSize bytes).
-	//
-	// Multiple pushes of data are allowed but the total script
-	// may not exceed MaxDataCarrierSize.
-	l := len(pops)
-	if l < 1 || pops[0].opcode.value != OP_RETURN {
-		return false
-	}
-
-	scriptLen := 1
-	for _, pop := range pops[1:] {
-		isDataOpcode := false
-		if isSmallInt(pop.opcode) {
-			isDataOpcode = true
-			scriptLen++
-		} else if pop.opcode.value < OP_PUSHDATA1 {
-			isDataOpcode = true
-			scriptLen += pop.opcode.length
-		} else if pop.opcode.value >= OP_PUSHDATA1 && pop.opcode.value <= OP_PUSHDATA4 {
-			isDataOpcode = true
-			scriptLen += len(pop.data)
-			scriptLen += -pop.opcode.length + 1
-		} else if pop.opcode.value < OP_16 {
-			isDataOpcode = true
-			scriptLen++
-		}
-		if !isDataOpcode {
-			return false
-		}
-	}
-	return scriptLen <= MaxDataCarrierSize
+	return tokenizer.Err() == nil
 }
 
 // typeOfScript returns the type of the script being inspected from the known
 // standard types.
-func typeOfScript(pops []parsedOpcode) ScriptClass {
-	if isPubkey(pops) {
+func typeOfScript(script []byte) ScriptClass {
+	switch {
+	case isPubKeyScript(script):
 		return PubKeyTy
-	} else if isPubkeyHash(pops) {
+	case isPubKeyHashScript(script):
 		return PubKeyHashTy
-	} else if isScriptHash(pops) {
+	case IsPayToScriptHash(script):
 		return ScriptHashTy
-	} else if isScriptHash32(pops) {
+	case IsPayToScriptHash32(script):
 		return ScriptHash32Ty
-	} else if isMultiSig(pops) {
+	case isMultiSigScript(script):
 		return MultiSigTy
-	} else if isNullData(pops) {
+	case isNullDataScript(script):
 		return NullDataTy
 	}
 	return NonStandardTy
+}
+
+// checkScriptParses returns the error parsing the script gives, if any.
+func checkScriptParses(script []byte) error {
+	tokenizer := MakeScriptTokenizer(script)
+	for tokenizer.Next() {
+	}
+	return tokenizer.Err()
 }
 
 // GetScriptClass returns the class of the script passed.
 //
 // NonStandardTy will be returned when the script does not parse.
 func GetScriptClass(script []byte) ScriptClass {
-	pops, err := parseScript(script)
-	if err != nil {
-		return NonStandardTy
+	return typeOfScript(script)
+}
+
+// ScriptTypeName returns the name RPC results give the type of a public key
+// script.  It differs from the name of its class in two ways: OP_RETURN
+// followed only by pushes is nulldata whatever its length, and any other
+// script of no recognized form is script (pay to script, standard since the
+// May 2026 upgrade) when it is no longer than MaxP2SScriptSize.
+func ScriptTypeName(script []byte) string {
+	class := typeOfScript(script)
+	if class != NonStandardTy {
+		return class.String()
 	}
-	return typeOfScript(pops)
+	switch {
+	case isDataCarrierScript(script):
+		return NullDataTy.String()
+	case len(script) <= MaxP2SScriptSize:
+		return "script"
+	}
+	return class.String()
 }
 
 // expectedInputs returns the number of arguments required by a script.
 // If the script is of unknown type such that the number can not be determined
 // then -1 is returned. We are an internal function and thus assume that class
-// is the real class of pops (and we can thus assume things that were determined
-// while finding out the type).
-func expectedInputs(pops []parsedOpcode, class ScriptClass) int {
+// is the real class of script (and we can thus assume things that were
+// determined while finding out the type).
+func expectedInputs(script []byte, class ScriptClass) int {
 	switch class {
 	case PubKeyTy:
 		return 1
@@ -233,7 +266,7 @@ func expectedInputs(pops []parsedOpcode, class ScriptClass) int {
 		// the original bitcoind bug where OP_CHECKMULTISIG pops an
 		// additional item from the stack, add an extra expected input
 		// for the extra push that is required to compensate.
-		return asSmallInt(pops[0].opcode) + 1
+		return asSmallInt(&opcodeArray[script[0]]) + 1
 
 	case NullDataTy:
 		fallthrough
@@ -269,14 +302,13 @@ func CalcScriptInfo(sigScript, pkScript []byte, scriptFlags ScriptFlags) (*Scrip
 		return nil, err
 	}
 
-	pkPops, err := parseScript(pkScript)
-	if err != nil {
+	if err := checkScriptParses(pkScript); err != nil {
 		return nil, err
 	}
 
 	// Push only sigScript makes little sense.
 	si := new(ScriptInfo)
-	si.PkScriptClass = typeOfScript(pkPops)
+	si.PkScriptClass = typeOfScript(pkScript)
 
 	// Can't have a signature script that doesn't just push data.
 	if !isPushOnly(sigPops) {
@@ -284,19 +316,22 @@ func CalcScriptInfo(sigScript, pkScript []byte, scriptFlags ScriptFlags) (*Scrip
 			"signature script is not push only")
 	}
 
-	si.ExpectedInputs = expectedInputs(pkPops, si.PkScriptClass)
+	si.ExpectedInputs = expectedInputs(pkScript, si.PkScriptClass)
 
 	switch {
 	case si.PkScriptClass == ScriptHashTy && scriptFlags.HasFlag(ScriptBip16):
 		// The pay-to-hash-script is the final data push of the
-		// signature script.
+		// signature script, so an empty one has none.
+		if len(sigPops) == 0 {
+			return nil, scriptError(ErrInvalidStackOperation,
+				"signature script is empty")
+		}
 		script := sigPops[len(sigPops)-1].data
-		shPops, err := parseScript(script)
-		if err != nil {
+		if err := checkScriptParses(script); err != nil {
 			return nil, err
 		}
 
-		shInputs := expectedInputs(shPops, typeOfScript(shPops))
+		shInputs := expectedInputs(script, typeOfScript(script))
 		if shInputs == -1 {
 			si.ExpectedInputs = -1
 		} else {
@@ -320,10 +355,6 @@ func CalcScriptInfo(sigScript, pkScript []byte, scriptFlags ScriptFlags) (*Scrip
 // a multi-signature transaction script.  The passed script MUST already be
 // known to be a multi-signature script.
 func CalcMultiSigStats(script []byte) (int, int, error) {
-	pops, err := parseScript(script)
-	if err != nil {
-		return 0, 0, err
-	}
 
 	// A multi-signature script is of the pattern:
 	//  NUM_SIGS PUBKEY PUBKEY PUBKEY... NUM_PUBKEYS OP_CHECKMULTISIG
@@ -332,13 +363,26 @@ func CalcMultiSigStats(script []byte) (int, int, error) {
 	// minimum for a multi-signature script is 1 pubkey, so at least 4
 	// items must be on the stack per:
 	//  OP_1 PUBKEY OP_1 OP_CHECKMULTISIG
-	if len(pops) < 4 {
+	var first, secondToLast, last *opcode
+	numOpcodes := 0
+	tokenizer := MakeScriptTokenizer(script)
+	for tokenizer.Next() {
+		if numOpcodes == 0 {
+			first = tokenizer.op
+		}
+		secondToLast, last = last, tokenizer.op
+		numOpcodes++
+	}
+	if err := tokenizer.Err(); err != nil {
+		return 0, 0, err
+	}
+	if numOpcodes < 4 {
 		str := fmt.Sprintf("script %x is not a multisig script", script)
 		return 0, 0, scriptError(ErrNotMultisigScript, str)
 	}
 
-	numSigs := asSmallInt(pops[0].opcode)
-	numPubKeys := asSmallInt(pops[len(pops)-2].opcode)
+	numSigs := asSmallInt(first)
+	numPubKeys := asSmallInt(secondToLast)
 	return numPubKeys, numSigs, nil
 }
 
@@ -460,18 +504,17 @@ func MultiSigScript(pubkeys []*bchutil.AddressPubKey, nrequired int) ([]byte, er
 // PushedData returns an array of byte slices containing any pushed data found
 // in the passed script.  This includes OP_0, but not OP_1 - OP_16.
 func PushedData(script []byte) ([][]byte, error) {
-	pops, err := parseScript(script)
-	if err != nil {
-		return nil, err
-	}
-
 	var data [][]byte
-	for _, pop := range pops {
-		if pop.data != nil {
-			data = append(data, pop.data)
-		} else if pop.opcode.value == OP_0 {
+	tokenizer := MakeScriptTokenizer(script)
+	for tokenizer.Next() {
+		if tokenizer.Data() != nil {
+			data = append(data, tokenizer.Data())
+		} else if tokenizer.Opcode() == OP_0 {
 			data = append(data, nil)
 		}
+	}
+	if err := tokenizer.Err(); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
@@ -484,14 +527,7 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 	var addrs []bchutil.Address
 	var requiredSigs int
 
-	// No valid addresses or required signatures if the script doesn't
-	// parse.
-	pops, err := parseScript(pkScript)
-	if err != nil {
-		return NonStandardTy, nil, 0, err
-	}
-
-	scriptClass := typeOfScript(pops)
+	scriptClass := typeOfScript(pkScript)
 	switch scriptClass {
 	case PubKeyHashTy:
 		// A pay-to-pubkey-hash script is of the form:
@@ -499,7 +535,7 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 		// Therefore the pubkey hash is the 3rd item on the stack.
 		// Skip the pubkey hash if it's invalid for some reason.
 		requiredSigs = 1
-		addr, err := bchutil.NewAddressPubKeyHash(pops[2].data,
+		addr, err := bchutil.NewAddressPubKeyHash(pkScript[3:23],
 			chainParams)
 		if err == nil {
 			addrs = append(addrs, addr)
@@ -511,7 +547,9 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 		// Therefore the pubkey is the first item on the stack.
 		// Skip the pubkey if it's invalid for some reason.
 		requiredSigs = 1
-		addr, err := bchutil.NewAddressPubKey(pops[0].data, chainParams)
+		tokenizer := MakeScriptTokenizer(pkScript)
+		tokenizer.Next()
+		addr, err := bchutil.NewAddressPubKey(tokenizer.Data(), chainParams)
 		if err == nil {
 			addrs = append(addrs, addr)
 		}
@@ -522,7 +560,7 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 		// Therefore the script hash is the 2nd item on the stack.
 		// Skip the script hash if it's invalid for some reason.
 		requiredSigs = 1
-		addr, err := bchutil.NewAddressScriptHashFromHash(pops[1].data,
+		addr, err := bchutil.NewAddressScriptHashFromHash(pkScript[2:22],
 			chainParams)
 		if err == nil {
 			addrs = append(addrs, addr)
@@ -534,7 +572,7 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 		// Therefore the script hash is the 2nd item on the stack.
 		// Skip the script hash if it's invalid for some reason.
 		requiredSigs = 1
-		addr, err := bchutil.NewAddressScriptHash32FromHash(pops[1].data,
+		addr, err := bchutil.NewAddressScriptHash32FromHash(pkScript[2:34],
 			chainParams)
 		if err == nil {
 			addrs = append(addrs, addr)
@@ -548,13 +586,15 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 		// Therefore the number of required signatures is the 1st item
 		// on the stack and the number of public keys is the 2nd to last
 		// item on the stack.
-		requiredSigs = asSmallInt(pops[0].opcode)
-		numPubKeys := asSmallInt(pops[len(pops)-2].opcode)
+		requiredSigs = asSmallInt(&opcodeArray[pkScript[0]])
+		numPubKeys := asSmallInt(&opcodeArray[pkScript[len(pkScript)-2]])
 
 		// Extract the public keys while skipping any that are invalid.
 		addrs = make([]bchutil.Address, 0, numPubKeys)
-		for i := 0; i < numPubKeys; i++ {
-			addr, err := bchutil.NewAddressPubKey(pops[i+1].data,
+		tokenizer := MakeScriptTokenizer(pkScript[1:])
+		for range numPubKeys {
+			tokenizer.Next()
+			addr, err := bchutil.NewAddressPubKey(tokenizer.Data(),
 				chainParams)
 			if err == nil {
 				addrs = append(addrs, addr)
@@ -567,7 +607,11 @@ func ExtractPkScriptAddrs(pkScript []byte, chainParams *chaincfg.Params) (Script
 
 	case NonStandardTy:
 		// Don't attempt to extract addresses or required signatures for
-		// nonstandard transactions.
+		// nonstandard transactions, and return the error of scripts that
+		// don't parse.
+		if err := checkScriptParses(pkScript); err != nil {
+			return NonStandardTy, nil, 0, err
+		}
 	}
 
 	return scriptClass, addrs, requiredSigs, nil
@@ -594,12 +638,23 @@ type AtomicSwapDataPushes struct {
 // This function is only defined in the txscript package due to API limitations
 // which prevent callers using txscript to parse nonstandard scripts.
 func ExtractAtomicSwapDataPushes(version uint16, pkScript []byte) (*AtomicSwapDataPushes, error) {
-	pops, err := parseScript(pkScript)
-	if err != nil {
+	// Keep the first 20 opcodes, but walk the whole script so scripts that
+	// don't parse still return their error.
+	var pops [20]parsedOpcode
+	numOpcodes := 0
+	tokenizer := MakeScriptTokenizer(pkScript)
+	for tokenizer.Next() {
+		if numOpcodes < len(pops) {
+			pops[numOpcodes] = parsedOpcode{opcode: tokenizer.op,
+				data: tokenizer.Data()}
+		}
+		numOpcodes++
+	}
+	if err := tokenizer.Err(); err != nil {
 		return nil, err
 	}
 
-	if len(pops) != 20 {
+	if numOpcodes != 20 {
 		return nil, nil
 	}
 	isAtomicSwap := pops[0].opcode.value == OP_IF &&

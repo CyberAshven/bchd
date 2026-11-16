@@ -6,7 +6,8 @@
   },
   "tags": [
     {
-      "name": "bchrpc"
+      "name": "bchrpc",
+      "description": "bchrpc contains a set of RPCs that can be exposed publicly via\nthe command line options. This service could be authenticated or\nunauthenticated."
     }
   ],
   "consumes": [
@@ -30,7 +31,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -64,13 +65,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Get marshaled transactions related to a specific address.\n\nRECOMMENDED:\nParameters have been provided to query without creating\n  performance issues on the node or client.\n\n- The number of transactions to skip and fetch allow for iterating\n      over a large set of transactions, if necessary.\n\n- A starting block parameter (either `hash` or `height`)\n      may then be used to filter results to those occurring\n      after a certain time.\n\nThis approach will reduce network traffic and response processing\n  for the client, as well as reduce workload on the node.",
             "in": "body",
             "required": true,
             "schema": {
@@ -98,7 +100,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -109,6 +111,40 @@
             "required": true,
             "schema": {
               "$ref": "#/definitions/pbGetAddressUnspentOutputsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "bchrpc"
+        ]
+      }
+    },
+    "/v1/GetBcmrIdentity": {
+      "post": {
+        "summary": "GetBcmrIdentity returns what the BCMR index knows of an identity, as\nCHIP-BCMR defines it, a token's or that of any transaction of an\nauthchain the index tracks, with the links of its authchain in the\nmempool: the authhead, the BCMR publication to read and a token's\ngenesis supply, and on request the authchain itself, in pages, with a\nmerkle proof of the newest confirmed link. The index tracks every\ntoken's authchain and, from where it begins, every authchain that holds\na publication, unless more than 100,000 transactions it doesn't\notherwise track are behind the publication; it finds the transactions\nbehind a publication in the background, once the publication's block is\nconnected.",
+        "description": "**Requires BcmrIndex**",
+        "operationId": "bchrpc_GetBcmrIdentity",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pbGetBcmrIdentityResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/googleRpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/pbGetBcmrIdentityRequest"
             }
           }
         ],
@@ -131,7 +167,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -165,7 +201,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -198,13 +234,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Request headers using a list of known block hashes.",
             "in": "body",
             "required": true,
             "schema": {
@@ -231,7 +268,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -264,7 +301,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -275,6 +312,106 @@
             "required": true,
             "schema": {
               "$ref": "#/definitions/pbGetBlockchainInfoRequest"
+            }
+          }
+        ],
+        "tags": [
+          "bchrpc"
+        ]
+      }
+    },
+    "/v1/GetDoubleSpendProof": {
+      "post": {
+        "summary": "GetDoubleSpendProof returns a double spend proof, looked up by its hash, by the\ndouble spent output, or by a mempool transaction, in which case the transaction's\nunconfirmed ancestors are searched as well.",
+        "description": "A double spend proof shows that a pay-to-pubkey-hash output spent by a mempool\ntransaction was also spent by another, differently signed transaction.",
+        "operationId": "bchrpc_GetDoubleSpendProof",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/googleRpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofRequest"
+            }
+          }
+        ],
+        "tags": [
+          "bchrpc"
+        ]
+      }
+    },
+    "/v1/GetDoubleSpendProofScore": {
+      "post": {
+        "summary": "GetDoubleSpendProofScore returns how far a mempool transaction can be trusted not\nto be double spent.",
+        "operationId": "bchrpc_GetDoubleSpendProofScore",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofScoreResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/googleRpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofScoreRequest"
+            }
+          }
+        ],
+        "tags": [
+          "bchrpc"
+        ]
+      }
+    },
+    "/v1/GetDoubleSpendProofs": {
+      "post": {
+        "summary": "GetDoubleSpendProofs returns the double spend proofs for mempool transactions.",
+        "operationId": "bchrpc_GetDoubleSpendProofs",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/googleRpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/pbGetDoubleSpendProofsRequest"
             }
           }
         ],
@@ -297,7 +434,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -330,7 +467,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -364,7 +501,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -385,7 +522,7 @@
     },
     "/v1/GetRawAddressTransactions": {
       "post": {
-        "summary": "GetRawAddressTransactions the serialized raw transactions for\nthe given address. Offers offset, limit, and from block options.",
+        "summary": "GetRawAddressTransactions returns the serialized raw transactions for\nthe given address. Offers offset, limit, and from block options.",
         "description": "**Requires AddressIndex**",
         "operationId": "bchrpc_GetRawAddressTransactions",
         "responses": {
@@ -398,13 +535,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Get encoded transactions related to a specific address.\n\nRECOMMENDED:\nParameters have been provided to query without creating\n  performance issues on the node or client.\n\n- The number of transactions to skip and fetch allow for iterating\n      over a large set of transactions, if necessary.\n\n- A starting block parameter (either `hash` or `height`)\n      may then be used to filter results to those occurring\n      after a certain time.\n\nThis approach will reduce network traffic and response processing\n  for the client, as well as reduce workload on the node.",
             "in": "body",
             "required": true,
             "schema": {
@@ -431,7 +569,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -465,13 +603,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Get an encoded transaction from a transaction hash.",
             "in": "body",
             "required": true,
             "schema": {
@@ -499,7 +638,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -532,7 +671,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -566,7 +705,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -600,7 +739,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -634,13 +773,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Get a transaction from a transaction hash.",
             "in": "body",
             "required": true,
             "schema": {
@@ -668,7 +808,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -701,7 +841,7 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -734,7 +874,7 @@
                   "$ref": "#/definitions/pbBlockNotification"
                 },
                 "error": {
-                  "$ref": "#/definitions/rpcStatus"
+                  "$ref": "#/definitions/googleRpcStatus"
                 }
               },
               "title": "Stream result of pbBlockNotification"
@@ -743,7 +883,50 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "- BlockInfo (block metadata): `BlockInfo`\n     - SubscribeBlocksRequest {}\n\n - Marshaled Block (with transaction hashes): `Block`\n     - SubscribeBlocksRequest {\n           full_block = true\n       }\n - Marshaled Block (with full transaction data): `Block`\n     - SubscribeBlocksRequest {\n           full_block = true\n           full_transactions = true\n       }\n - Serialized Block acccording to bitcoin protocol encoding: `bytes`\n     - SubscribeBlocksRequest {\n           serialize_block = true\n       }",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/pbSubscribeBlocksRequest"
+            }
+          }
+        ],
+        "tags": [
+          "bchrpc"
+        ]
+      }
+    },
+    "/v1/SubscribeDoubleSpendProofs": {
+      "post": {
+        "summary": "SubscribeDoubleSpendProofs creates a subscription for notifications of double spend\nproofs as they become associated with mempool transactions.",
+        "operationId": "bchrpc_SubscribeDoubleSpendProofs",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/pbDoubleSpendProofNotification"
+                },
+                "error": {
+                  "$ref": "#/definitions/googleRpcStatus"
+                }
+              },
+              "title": "Stream result of pbDoubleSpendProofNotification"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
@@ -753,7 +936,7 @@
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/pbSubscribeBlocksRequest"
+              "$ref": "#/definitions/pbSubscribeDoubleSpendProofsRequest"
             }
           }
         ],
@@ -777,7 +960,7 @@
                   "$ref": "#/definitions/pbTransactionNotification"
                 },
                 "error": {
-                  "$ref": "#/definitions/rpcStatus"
+                  "$ref": "#/definitions/googleRpcStatus"
                 }
               },
               "title": "Stream result of pbTransactionNotification"
@@ -786,14 +969,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
-            "description": " (streaming inputs)",
+            "description": "Request to subscribe or unsubscribe from a stream of transactions. (streaming inputs)",
             "in": "body",
             "required": true,
             "schema": {
@@ -821,7 +1004,7 @@
                   "$ref": "#/definitions/pbTransactionNotification"
                 },
                 "error": {
-                  "$ref": "#/definitions/rpcStatus"
+                  "$ref": "#/definitions/googleRpcStatus"
                 }
               },
               "title": "Stream result of pbTransactionNotification"
@@ -830,13 +1013,14 @@
           "default": {
             "description": "An unexpected error response.",
             "schema": {
-              "$ref": "#/definitions/rpcStatus"
+              "$ref": "#/definitions/googleRpcStatus"
             }
           }
         },
         "parameters": [
           {
             "name": "body",
+            "description": "Request to subscribe or unsubscribe from a stream of transactions.",
             "in": "body",
             "required": true,
             "schema": {
@@ -851,16 +1035,150 @@
     }
   },
   "definitions": {
+    "DoubleSpendProofSpender": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The transaction version."
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The input sequence number."
+        },
+        "lock_time": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The transaction lock time."
+        },
+        "hash_prev_outputs": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the outpoints spent by the transaction, or zero when the\nsignature does not commit to them."
+        },
+        "hash_sequence": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the input sequence numbers, or zero when the signature\ndoes not commit to them."
+        },
+        "hash_outputs": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the outputs the signature commits to, or zero."
+        },
+        "push_data": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "The data the input pushed: its signature."
+        }
+      },
+      "description": "The parts of the signature preimage of one of the two inputs."
+    },
+    "GetBcmrIdentityResponseLink": {
+      "type": "object",
+      "properties": {
+        "hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The link's transaction hash, little-endian."
+        },
+        "height": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The height of the link's block, or 0 while it is in the mempool."
+        },
+        "block_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the link's block, little-endian, or empty while it is\nin the mempool."
+        },
+        "publication": {
+          "$ref": "#/definitions/GetBcmrIdentityResponsePublication",
+          "description": "The link's BCMR publication output, if it has one."
+        },
+        "transaction": {
+          "type": "string",
+          "format": "byte",
+          "description": "The serialized transaction, for the links in authchain."
+        }
+      },
+      "description": "A link of the authchain."
+    },
+    "GetBcmrIdentityResponseProof": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The index of the link in the authchain."
+        },
+        "block": {
+          "$ref": "#/definitions/pbBlockInfo",
+          "description": "The link's block, and the proof's hashes and flags, as in\nGetMerkleProofResponse."
+        },
+        "hashes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          }
+        },
+        "flags": {
+          "type": "string",
+          "format": "byte"
+        },
+        "transactions": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of transactions in the block, which the proof's tree\nneeds."
+        }
+      },
+      "description": "A merkle proof of a link of the authchain."
+    },
+    "GetBcmrIdentityResponsePublication": {
+      "type": "object",
+      "properties": {
+        "output": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The index of the output."
+        },
+        "malformed": {
+          "type": "boolean",
+          "description": "The output starts with the publication prefix but is malformed,\nand hash and uris are empty."
+        },
+        "hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The SHA-256 of the registry in the byte order it was pushed in,\nwhich SHA-256 tools print, unlike the little-endian hashes of\ntransactions and blocks."
+        },
+        "uris": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The URIs pushed after the hash, as they are."
+        }
+      },
+      "description": "A BCMR publication output, as CHIP-BCMR defines it."
+    },
     "GetBlockchainInfoResponseBitcoinNet": {
       "type": "string",
       "enum": [
         "MAINNET",
         "REGTEST",
         "TESTNET3",
-        "SIMNET"
+        "SIMNET",
+        "TESTNET4",
+        "CHIPNET"
       ],
       "default": "MAINNET",
-      "description": "- MAINNET: Live public network with monetary value.\n - REGTEST: An isolated environment for automated testing.\n - TESTNET3: A public environment where monetary value is agreed to be zero,\nand some checks for transaction conformity are disabled.\n - SIMNET: Private testnets for large scale simulations (or stress testing),\nwhere a specified list of nodes is used, rather than node discovery.",
+      "description": "- MAINNET: Live public network with monetary value.\n - REGTEST: An isolated environment for automated testing.\n - TESTNET3: A public environment where monetary value is agreed to be zero,\nand some checks for transaction conformity are disabled.\n - SIMNET: Private testnets for large scale simulations (or stress testing),\nwhere a specified list of nodes is used, rather than node discovery.\n - TESTNET4: Latest Testnet.\n - CHIPNET: The public network for testing upcoming upgrades.",
       "title": "Bitcoin network types"
     },
     "GetSlpTrustedValidationRequestQuery": {
@@ -1078,6 +1396,9 @@
         },
         "slp_token": {
           "$ref": "#/definitions/pbSlpToken"
+        },
+        "cash_token": {
+          "$ref": "#/definitions/pbCashToken"
         }
       }
     },
@@ -1105,7 +1426,7 @@
         },
         "script_class": {
           "type": "string",
-          "description": "The type of script."
+          "description": "The type of script: pubkey, pubkeyhash, scripthash (for both the\n20 and the 32 byte hash forms), multisig, datacarrier (OP_RETURN\nfollowed only by pushes), script (any other script of at most 201\nbytes) or nonstandard."
         },
         "disassembled_script": {
           "type": "string",
@@ -1113,6 +1434,28 @@
         },
         "slp_token": {
           "$ref": "#/definitions/pbSlpToken"
+        },
+        "cash_token": {
+          "$ref": "#/definitions/pbCashToken"
+        }
+      }
+    },
+    "googleRpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
         }
       }
     },
@@ -1126,6 +1469,7 @@
         "transaction_data": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbBlockTransactionData"
           },
           "description": "List of transactions or transaction hashes."
@@ -1201,6 +1545,7 @@
           "description": "The median block time of the latest 11 block timestamps."
         }
       },
+      "description": "Identification.",
       "title": "Metadata for identifying and validating a block"
     },
     "pbBlockNotification": {
@@ -1248,6 +1593,29 @@
         }
       }
     },
+    "pbCashToken": {
+      "type": "object",
+      "properties": {
+        "category_id": {
+          "type": "string",
+          "format": "byte"
+        },
+        "amount": {
+          "type": "string",
+          "format": "uint64"
+        },
+        "commitment": {
+          "type": "string",
+          "format": "byte"
+        },
+        "bitfield": {
+          "type": "string",
+          "format": "byte"
+        }
+      },
+      "description": "WARNING: Some languages (e.g., JavaScript) may not properly handle the 'uint64'\nfor large amounts. For this reason, an annotation has been added for JS to\nreturn a string for the amount field instead of casting uint64 to the JS 'number'\ntype. Other languages may require similar treatment.",
+      "title": "CashToken info used in transaction inputs / outputs"
+    },
     "pbCheckSlpTransactionRequest": {
       "type": "object",
       "properties": {
@@ -1258,6 +1626,7 @@
         "required_slp_burns": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbSlpRequiredBurn"
           }
         },
@@ -1282,6 +1651,45 @@
         }
       }
     },
+    "pbDoubleSpendProof": {
+      "type": "object",
+      "properties": {
+        "hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the serialized proof, little-endian."
+        },
+        "transaction_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The mempool transaction spending the double spent output, little-endian,\nor empty when no mempool transaction spends it. Orphan proofs, those\nreturned by GetDoubleSpendProofs with include_orphans, always have it empty."
+        },
+        "outpoint": {
+          "$ref": "#/definitions/InputOutpoint",
+          "description": "The double spent output."
+        },
+        "first_spender": {
+          "$ref": "#/definitions/DoubleSpendProofSpender"
+        },
+        "double_spender": {
+          "$ref": "#/definitions/DoubleSpendProofSpender"
+        },
+        "serialized_proof": {
+          "type": "string",
+          "format": "byte",
+          "description": "The proof serialized as in the dsproof-beta message."
+        }
+      },
+      "description": "A proof that two differently signed inputs spend the same pay-to-pubkey-hash\noutput, as relayed in dsproof-beta messages."
+    },
+    "pbDoubleSpendProofNotification": {
+      "type": "object",
+      "properties": {
+        "proof": {
+          "$ref": "#/definitions/pbDoubleSpendProof"
+        }
+      }
+    },
     "pbGetAddressTransactionsRequest": {
       "type": "object",
       "properties": {
@@ -1292,17 +1700,17 @@
         "nb_skip": {
           "type": "integer",
           "format": "int64",
-          "description": "The number of confirmed transactions to skip, starting with the oldest first.\nDoes not affect results of unconfirmed transactions."
+          "description": "The number of confirmed transactions to skip, starting with the newest.\nDoes not affect results of unconfirmed transactions."
         },
         "nb_fetch": {
           "type": "integer",
           "format": "int64",
-          "description": "Specify the number of transactions to fetch."
+          "description": "Specify the number of confirmed transactions to fetch, 100 if 0.  A\nrequest for more than 10,000 fails.  Does not affect results of\nunconfirmed transactions."
         },
         "hash": {
           "type": "string",
           "format": "byte",
-          "description": "Recommended. Only get transactions after (or within) a\nstarting block identified by hash, little-endian."
+          "description": "Recommended. Only get transactions after (or within) a\nstarting block identified by hash, little-endian.  A hash of no\nblock of the main chain is taken for the genesis block."
         },
         "height": {
           "type": "integer",
@@ -1318,6 +1726,7 @@
         "confirmed_transactions": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbTransaction"
           },
           "description": "Transactions that have been included in a block."
@@ -1325,9 +1734,15 @@
         "unconfirmed_transactions": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbMempoolTransaction"
           },
           "description": "Transactions in mempool which have not been included in a block."
+        },
+        "confirmed_count": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of confirmed transactions of the address, whatever the\nskip, fetch and start block of the request.  Nodes that predate it\nleave it 0, so a reply with confirmed transactions and a count of 0 is\nfrom such a node."
         }
       }
     },
@@ -1353,6 +1768,7 @@
         "outputs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbUnspentOutput"
           },
           "description": "List of unspent outputs."
@@ -1360,10 +1776,102 @@
         "token_metadata": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbSlpTokenMetadata"
           }
         }
       }
+    },
+    "pbGetBcmrIdentityRequest": {
+      "type": "object",
+      "properties": {
+        "authbase": {
+          "type": "string",
+          "format": "byte",
+          "description": "The identity's authbase, little-endian: a token's category ID, or any\ntransaction of an authchain the index tracks."
+        },
+        "include_authchain": {
+          "type": "boolean",
+          "description": "Also return the authchain's transactions, from the authbase, or from\nthe link after the one in after."
+        },
+        "after": {
+          "type": "string",
+          "format": "byte",
+          "description": "A link of the authchain, little-endian, which the client knows the\nauthchain up to, to return the links after it. Only with\ninclude_authchain."
+        },
+        "limit": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The most links to return, up to 1000, which 0 also means. An answer\nalso holds no more after the link that takes its transactions to\n1 MB. Only with include_authchain."
+        }
+      }
+    },
+    "pbGetBcmrIdentityResponse": {
+      "type": "object",
+      "properties": {
+        "authbase": {
+          "type": "string",
+          "format": "byte",
+          "description": "The identity's authbase, little-endian."
+        },
+        "status": {
+          "$ref": "#/definitions/pbGetBcmrIdentityResponseStatus"
+        },
+        "head": {
+          "$ref": "#/definitions/GetBcmrIdentityResponseLink",
+          "description": "The authhead, the newest link of the authchain, confirmed or in the\nmempool."
+        },
+        "publication": {
+          "$ref": "#/definitions/GetBcmrIdentityResponseLink",
+          "description": "The link with the publication to read: the authhead, when it has a\nwell-formed publication and publication_current is set, or else the\nnewest earlier link with one. Unset if no link has one."
+        },
+        "publication_current": {
+          "type": "boolean"
+        },
+        "genesis_supply": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The number of fungible tokens the token's genesis created, when\nhas_genesis_supply is set, for a token's identity."
+        },
+        "has_genesis_supply": {
+          "type": "boolean"
+        },
+        "identity_output": {
+          "$ref": "#/definitions/pbCashToken",
+          "description": "The CashTokens data of the authhead's identity output, output 0, as it\nis, if it carries a token."
+        },
+        "first_index": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The index of the first link in authchain, counted from the authbase\nas 0."
+        },
+        "authchain": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/GetBcmrIdentityResponseLink"
+          },
+          "description": "The links of the authchain, with include_authchain, in the order of\nCHIP-BCMR's authchain extension."
+        },
+        "more": {
+          "type": "boolean",
+          "description": "Later links didn't fit; ask again with after set to the last one."
+        },
+        "proof": {
+          "$ref": "#/definitions/GetBcmrIdentityResponseProof",
+          "description": "A merkle proof of the newest confirmed link, which proves the earlier\nlinks too, since each spends the one before. Set when the links\nreturned reach the authhead and a link is confirmed."
+        }
+      },
+      "description": "GetBcmrIdentityResponse is what the BCMR index knows of an identity.\n\nWARNING: Some languages (e.g., JavaScript) may not properly handle the 'uint64'\nfor large amounts. For this reason, an annotation has been added for JS to\nreturn a string for the genesis_supply field instead of casting uint64 to the\nJS 'number' type. Other languages may require similar treatment."
+    },
+    "pbGetBcmrIdentityResponseStatus": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "BURNED"
+      ],
+      "default": "ACTIVE",
+      "description": " - ACTIVE: The authchain goes on.\n - BURNED: The authhead spent the identity output to a data-carrier output,\nwhich ends the authchain."
     },
     "pbGetBlockFilterRequest": {
       "type": "object",
@@ -1487,6 +1995,98 @@
         "slp_graphsearch": {
           "type": "boolean",
           "title": "When `slp_graphsearch` is true, the node is able to handle calls to slp graph search"
+        },
+        "bcmr_index": {
+          "type": "boolean",
+          "description": "When `bcmr_index` is true, the node has the BCMR index enabled and may\nbe used with GetBcmrIdentity."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofRequest": {
+      "type": "object",
+      "properties": {
+        "proof_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the proof, little-endian."
+        },
+        "transaction_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of a mempool transaction, little-endian."
+        },
+        "outpoint": {
+          "$ref": "#/definitions/InputOutpoint",
+          "description": "The double spent output."
+        },
+        "exclude_ancestors": {
+          "type": "boolean",
+          "description": "When looking up by transaction_hash, only return a proof for that transaction,\nwithout searching its unconfirmed ancestors. Default is false. The search is\ndepth first, and one past 1000 ancestors fails with ResourceExhausted."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofResponse": {
+      "type": "object",
+      "properties": {
+        "proof": {
+          "$ref": "#/definitions/pbDoubleSpendProof"
+        },
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "When looking up by transaction_hash with the ancestors searched, the\ntransactions from the one looked up to the one the proof is for,\nlittle-endian."
+        },
+        "descendants": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "The transaction the proof is for and its mempool descendants, at most the 1000\nnearest, little-endian.\nEmpty for an orphan proof."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofScoreRequest": {
+      "type": "object",
+      "properties": {
+        "transaction_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of a mempool transaction, little-endian."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofScoreResponse": {
+      "type": "object",
+      "properties": {
+        "score": {
+          "type": "number",
+          "format": "double",
+          "description": "1 when neither the transaction nor an unconfirmed ancestor has a proof and a\nproof is possible for all of them, 0 when one of them has a proof or spends an\noutput no proof is possible for (not pay-to-pubkey-hash), and 0.25 when an input\nof one of them does not sign all inputs and outputs or there are too many\nunconfirmed ancestors to check."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofsRequest": {
+      "type": "object",
+      "properties": {
+        "include_orphans": {
+          "type": "boolean",
+          "description": "When include_orphans is true, proofs whose transaction is not in the mempool are\nincluded. Default is false."
+        }
+      }
+    },
+    "pbGetDoubleSpendProofsResponse": {
+      "type": "object",
+      "properties": {
+        "proofs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/pbDoubleSpendProof"
+          }
         }
       }
     },
@@ -1515,6 +2115,7 @@
         "headers": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbBlockInfo"
           },
           "description": "List of block headers."
@@ -1554,6 +2155,7 @@
         "transaction_data": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbGetMempoolResponseTransactionData"
           },
           "description": "List of unconfirmed transactions."
@@ -1616,22 +2218,22 @@
         "nb_skip": {
           "type": "integer",
           "format": "int64",
-          "description": "The number of confirmed transactions to skip, starting with the oldest first.\nDoes not affect results of unconfirmed transactions."
+          "description": "The number of confirmed transactions to skip, starting with the newest.\nDoes not affect results of unconfirmed transactions."
         },
         "nb_fetch": {
           "type": "integer",
           "format": "int64",
-          "description": "Specify the number of transactions to fetch."
+          "description": "Specify the number of confirmed transactions to fetch, 100 if 0.  A\nrequest for more than 10,000 fails.  Does not affect results of\nunconfirmed transactions."
         },
         "hash": {
           "type": "string",
           "format": "byte",
-          "description": "Recommended. Only return transactions after some starting block\nidentified by hash, little-endian."
+          "description": "Recommended. Only return transactions in or after some starting\nblock identified by hash, little-endian.  A hash of no block of\nthe main chain is taken for the genesis block."
         },
         "height": {
           "type": "integer",
           "format": "int32",
-          "description": "Recommended. Only return transactions after some starting block\nidentified by block number."
+          "description": "Recommended. Only return transactions in or after some starting\nblock identified by block number."
         }
       },
       "description": "Get encoded transactions related to a specific address.\n\nRECOMMENDED:\nParameters have been provided to query without creating\n  performance issues on the node or client.\n\n- The number of transactions to skip and fetch allow for iterating\n      over a large set of transactions, if necessary.\n\n- A starting block parameter (either `hash` or `height`)\n      may then be used to filter results to those occurring\n      after a certain time.\n\nThis approach will reduce network traffic and response processing\n  for the client, as well as reduce workload on the node."
@@ -1654,6 +2256,11 @@
             "format": "byte"
           },
           "description": "Transactions in mempool which have not been included in a block."
+        },
+        "confirmed_count": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of confirmed transactions of the address, whatever the\nskip, fetch and start block of the request.  Nodes that predate it\nleave it 0, so a reply with confirmed transactions and a count of 0 is\nfrom such a node."
         }
       }
     },
@@ -1757,13 +2364,16 @@
           "$ref": "#/definitions/pbSlpTokenType"
         },
         "v1_genesis": {
-          "$ref": "#/definitions/pbSlpV1GenesisMetadata"
+          "$ref": "#/definitions/pbSlpV1GenesisMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_mint": {
-          "$ref": "#/definitions/pbSlpV1MintMetadata"
+          "$ref": "#/definitions/pbSlpV1MintMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_send": {
-          "$ref": "#/definitions/pbSlpV1SendMetadata"
+          "$ref": "#/definitions/pbSlpV1SendMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_nft1_child_genesis": {
           "$ref": "#/definitions/pbSlpV1Nft1ChildGenesisMetadata"
@@ -1791,6 +2401,7 @@
         "token_metadata": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbSlpTokenMetadata"
           }
         }
@@ -1802,6 +2413,7 @@
         "queries": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/GetSlpTrustedValidationRequestQuery"
           }
         },
@@ -1816,6 +2428,7 @@
         "results": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/GetSlpTrustedValidationResponseValidityResult"
           }
         }
@@ -1900,6 +2513,9 @@
         },
         "token_metadata": {
           "$ref": "#/definitions/pbSlpTokenMetadata"
+        },
+        "cash_token": {
+          "$ref": "#/definitions/pbCashToken"
         }
       }
     },
@@ -1932,7 +2548,7 @@
         "starting_priority": {
           "type": "number",
           "format": "double",
-          "description": "The priority of the transaction when it was added to the pool."
+          "description": "Deprecated, always 0."
         }
       }
     },
@@ -2065,13 +2681,16 @@
           }
         },
         "v1_genesis": {
-          "$ref": "#/definitions/pbSlpV1GenesisMetadata"
+          "$ref": "#/definitions/pbSlpV1GenesisMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_mint": {
-          "$ref": "#/definitions/pbSlpV1MintMetadata"
+          "$ref": "#/definitions/pbSlpV1MintMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_send": {
-          "$ref": "#/definitions/pbSlpV1SendMetadata"
+          "$ref": "#/definitions/pbSlpV1SendMetadata",
+          "title": "NFT1 Group also uses this"
         },
         "v1_nft1_child_genesis": {
           "$ref": "#/definitions/pbSlpV1Nft1ChildGenesisMetadata"
@@ -2197,6 +2816,7 @@
         "required_slp_burns": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/pbSlpRequiredBurn"
           }
         }
@@ -2230,6 +2850,15 @@
       },
       "description": "- BlockInfo (block metadata): `BlockInfo`\n     - SubscribeBlocksRequest {}\n\n - Marshaled Block (with transaction hashes): `Block`\n     - SubscribeBlocksRequest {\n           full_block = true\n       }\n - Marshaled Block (with full transaction data): `Block`\n     - SubscribeBlocksRequest {\n           full_block = true\n           full_transactions = true\n       }\n - Serialized Block acccording to bitcoin protocol encoding: `bytes`\n     - SubscribeBlocksRequest {\n           serialize_block = true\n       }",
       "title": "Options to define data structure to be sent by SubscribeBlock stream:"
+    },
+    "pbSubscribeDoubleSpendProofsRequest": {
+      "type": "object",
+      "properties": {
+        "include_mempool": {
+          "type": "boolean",
+          "description": "When include_mempool is true, the proofs already in the mempool are sent first."
+        }
+      }
     },
     "pbSubscribeTransactionsRequest": {
       "type": "object",
@@ -2273,6 +2902,7 @@
         "inputs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/TransactionInput"
           },
           "description": "List of inputs."
@@ -2280,6 +2910,7 @@
         "outputs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/TransactionOutput"
           },
           "description": "List of outputs."
@@ -2332,6 +2963,7 @@
         "outpoints": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/InputOutpoint"
           },
           "description": "Filter by output hash and index."
@@ -2421,38 +3053,20 @@
         },
         "slp_token": {
           "$ref": "#/definitions/pbSlpToken"
+        },
+        "cash_token": {
+          "$ref": "#/definitions/pbCashToken"
         }
       }
     },
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
-    },
-    "rpcStatus": {
-      "type": "object",
-      "properties": {
-        "code": {
-          "type": "integer",
-          "format": "int32"
-        },
-        "message": {
-          "type": "string"
-        },
-        "details": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/protobufAny"
-          }
-        }
-      }
+      },
+      "additionalProperties": true
     }
   }
 }

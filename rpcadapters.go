@@ -5,7 +5,9 @@
 package main
 
 import (
+	"errors"
 	"sync/atomic"
+	"time"
 
 	"github.com/gcash/bchd/blockchain"
 	"github.com/gcash/bchd/chaincfg/chainhash"
@@ -78,6 +80,21 @@ type rpcConnManager struct {
 // Ensure rpcConnManager implements the rpcserverConnManager interface.
 var _ rpcserverConnManager = &rpcConnManager{}
 
+// errServerShutdown is the error of a connection change asked for once the
+// server is shutting down, as its peer handler then makes no more.
+var errServerShutdown = errors.New("server is shutting down")
+
+// queryConnChange sends msg, a connection change whose result comes on reply,
+// to the peer handler and returns the result, or errServerShutdown once the
+// server is shutting down.  reply must be buffered.
+func queryConnChange(s *server, msg interface{}, reply chan error) error {
+	err, ok := queryPeerHandler(s, msg, reply)
+	if !ok {
+		return errServerShutdown
+	}
+	return err
+}
+
 // Connect adds the provided address as a new outbound peer.  The permanent flag
 // indicates whether or not to make the peer persistent and reconnect if the
 // connection is lost.  Attempting to connect to an already existing peer will
@@ -86,13 +103,12 @@ var _ rpcserverConnManager = &rpcConnManager{}
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) Connect(addr string, permanent bool) error {
-	replyChan := make(chan error)
-	cm.server.query <- connectNodeMsg{
+	replyChan := make(chan error, 1)
+	return queryConnChange(cm.server, connectNodeMsg{
 		addr:      addr,
 		permanent: permanent,
 		reply:     replyChan,
-	}
-	return <-replyChan
+	}, replyChan)
 }
 
 // RemoveByID removes the peer associated with the provided id from the list of
@@ -102,12 +118,11 @@ func (cm *rpcConnManager) Connect(addr string, permanent bool) error {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) RemoveByID(id int32) error {
-	replyChan := make(chan error)
-	cm.server.query <- removeNodeMsg{
+	replyChan := make(chan error, 1)
+	return queryConnChange(cm.server, removeNodeMsg{
 		cmp:   func(sp *serverPeer) bool { return sp.ID() == id },
 		reply: replyChan,
-	}
-	return <-replyChan
+	}, replyChan)
 }
 
 // RemoveByAddr removes the peer associated with the provided address from the
@@ -117,12 +132,11 @@ func (cm *rpcConnManager) RemoveByID(id int32) error {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) RemoveByAddr(addr string) error {
-	replyChan := make(chan error)
-	cm.server.query <- removeNodeMsg{
+	replyChan := make(chan error, 1)
+	return queryConnChange(cm.server, removeNodeMsg{
 		cmp:   func(sp *serverPeer) bool { return sp.Addr() == addr },
 		reply: replyChan,
-	}
-	return <-replyChan
+	}, replyChan)
 }
 
 // DisconnectByID disconnects the peer associated with the provided id.  This
@@ -132,12 +146,11 @@ func (cm *rpcConnManager) RemoveByAddr(addr string) error {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) DisconnectByID(id int32) error {
-	replyChan := make(chan error)
-	cm.server.query <- disconnectNodeMsg{
+	replyChan := make(chan error, 1)
+	return queryConnChange(cm.server, disconnectNodeMsg{
 		cmp:   func(sp *serverPeer) bool { return sp.ID() == id },
 		reply: replyChan,
-	}
-	return <-replyChan
+	}, replyChan)
 }
 
 // DisconnectByAddr disconnects the peer associated with the provided address.
@@ -147,12 +160,50 @@ func (cm *rpcConnManager) DisconnectByID(id int32) error {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) DisconnectByAddr(addr string) error {
-	replyChan := make(chan error)
-	cm.server.query <- disconnectNodeMsg{
+	replyChan := make(chan error, 1)
+	return queryConnChange(cm.server, disconnectNodeMsg{
 		cmp:   func(sp *serverPeer) bool { return sp.Addr() == addr },
 		reply: replyChan,
+	}, replyChan)
+}
+
+// Ban bans target from now until until and disconnects the peers the ban
+// applies to, persistent and whitelisted ones too, as BCHN does, though those
+// can connect again.  It returns false if target is banned already.
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverConnManager interface implementation.
+func (cm *rpcConnManager) Ban(target banTarget, now, until time.Time) bool {
+	if !cm.server.bans.add(target, now, until) {
+		return false
 	}
-	return <-replyChan
+	reply := make(chan struct{}, 1)
+	queryPeerHandler(cm.server, disconnectBannedMsg{reply: reply}, reply)
+	return true
+}
+
+// Unban lifts the ban of exactly target, and returns false if there is none.
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverConnManager interface implementation.
+func (cm *rpcConnManager) Unban(target banTarget) bool {
+	return cm.server.bans.remove(target)
+}
+
+// Bans returns the bans in force at now.
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverConnManager interface implementation.
+func (cm *rpcConnManager) Bans(now time.Time) []banEntry {
+	return cm.server.bans.list(now)
+}
+
+// ClearBans lifts the bans of the chosen kinds.
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverConnManager interface implementation.
+func (cm *rpcConnManager) ClearBans(manual, automatic bool) {
+	cm.server.bans.clear(manual, automatic)
 }
 
 // ConnectedCount returns the number of currently connected peers.
@@ -177,9 +228,9 @@ func (cm *rpcConnManager) NetTotals() (uint64, uint64) {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) ConnectedPeers() []rpcserverPeer {
-	replyChan := make(chan []*serverPeer)
-	cm.server.query <- getPeersMsg{reply: replyChan}
-	serverPeers := <-replyChan
+	replyChan := make(chan []*serverPeer, 1)
+	serverPeers, _ := queryPeerHandler(cm.server,
+		getPeersMsg{reply: replyChan}, replyChan)
 
 	// Convert to RPC server peers.
 	peers := make([]rpcserverPeer, 0, len(serverPeers))
@@ -195,9 +246,9 @@ func (cm *rpcConnManager) ConnectedPeers() []rpcserverPeer {
 // This function is safe for concurrent access and is part of the
 // rpcserverConnManager interface implementation.
 func (cm *rpcConnManager) PersistentPeers() []rpcserverPeer {
-	replyChan := make(chan []*serverPeer)
-	cm.server.query <- getAddedNodesMsg{reply: replyChan}
-	serverPeers := <-replyChan
+	replyChan := make(chan []*serverPeer, 1)
+	serverPeers, _ := queryPeerHandler(cm.server,
+		getAddedNodesMsg{reply: replyChan}, replyChan)
 
 	// Convert to generic peers.
 	peers := make([]rpcserverPeer, 0, len(serverPeers))
@@ -287,6 +338,9 @@ func (b *rpcSyncMgr) LocateHeaders(locators []*chainhash.Hash, hashStop *chainha
 }
 
 // SyncHeight returns the block height of the best peer selected to sync from
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverSyncManager interface implementation.
 func (b *rpcSyncMgr) SyncHeight() uint64 {
 	return b.syncMgr.SyncHeight()
 }

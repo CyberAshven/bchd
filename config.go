@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,12 +25,14 @@ import (
 
 	"github.com/gcash/bchd/mining"
 
-	"github.com/btcsuite/go-socks/socks"
+	"github.com/gcash/bchd/blockchain"
+	"github.com/gcash/bchd/blockchain/indexers"
 	"github.com/gcash/bchd/chaincfg"
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/connmgr"
 	"github.com/gcash/bchd/database"
 	_ "github.com/gcash/bchd/database/ffldb"
+	"github.com/gcash/bchd/internal/socks"
 	"github.com/gcash/bchd/mempool"
 	"github.com/gcash/bchd/peer"
 	"github.com/gcash/bchd/version"
@@ -52,12 +55,15 @@ const (
 	defaultMaxRPCClients           = 10
 	defaultMaxRPCWebsockets        = 25
 	defaultMaxRPCConcurrentReqs    = 20
+	defaultGrpcMaxSubscriptions    = 100
+	defaultGrpcMaxFilterEntries    = 100000
+	defaultGrpcMaxConcurrentCalls  = 16
 	defaultDbType                  = "ffldb"
-	defaultFreeTxRelayLimit        = 0
+	defaultMaxTxFee                = bchutil.Amount(bchutil.SatoshiPerBitcoin / 10)
+	highMaxTxFee                   = bchutil.Amount(bchutil.SatoshiPerBitcoin)
 	defaultTrickleInterval         = peer.DefaultTrickleInterval
-	defaultExcessiveBlockSize      = 32000000
-	defaultBlockMinSize            = 0
-	defaultBlockMaxSize            = 31999000
+	minMessageLimitsBlockSize      = 32000000
+	defaultBlockMaxSize            = 0
 	blockMaxSizeMin                = 1000
 	defaultGenerate                = false
 	defaultMaxOrphanTransactions   = 100
@@ -69,6 +75,7 @@ const (
 	defaultSlpCacheMaxSize         = 100000
 	defaultSlpGraphSearch          = false
 	defaultUtxoCacheMaxSizeMiB     = 450
+	defaultGCPercent               = 50
 	defaultMinSyncPeerNetworkSpeed = 51200
 	defaultPruneDepth              = 4320
 	defaultTargetOutboundPeers     = uint32(8)
@@ -88,6 +95,10 @@ var (
 	defaultLogDir      = filepath.Join(defaultHomeDir, defaultLogDirname)
 )
 
+// deprecatedOptions are options that are still accepted but have no effect.
+var deprecatedOptions = []string{"limitfreerelay", "norelaypriority",
+	"blockminsize", "blockprioritysize"}
+
 // runServiceCommand is only set to a real function on Windows.  It is used
 // to parse and execute service commands specified via the -s flag.
 var runServiceCommand func(string) error
@@ -104,12 +115,12 @@ type config struct {
 	ConnectPeers            []string      `long:"connect" description:"Connect only to the specified peers at startup"`
 	DisableListen           bool          `long:"nolisten" description:"Disable listening for incoming connections -- NOTE: Listening is automatically disabled if the --connect or --proxy options are used without also specifying listen interfaces via --listen"`
 	Listeners               []string      `long:"listen" description:"Add an interface/port to listen for connections (default all interfaces port: 8333, testnet: 18333)"`
-	MaxPeers                int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
-	MaxPeersPerIP           int           `long:"maxpeersperip" description:"Max number of inbound and outbound peers per IP"`
+	MaxPeers                int           `long:"maxpeers" description:"Max number of inbound and outbound peers, keeping --targetoutboundpeers of them for outbound peers -- Persistent peers, from --addpeer, --connect or addnode, are not counted"`
+	MaxPeersPerIP           int           `long:"maxpeersperip" description:"Max number of inbound and outbound peers per IP -- Local addresses, such as a Tor daemon's, are not limited"`
 	MinSyncPeerNetworkSpeed uint64        `long:"minsyncpeernetworkspeed" description:"Disconnect sync peers slower than this threshold in bytes/sec"`
 	DisableBanning          bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
 	BanDuration             time.Duration `long:"banduration" description:"How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second"`
-	BanThreshold            uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
+	BanThreshold            uint32        `long:"banthreshold" description:"Ban score at which misbehaving peers are disconnected and banned."`
 	Whitelists              []string      `long:"whitelist" description:"Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or ::1)"`
 	AgentBlacklist          []string      `long:"agentblacklist" description:"A comma separated list of user-agent substrings which will cause bchd to reject any peers whose user-agent contains any of the blacklisted substrings."`
 	AgentWhitelist          []string      `long:"agentwhitelist" description:"A comma separated list of user-agent substrings which will cause bchd to require all peers' user-agents to contain one of the whitelisted substrings. The blacklist is applied before the whitelist, and an empty whitelist will allow all agents that do not fail the blacklist."`
@@ -121,14 +132,14 @@ type config struct {
 	RPCCert                 string        `long:"rpccert" description:"File containing the certificate file"`
 	RPCKey                  string        `long:"rpckey" description:"File containing the certificate key"`
 	RPCMaxClients           int           `long:"rpcmaxclients" description:"Max number of RPC clients for standard connections"`
-	RPCMaxWebsockets        int           `long:"rpcmaxwebsockets" description:"Max number of RPC websocket connections"`
+	RPCMaxWebsockets        int           `long:"rpcmaxwebsockets" description:"Max number of authenticated RPC websocket clients, and of those yet to authenticate"`
 	RPCMaxConcurrentReqs    int           `long:"rpcmaxconcurrentreqs" description:"Max number of concurrent RPC requests that may be processed concurrently"`
 	RPCQuirks               bool          `long:"rpcquirks" description:"Mirror some JSON-RPC quirks of Bitcoin Core -- NOTE: Discouraged unless interoperability issues need to be worked around"`
 	RPCAuthTimeout          uint          `long:"rpcauthtimeout" description:"The number of seconds a connection to the RPC server is allowed to stay open without authenticating. To disable the timeout use 0."`
 	DisableRPC              bool          `long:"norpc" description:"Disable built-in RPC server -- NOTE: The RPC server is disabled by default if no rpcuser/rpcpass or rpclimituser/rpclimitpass is specified"`
 	DisableTLS              bool          `long:"notls" description:"Disable TLS for the RPC server -- NOTE: This is only allowed if the RPC server is bound to localhost"`
 	DisableDNSSeed          bool          `long:"nodnsseed" description:"Disable DNS seeding for peers"`
-	ExternalIPs             []string      `long:"externalip" description:"Add an ip to the list of local addresses we claim to listen on to peers"`
+	ExternalIPs             []string      `long:"externalip" description:"Add an ip or Tor v3 onion address to the list of local addresses we claim to listen on to peers"`
 	Proxy                   string        `long:"proxy" description:"Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)"`
 	ProxyUser               string        `long:"proxyuser" description:"Username for proxy server"`
 	ProxyPass               string        `long:"proxypass" default-mask:"-" description:"Password for proxy server"`
@@ -146,30 +157,35 @@ type config struct {
 	SimNet                  bool          `long:"simnet" description:"Use the simulation test network"`
 	AddCheckpoints          []string      `long:"addcheckpoint" description:"Add a custom checkpoint.  Format: '<height>:<hash>'"`
 	DisableCheckpoints      bool          `long:"nocheckpoints" description:"Disable built-in checkpoints.  Don't do this unless you know what you're doing."`
+	MaxReorgDepth           int32         `long:"maxreorgdepth" description:"Depth at which main chain blocks are finalized, so that blocks forking the chain below them are rejected (-1 to disable)"`
+	FinalizationDelay       int64         `long:"finalizationdelay" description:"Time in seconds a block must have been known, and the node running, before the block can be finalized"`
 	DbType                  string        `long:"dbtype" description:"Database backend to use for the Block Chain"`
-	Profile                 string        `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
+	Profile                 string        `long:"profile" description:"Enable HTTP profiling on the given port on localhost, or on IP:port -- NOTE port must be between 1024 and 65535"`
 	CPUProfile              string        `long:"cpuprofile" description:"Write CPU profile to the specified file"`
 	DebugLevel              string        `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 	Upnp                    bool          `long:"upnp" description:"Use UPnP to map our listening port outside of NAT"`
-	ExcessiveBlockSize      uint32        `long:"excessiveblocksize" description:"The maximum size block (in bytes) this node will accept. Cannot be less than 32000000."`
-	MinRelayTxFee           float64       `long:"minrelaytxfee" description:"The minimum transaction fee in BCH/kB to be considered a non-zero fee."`
-	FreeTxRelayLimit        float64       `long:"limitfreerelay" description:"Limit relay of transactions with no transaction fee to the given amount in thousands of bytes per minute"`
-	NoRelayPriority         bool          `long:"norelaypriority" description:"Do not require free or low-fee transactions to have high priority for relaying"`
+	ExcessiveBlockSize      uint32        `long:"excessiveblocksize" description:"The block size (in bytes) that P2P and RPC message limits are sized for, and on regtest and simnet the floor of the block size limit -- 0 uses the network's default, which is also the minimum: 2000000 on testnet4 and chipnet, otherwise 32000000"`
+	MinRelayTxFee           float64       `long:"minrelaytxfee" description:"The minimum fee rate in BCH/kB a transaction must pay to be relayed, accepted into the mempool and mined -- Must be above 0 and at most 21000000"`
+	MaxTxFee                float64       `long:"maxtxfee" description:"The maximum total fee in BCH of a transaction sent with sendrawtransaction or checked with testmempoolaccept, unless allowhighfees is set"`
+	FreeTxRelayLimit        float64       `long:"limitfreerelay" description:"Deprecated, has no effect: free transactions are no longer relayed"`
+	NoRelayPriority         bool          `long:"norelaypriority" description:"Deprecated, has no effect: transaction priority is no longer used"`
 	TrickleInterval         time.Duration `long:"trickleinterval" description:"Minimum time between attempts to send new inventory to a connected peer"`
 	MaxOrphanTxs            int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
 	Generate                bool          `long:"generate" description:"Generate (mine) bitcoins using the CPU"`
 	MiningAddrs             []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
-	BlockMinSize            uint32        `long:"blockminsize" description:"Minimum block size in bytes to be used when creating a block"`
-	BlockMaxSize            uint32        `long:"blockmaxsize" description:"Maximum block size in bytes to be used when creating a block"`
-	BlockPrioritySize       uint32        `long:"blockprioritysize" description:"Size in bytes for high-priority/low-fee transactions when creating a block"`
+	BlockMinSize            uint32        `long:"blockminsize" description:"Deprecated, has no effect: blocks no longer include transactions below the minimum relay fee"`
+	BlockMaxSize            uint32        `long:"blockmaxsize" description:"Maximum block size in bytes to be used when creating a block -- 0 follows the consensus limit less 1000 bytes"`
+	BlockPrioritySize       uint32        `long:"blockprioritysize" description:"Deprecated, has no effect: blocks no longer have a high-priority area"`
 	CoinbaseFlags           string        `long:"cbflags" description:"Comment to append to the coinbase input when generating a block template." default:"/bchd/"`
 	UserAgentComments       []string      `long:"uacomment" description:"Comment to add to the user agent -- See BIP 14 for more information."`
 	NoPeerBloomFilters      bool          `long:"nopeerbloomfilters" description:"Disable bloom filtering support"`
 	NoCFilters              bool          `long:"nocfilters" description:"Disable committed filtering (CF) support"`
 	DropCfIndex             bool          `long:"dropcfindex" description:"Deletes the index used for committed filtering (CF) support from the database on start up and then exits."`
-	SigCacheMaxSize         uint          `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache"`
+	SigCacheMaxSize         uint          `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache, and in the cache of transaction signature hashes"`
 	UtxoCacheMaxSizeMiB     uint          `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
+	GCPercent               int           `long:"gcpercent" description:"Garbage collection target percentage -- Higher values use more memory and less CPU; a negative value disables the collector (use with GOMEMLIMIT). Ignored if GOGC is set"`
 	BlocksOnly              bool          `long:"blocksonly" description:"Do not accept transactions from remote peers."`
+	NoDoubleSpendProof      bool          `long:"nodoublespendproof" description:"Do not create, relay or answer queries for double spend proofs"`
 	TxIndex                 bool          `long:"txindex" description:"Maintain a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC"`
 	DropTxIndex             bool          `long:"droptxindex" description:"Deletes the hash-based transaction index from the database on start up and then exits."`
 	AddrIndex               bool          `long:"addrindex" description:"Maintain a full address-based transaction index which makes the searchrawtransactions RPC available"`
@@ -178,15 +194,22 @@ type config struct {
 	SlpCacheMaxSize         uint          `long:"slpcachemaxsize" description:"The maximum number of entries in the slp indexer cache"`
 	DropSlpIndex            bool          `long:"dropslpindex" description:"Deletes the slp index from the database on start up and then exits."`
 	SlpGraphSearch          bool          `long:"slpgraphsearch" description:"Enables gRPC calls related to slp graph search."`
+	BcmrIndex               bool          `long:"bcmrindex" description:"Maintain an index of the authchain of every token category, and of every authchain that holds a BCMR metadata registry publication, from where it begins, which makes the getbcmridentity and GetBcmrIdentity RPCs available"`
+	DropBcmrIndex           bool          `long:"dropbcmrindex" description:"Deletes the BCMR index from the database on start up and then exits."`
+	NoScriptFilters         bool          `long:"noscriptfilters" description:"Disable the script filter index and serving script filters (filter type 1), which list the scripts of the outputs each block creates and spends, to light clients"`
+	DropScriptFilterIndex   bool          `long:"dropscriptfilterindex" description:"Deletes the script filter index from the database on start up and then exits."`
 	RelayNonStd             bool          `long:"relaynonstd" description:"Relay non-standard transactions regardless of the default settings for the active network."`
 	RejectNonStd            bool          `long:"rejectnonstd" description:"Reject non-standard transactions regardless of the default settings for the active network."`
 	Prune                   bool          `long:"prune" description:"Delete historical blocks from the chain. A buffer of blocks will be retained in case of a reorg."`
 	PruneDepth              uint32        `long:"prunedepth" description:"The number of blocks to retain when running in pruned mode. Cannot be less than 288."`
 	TargetOutboundPeers     uint32        `long:"targetoutboundpeers" description:"Number of outbound connections to maintain"`
 	ReIndexChainState       bool          `long:"reindexchainstate" description:"Rebuild the UTXO database from currently indexed blocks on disk."`
-	FastSync                bool          `long:"fastsync" description:"Sync full blocks from the last checkpoint to the tip rather than from genesis."`
+	FastSync                bool          `long:"fastsync" description:"Download the UTXO set of the last checkpoint that has one and sync full blocks from there to the tip rather than from genesis."`
 	GrpcListeners           []string      `long:"grpclisten" description:"Add an interface/port to listen for experimental gRPC connections (default port: 8335, testnet: 18335)"`
 	GrpcAuthToken           string        `long:"grpcauthtoken" description:"An authentication token for the gRPC API to authenticate clients"`
+	GrpcMaxSubscriptions    int           `long:"grpcmaxsubscriptions" description:"Max number of gRPC subscriptions clients may hold at once"`
+	GrpcMaxFilterEntries    int           `long:"grpcmaxfilterentries" description:"Max number of entries a gRPC subscription's transaction filter may hold; an address, outpoint or token ID counts once, a data element once per 20 bytes"`
+	GrpcMaxConcurrentCalls  int           `long:"grpcmaxconcurrentcalls" description:"Max number of gRPC calls other than subscriptions in progress at once; up to 4 times as many more wait, and later ones are refused"`
 	DBCacheSize             uint64        `long:"dbcachesize" description:"The maximum size in MiB of the database cache"`
 	DBFlushInterval         uint32        `long:"dbflushinterval" description:"The number of seconds between database flushes"`
 	PrometheusListen        string        `long:"prometheus" description:"Specify an (addr):port to serve prometheus metrics (for example :9000 or my-interface:9000, default disabled)"`
@@ -196,6 +219,7 @@ type config struct {
 	addCheckpoints          []chaincfg.Checkpoint
 	miningAddrs             []bchutil.Address
 	minRelayTxFee           bchutil.Amount
+	maxTxFee                bchutil.Amount
 	whitelists              []*net.IPNet
 }
 
@@ -434,22 +458,23 @@ func loadConfig() (*config, []string, error) {
 		RPCMaxClients:           defaultMaxRPCClients,
 		RPCMaxWebsockets:        defaultMaxRPCWebsockets,
 		RPCMaxConcurrentReqs:    defaultMaxRPCConcurrentReqs,
+		GrpcMaxSubscriptions:    defaultGrpcMaxSubscriptions,
+		GrpcMaxFilterEntries:    defaultGrpcMaxFilterEntries,
+		GrpcMaxConcurrentCalls:  defaultGrpcMaxConcurrentCalls,
 		DataDir:                 defaultDataDir,
 		LogDir:                  defaultLogDir,
 		DbType:                  defaultDbType,
 		RPCKey:                  defaultRPCKeyFile,
 		RPCCert:                 defaultRPCCertFile,
-		ExcessiveBlockSize:      defaultExcessiveBlockSize,
 		MinRelayTxFee:           mempool.DefaultMinRelayTxFee.ToBCH(),
-		FreeTxRelayLimit:        defaultFreeTxRelayLimit,
+		MaxTxFee:                defaultMaxTxFee.ToBCH(),
 		TrickleInterval:         defaultTrickleInterval,
-		BlockMinSize:            defaultBlockMinSize,
 		BlockMaxSize:            defaultBlockMaxSize,
 		CoinbaseFlags:           mining.CoinbaseFlags,
-		BlockPrioritySize:       mempool.DefaultBlockPrioritySize,
 		MaxOrphanTxs:            defaultMaxOrphanTransactions,
 		SigCacheMaxSize:         defaultSigCacheMaxSize,
 		UtxoCacheMaxSizeMiB:     defaultUtxoCacheMaxSizeMiB,
+		GCPercent:               defaultGCPercent,
 		Generate:                defaultGenerate,
 		TxIndex:                 defaultTxIndex,
 		RPCAuthTimeout:          defaultRPCAuthTimeout,
@@ -458,6 +483,8 @@ func loadConfig() (*config, []string, error) {
 		SlpCacheMaxSize:         defaultSlpCacheMaxSize,
 		SlpGraphSearch:          defaultSlpGraphSearch,
 		PruneDepth:              defaultPruneDepth,
+		MaxReorgDepth:           blockchain.DefaultMaxReorgDepth,
+		FinalizationDelay:       int64(blockchain.DefaultFinalizationDelay / time.Second),
 		TargetOutboundPeers:     defaultTargetOutboundPeers,
 		DBCacheSize:             defaultDBCacheSize,
 		DBFlushInterval:         defaultDBFlushSecs,
@@ -633,6 +660,36 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
+	// The BCMR index reads every block since CashTokens activated, and serves
+	// the transactions of authchains from the block files.
+	if cfg.BcmrIndex && cfg.Prune {
+		str := "%s: bcmrindex can not be used with a pruned blockchain"
+		err := fmt.Errorf(str, funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// A fast-synced node has no blocks before the UTXO set it downloaded,
+	// and the authbase of a token can be older than that.
+	if cfg.BcmrIndex && cfg.FastSync {
+		str := "%s: bcmrindex can not be used with fast sync mode"
+		err := fmt.Errorf(str, funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// The BCMR index can undo only its latest blocks, so the chain mustn't
+	// finalize blocks deeper than that.
+	if cfg.BcmrIndex && cfg.MaxReorgDepth > indexers.BcmrUndoDepth {
+		str := "%s: bcmrindex can not be used with a maxreorgdepth above %d"
+		err := fmt.Errorf(str, funcName, indexers.BcmrUndoDepth)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
 	// Checkpoints must not be disabled in fast sync mode
 	if cfg.FastSync && cfg.DisableCheckpoints {
 		str := "%s: disablecheckpoints can not be used with fast sync mode"
@@ -713,22 +770,64 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// Validate profile port number
+	// Validate the profile address.  A bare port only listens on localhost
+	// since the profiler is unauthenticated.
 	if cfg.Profile != "" {
-		profilePort, err := strconv.Atoi(cfg.Profile)
-		if err != nil || profilePort < 1024 || profilePort > 65535 {
-			str := "%s: The profile port must be between 1024 and 65535"
+		host, port := "127.0.0.1", cfg.Profile
+		var splitErr error
+		if strings.Contains(cfg.Profile, ":") {
+			host, port, splitErr = net.SplitHostPort(cfg.Profile)
+		}
+		profilePort, portErr := strconv.Atoi(port)
+		if splitErr != nil || portErr != nil || profilePort < 1024 ||
+			profilePort > 65535 ||
+			(host != "" && net.ParseIP(host) == nil) {
+
+			str := "%s: The profile option must be a port or " +
+				"IP:port with a port between 1024 and 65535"
 			err := fmt.Errorf(str, funcName)
 			fmt.Fprintln(os.Stderr, err)
 			fmt.Fprintln(os.Stderr, usageMessage)
 			return nil, nil, err
 		}
+		cfg.Profile = net.JoinHostPort(host, port)
 	}
 
 	// Don't allow ban durations that are too short.
 	if cfg.BanDuration < time.Second {
 		str := "%s: The banduration option may not be less than 1s -- parsed [%v]"
 		err := fmt.Errorf(str, funcName, cfg.BanDuration)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// The server makes its peer queues with room for maxpeers peers, which
+	// panics for a negative count.
+	if cfg.MaxPeers < 0 {
+		str := "%s: The maxpeers option may not be less than 0 " +
+			"-- parsed [%d]"
+		err := fmt.Errorf(str, funcName, cfg.MaxPeers)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	if cfg.GrpcMaxFilterEntries < 0 {
+		str := "%s: The grpcmaxfilterentries option may not be less " +
+			"than 0 -- parsed [%d]"
+		err := fmt.Errorf(str, funcName, cfg.GrpcMaxFilterEntries)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// Zero would finalize the tip itself and is the chain configuration's
+	// default, so it is refused.  Any negative depth disables finalization.
+	if cfg.MaxReorgDepth == 0 {
+		str := "%s: The maxreorgdepth option must be negative to " +
+			"disable finalization or at least 1 -- parsed [%d]"
+		err := fmt.Errorf(str, funcName, cfg.MaxReorgDepth)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
@@ -856,11 +955,60 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// Validate the minrelaytxfee.
+	if cfg.GrpcMaxConcurrentCalls < 0 {
+		str := "%s: The grpcmaxconcurrentcalls option may not be less " +
+			"than 0 -- parsed [%d]"
+		err := fmt.Errorf(str, funcName, cfg.GrpcMaxConcurrentCalls)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// Validate the minrelaytxfee, which must be above 0 and at most every
+	// coin there is.
 	cfg.minRelayTxFee, err = bchutil.NewAmount(cfg.MinRelayTxFee)
+	if err == nil && cfg.minRelayTxFee <= 0 {
+		err = errors.New("must be above 0")
+	}
+	if err == nil && cfg.minRelayTxFee > bchutil.MaxSatoshi {
+		err = errors.New("must be at most 21000000")
+	}
 	if err != nil {
 		str := "%s: invalid minrelaytxfee: %v"
 		err := fmt.Errorf(str, funcName, err)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// Validate the maxtxfee.  When it is set, it may not be below the
+	// minimum relay fee of a 1000 byte transaction.  As in Bitcoin Cash
+	// Node, the default is not checked against it.
+	cfg.maxTxFee, err = bchutil.NewAmount(cfg.MaxTxFee)
+	maxTxFeeOpt := parser.FindOptionByLongName("maxtxfee")
+	if err == nil && maxTxFeeOpt != nil && maxTxFeeOpt.IsSet() &&
+		cfg.maxTxFee < cfg.minRelayTxFee {
+
+		err = fmt.Errorf("must be at least the minrelaytxfee of %v",
+			cfg.minRelayTxFee)
+	}
+	if err != nil {
+		str := "%s: invalid maxtxfee: %v"
+		err := fmt.Errorf(str, funcName, err)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+	if cfg.maxTxFee > highMaxTxFee {
+		bchdLog.Warnf("%s: maxtxfee is set very high, a single "+
+			"transaction could pay fees this large", funcName)
+	}
+
+	// The runtime stores the GC percent as an int32.
+	if cfg.GCPercent > math.MaxInt32 {
+		str := "%s: The gcpercent option may not be more than %d " +
+			"-- parsed [%d]"
+		err := fmt.Errorf(str, funcName, math.MaxInt32, cfg.GCPercent)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
@@ -876,26 +1024,22 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// Excessive blocksize cannot be set less than the default but it can be higher.
-	cfg.ExcessiveBlockSize = max(cfg.ExcessiveBlockSize, defaultExcessiveBlockSize)
+	// The excessive block size cannot be set less than the network's default
+	// block size, which is also used when it isn't set, but it can be higher.
+	cfg.ExcessiveBlockSize = max(cfg.ExcessiveBlockSize,
+		activeNetParams.DefaultConsensusBlockSize)
 
-	// Limit the max block size to a sane value.
-	blockMaxSizeMax := cfg.ExcessiveBlockSize - 1000
-	if cfg.BlockMaxSize < blockMaxSizeMin || cfg.BlockMaxSize >
-		blockMaxSizeMax {
-
-		str := "%s: The blockmaxsize option must be in between %d " +
-			"and %d -- parsed [%d]"
+	// Limit the max block size to a sane value.  Templates never exceed
+	// the consensus limit less 1000 bytes, so there is no upper bound.
+	if cfg.BlockMaxSize != 0 && cfg.BlockMaxSize < blockMaxSizeMin {
+		str := "%s: The blockmaxsize option must be 0 or at least %d " +
+			"-- parsed [%d]"
 		err := fmt.Errorf(str, funcName, blockMaxSizeMin,
-			blockMaxSizeMax, cfg.BlockMaxSize)
+			cfg.BlockMaxSize)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
 	}
-	// Limit the block priority and minimum block sizes to max block size.
-	cfg.BlockPrioritySize = min(cfg.BlockPrioritySize, cfg.BlockMaxSize)
-	cfg.BlockMinSize = min(cfg.BlockMinSize, cfg.BlockMaxSize)
-
 	// Prepend ExcessiveBlockSize signaling to the UserAgentComments
 	cfg.UserAgentComments = append([]string{fmt.Sprintf("EB%.1f", float64(cfg.ExcessiveBlockSize)/1000000)}, cfg.UserAgentComments...)
 
@@ -946,6 +1090,16 @@ func loadConfig() (*config, []string, error) {
 	// --slpindex and --dropslpindex do not mix.
 	if cfg.SlpIndex && cfg.DropSlpIndex {
 		err := fmt.Errorf("%s: the --slpindex and --dropslpindex "+
+			"options may not be activated at the same time",
+			funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	// --bcmrindex and --dropbcmrindex do not mix.
+	if cfg.BcmrIndex && cfg.DropBcmrIndex {
+		err := fmt.Errorf("%s: the --bcmrindex and --dropbcmrindex "+
 			"options may not be activated at the same time",
 			funcName)
 		fmt.Fprintln(os.Stderr, err)
@@ -1181,6 +1335,16 @@ func loadConfig() (*config, []string, error) {
 	if cfg.NoOnion {
 		cfg.oniondial = func(a, b string, t time.Duration) (net.Conn, error) {
 			return nil, errors.New("tor has been disabled")
+		}
+	}
+
+	// The options of the removed free and priority relay are still
+	// accepted so existing configurations keep working.
+	for _, name := range deprecatedOptions {
+		opt := parser.FindOptionByLongName(name)
+		if opt != nil && opt.IsSet() {
+			bchdLog.Warnf("The --%s option is deprecated and has "+
+				"no effect", name)
 		}
 	}
 

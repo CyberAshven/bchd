@@ -99,6 +99,8 @@ func invSummary(invList []*wire.InvVect) string {
 			return fmt.Sprintf("filteredblock %s", iv.Hash)
 		case wire.InvTypeTx:
 			return fmt.Sprintf("tx %s", iv.Hash)
+		case wire.InvTypeDSProof:
+			return fmt.Sprintf("dsproof %s", iv.Hash)
 		}
 
 		return fmt.Sprintf("unknown (%d) %s", uint32(iv.Type), iv.Hash)
@@ -157,6 +159,9 @@ func messageSummary(msg wire.Message) string {
 		// No summary.
 
 	case *wire.MsgAddr:
+		return fmt.Sprintf("%d addr", len(msg.AddrList))
+
+	case *wire.MsgAddrV2:
 		return fmt.Sprintf("%d addr", len(msg.AddrList))
 
 	case *wire.MsgPing:
@@ -220,6 +225,9 @@ func messageSummary(msg wire.Message) string {
 
 	case *wire.MsgBlockTxns:
 		return fmt.Sprintf("txs %d", len(msg.Txs))
+
+	case *wire.MsgDSProof:
+		return fmt.Sprintf("hash %v, outpoint %v", msg.ProofHash(), msg.PrevOut)
 
 	case *wire.MsgReject:
 		// Ensure the variable length strings don't contain any

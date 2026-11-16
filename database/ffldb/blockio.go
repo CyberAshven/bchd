@@ -192,6 +192,13 @@ type blockLocation struct {
 	blockLen     uint32
 }
 
+// blockSize returns the size of the block itself.  The stored length also
+// counts the network, the block length and the checksum around it in the
+// block file, 12 bytes in all, which a region of the block must not reach.
+func (loc *blockLocation) blockSize() uint32 {
+	return loc.blockLen - min(loc.blockLen, 12)
+}
+
 // deserializeBlockLoc deserializes the passed serialized block location
 // information.  This is data stored into the block index metadata for each
 // block.  The serialized data passed to this function MUST be at least
@@ -398,6 +405,32 @@ func (s *blockStore) writeData(data []byte, fieldName string) error {
 	return nil
 }
 
+// openCurFileIfNeeded opens the write cursor's current file when it is not
+// already open.  This will typically only be the case when moving to the next
+// file to write to or on initial database load.  However, it might also be the
+// case if rollbacks happened after file writes started during a transaction
+// commit.
+//
+// It must be called before any writeData call, since writeData dereferences the
+// current file unconditionally.
+//
+// NOTE: This function MUST be called with the write cursor current file lock
+// held.
+func (s *blockStore) openCurFileIfNeeded() error {
+	wc := s.writeCursor
+	if wc.curFile.file != nil {
+		return nil
+	}
+
+	file, err := s.openWriteFileFunc(wc.curFileNum)
+	if err != nil {
+		return err
+	}
+	wc.curFile.file = file
+
+	return nil
+}
+
 // writeBlock appends the specified raw block bytes to the store's write cursor
 // location and increments it accordingly.  When the block would exceed the max
 // file size for the current flat file, this function will close the current
@@ -430,11 +463,32 @@ func (s *blockStore) writeBlock(rawBlock []byte, height uint32) (blockLocation, 
 		// Before we load the new file write the height of the final block
 		// to the end of the file.
 		wc.curFile.Lock()
+
+		// The current file may not be open yet, such as on initial database
+		// load or after a rollback, and writeData requires it.  Opening it
+		// here rather than relying on the open below is what keeps this
+		// write from dereferencing a nil file.
+		if err := s.openCurFileIfNeeded(); err != nil {
+			wc.curFile.Unlock()
+			return blockLocation{}, err
+		}
+
 		heightBytes := make([]byte, 4)
 		byteOrder.PutUint32(heightBytes, height-1)
 		if err := s.writeData(heightBytes, "last block height"); err != nil {
 			wc.curFile.Unlock()
-			return blockLocation{}, nil
+			return blockLocation{}, err
+		}
+
+		// Sync the file before it is closed, since a flush of the cached
+		// metadata, which locates its blocks, only syncs the current
+		// write file.
+		if err := wc.curFile.file.Sync(); err != nil {
+			wc.curFile.Unlock()
+			str := fmt.Sprintf("failed to sync file %d: %v",
+				wc.curFileNum, err)
+			return blockLocation{}, makeDbErr(database.ErrDriverSpecific,
+				str, err)
 		}
 		// Put the block height into the map
 		s.fbhMutex.Lock()
@@ -468,16 +522,10 @@ func (s *blockStore) writeBlock(rawBlock []byte, height uint32) (blockLocation, 
 	wc.curFile.Lock()
 	defer wc.curFile.Unlock()
 
-	// Open the current file if needed.  This will typically only be the
-	// case when moving to the next file to write to or on initial database
-	// load.  However, it might also be the case if rollbacks happened after
-	// file writes started during a transaction commit.
-	if wc.curFile.file == nil {
-		file, err := s.openWriteFileFunc(wc.curFileNum)
-		if err != nil {
-			return blockLocation{}, err
-		}
-		wc.curFile.file = file
+	// Open the current file if needed.  When the block file was just rolled
+	// over above this opens the new one.
+	if err := s.openCurFileIfNeeded(); err != nil {
+		return blockLocation{}, err
 	}
 
 	// Bitcoin network.
@@ -577,6 +625,33 @@ func (s *blockStore) readBlock(hash *chainhash.Hash, loc blockLocation) ([]byte,
 	return serializedData[8 : n-4], nil
 }
 
+// deleteBlockFile removes the block file for the passed flat file number,
+// first closing its read-only handle and dropping it from the open files cache
+// if it is open.  The open files lock is held until the file is removed, so a
+// read can't open the file again in between, which on Windows, where a file
+// open for reading can't be removed, would fail the removal.
+func (s *blockStore) deleteBlockFile(fileNum uint32) error {
+	s.obfMutex.Lock()
+	defer s.obfMutex.Unlock()
+	obf, ok := s.openBlockFiles[fileNum]
+	if !ok {
+		return s.deleteFileFunc(fileNum)
+	}
+	s.lruMutex.Lock()
+	if elem, ok := s.fileNumToLRUElem[fileNum]; ok {
+		s.openBlocksLRU.Remove(elem)
+		delete(s.fileNumToLRUElem, fileNum)
+	}
+	s.lruMutex.Unlock()
+
+	// Wait for any readers to finish before closing the file.
+	obf.Lock()
+	_ = obf.file.Close()
+	obf.Unlock()
+	delete(s.openBlockFiles, fileNum)
+	return s.deleteFileFunc(fileNum)
+}
+
 // deleteBlocks will delete all blocks in the blockstore where the height of the
 // last block in the file is less than the provided height.
 func (s *blockStore) deleteBlocks(deleteBefore uint32) error {
@@ -594,18 +669,13 @@ func (s *blockStore) deleteBlocks(deleteBefore uint32) error {
 	}
 
 	s.fbhMutex.Lock()
+	defer s.fbhMutex.Unlock()
 	for _, n := range toDelete {
-		blockFile, err := s.blockFile(n)
-		if err != nil {
-			return err
-		}
-		blockFile.file.Close()
-		if err := s.deleteFile(n); err != nil {
+		if err := s.deleteBlockFile(n); err != nil {
 			return err
 		}
 		delete(s.fileBlockHeights, n)
 	}
-	s.fbhMutex.Unlock()
 	return nil
 }
 
@@ -736,6 +806,12 @@ func (s *blockStore) handleRollback(oldBlockFileNum, oldBlockOffset uint32) {
 				"number %d: %v", wc.curFileNum, err)
 			return
 		}
+
+		// Forget the last block height of the deleted file, or a
+		// prune would fail to delete it again.
+		s.fbhMutex.Lock()
+		delete(s.fileBlockHeights, wc.curFileNum)
+		s.fbhMutex.Unlock()
 	}
 
 	// Open the file for the current write cursor if needed.
@@ -821,38 +897,43 @@ func scanBlockFiles(dbPath string) (int, uint32, error) {
 	return lastFile, fileLen, nil
 }
 
-// loadLastBlockHeights searches the database directory for all flat block files. For
-// each file that is not our current file it seeks to four bytes from the end of the
-// file and reads the height of the last block into the fileBlockHeights map.
+// loadLastBlockHeights reads the height of the last block of each full flat
+// block file, which writeBlock writes to the end of a file when writes move to
+// the next one, into the fileBlockHeights map that deleteBlocks prunes files
+// by.  Each file before the current write file that still exists is read, so
+// the first files, which earlier prunes deleted, are skipped.  A file too short
+// to hold the height, or whose end can't be read, is left out of the map, so it
+// is never pruned.
 func (s *blockStore) loadLastBlockHeights(dbPath string) error {
 	s.writeCursor.RLock()
 	defer s.writeCursor.RUnlock()
 	s.fbhMutex.Lock()
 	defer s.fbhMutex.Unlock()
-	for i := 0; ; i++ {
-		if uint32(i) == s.writeCursor.curFileNum {
+	var heightBytes [4]byte
+	for i := uint32(0); i < s.writeCursor.curFileNum; i++ {
+		file, err := os.Open(blockFilePath(dbPath, i))
+		if os.IsNotExist(err) {
 			continue
 		}
-		filePath := blockFilePath(dbPath, uint32(i))
-		_, err := os.Stat(filePath)
-		if err != nil {
-			break
-		}
-		file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-		if _, err := file.Seek(4, 2); err != nil {
-			return err
+		info, err := file.Stat()
+		if err == nil {
+			if info.Size() < int64(len(heightBytes)) {
+				err = io.ErrUnexpectedEOF
+			} else {
+				_, err = file.ReadAt(heightBytes[:],
+					info.Size()-int64(len(heightBytes)))
+			}
 		}
-		heightBytes := make([]byte, 4)
-		_, err = file.Read(heightBytes)
+		_ = file.Close()
 		if err != nil {
+			log.Warnf("Block file %d is not pruned, its last block "+
+				"height could not be read: %v", i, err)
 			continue
 		}
-		height := byteOrder.Uint32(heightBytes)
-		s.fileBlockHeights[uint32(i)] = height
+		s.fileBlockHeights[i] = byteOrder.Uint32(heightBytes[:])
 	}
 	return nil
 }

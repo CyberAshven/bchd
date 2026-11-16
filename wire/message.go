@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
@@ -22,19 +24,56 @@ const MessageHeaderSize = 24
 // header.  Shorter commands must be zero padded.
 const CommandSize = 12
 
-// ebs is the excessive block size, used to determine reasonable maximum message sizes.
-// 32MB is the current default value
-var ebs uint32 = 32000000 * 4
+// maxBlockPayloadLimit is the most the block message limit can be, 2 GB, the
+// largest block ABLA allows, as BCHN's MAX_CONSENSUS_BLOCK_SIZE.  It keeps the
+// limits computed from the block message limit within 32 bits.
+const maxBlockPayloadLimit = 2000000000
 
-// SetLimits adjusts various message limits based on max block size configuration.
+// maxProtocolMessageLength is the most a message other than block, cmpctblock
+// and blocktxn may be, BCHN's MAX_PROTOCOL_MESSAGE_LENGTH.  bchd's own compact
+// filter messages, which BCHN does not have, and merkleblock, which BCHN never
+// reads, have limits of their own.
+const maxProtocolMessageLength = 2 * 1024 * 1024
+
+// The block message limit, from which the other limits are computed, is the
+// larger of the two.  They are read by every peer's goroutines and set while
+// they run, so they are atomic.
+var (
+	// blockPayloadFloor is the block message limit SetLimits sets.
+	blockPayloadFloor atomic.Uint32
+
+	// blockPayloadLookAhead is the block message limit
+	// SetMaxBlockSizeLookAhead sets, which follows the block size limit as
+	// ABLA raises it.
+	blockPayloadLookAhead atomic.Uint32
+)
+
+// The limits start at those for the default excessive block size, 32 MB.
+func init() {
+	SetLimits(32000000)
+}
+
+// SetLimits adjusts various message limits based on max block size
+// configuration.  A block message may be four times the passed size, up to
+// maxBlockPayloadLimit.
 func SetLimits(excessiveBlockSize uint32) {
-	ebs = excessiveBlockSize * 4 // TODO TODO set max?
+	blockPayloadFloor.Store(uint32(min(uint64(excessiveBlockSize)*4,
+		maxBlockPayloadLimit)))
+}
+
+// SetMaxBlockSizeLookAhead sets the largest size a block can have within the
+// next 2048 blocks, which the chain computes from ABLA whenever its tip
+// changes.  As in Bitcoin Cash Node, a block message may then be twice that
+// size, so the limit follows the block size limit as it grows; it never drops
+// below the limit SetLimits sets, nor passes maxBlockPayloadLimit.
+func SetMaxBlockSizeLookAhead(size uint64) {
+	blockPayloadLookAhead.Store(uint32(min(size, maxBlockPayloadLimit/2) * 2))
 }
 
 // MaxMessagePayload returns is the maximum bytes a message can be regardless of other
 // individual limits imposed by messages themselves.
 func maxMessagePayload() uint32 {
-	return ((ebs / 1000000) * 1024 * 1024) * 2
+	return ((MaxBlockPayload() / 1000000) * 1024 * 1024) * 2
 }
 
 // Commands used in bitcoin message headers which describe the type of message.
@@ -75,6 +114,8 @@ const (
 	CmdGetBlockTxns = "getblocktxn"
 	CmdBlockTxns    = "blocktxn"
 	CmdSendAddrV2   = "sendaddrv2"
+	CmdAddrV2       = "addrv2"
+	CmdDSProof      = "dsproof-beta"
 )
 
 // MessageEncoding represents the wire message encoding format to be used.
@@ -126,6 +167,9 @@ func makeEmptyMessage(command string) (Message, error) {
 
 	case CmdAddr:
 		msg = &MsgAddr{}
+
+	case CmdAddrV2:
+		msg = &MsgAddrV2{}
 
 	case CmdGetBlocks:
 		msg = &MsgGetBlocks{}
@@ -214,6 +258,9 @@ func makeEmptyMessage(command string) (Message, error) {
 	case CmdBlockTxns:
 		msg = &MsgBlockTxns{}
 
+	case CmdDSProof:
+		msg = &MsgDSProof{}
+
 	default:
 		return nil, fmt.Errorf("unhandled command [%s]", command)
 	}
@@ -264,7 +311,7 @@ func discardInput(r io.Reader, n uint32) {
 	bytesRemaining := n % maxSize
 	if n > 0 {
 		buf := make([]byte, maxSize)
-		for i := uint32(0); i < numReads; i++ {
+		for range numReads {
 			_, _ = io.ReadFull(r, buf)
 		}
 	}
@@ -321,7 +368,7 @@ func WriteMessageWithEncodingN(w io.Writer, msg Message, pver uint32,
 	lenp := len(payload)
 
 	// Enforce maximum overall message payload.
-	if lenp > int(maxMessagePayload()) {
+	if uint64(lenp) > uint64(maxMessagePayload()) {
 		str := fmt.Sprintf("message payload is too large - encoded "+
 			"%d bytes, but maximum message payload is %d bytes",
 			lenp, maxMessagePayload())
@@ -366,6 +413,49 @@ func WriteMessageWithEncodingN(w io.Writer, msg Message, pver uint32,
 	return totalBytes, err
 }
 
+// initialPayloadAlloc is the largest buffer allocated for a message payload
+// before any of its bytes have been read.  The buffer grows from there as the
+// payload arrives.
+const initialPayloadAlloc = 32 * 1024
+
+// readPayload reads exactly length bytes from r and returns them along with
+// the number of bytes read.  The length comes from the message header, which
+// the remote peer controls, so rather than allocating the full length up
+// front, the buffer starts at no more than initialPayloadAlloc bytes and
+// doubles in size each time it fills, up to length.  This way memory use
+// tracks the bytes actually received.  The errors match those of io.ReadFull
+// for a buffer of the full length: io.EOF if no bytes were read and
+// io.ErrUnexpectedEOF if only some were.
+func readPayload(r io.Reader, length uint32) ([]byte, int, error) {
+	payload := make([]byte, min(length, initialPayloadAlloc))
+	total := 0
+	for {
+		n, err := io.ReadFull(r, payload[total:])
+		total += n
+		if err != nil {
+			if err == io.EOF && total > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, total, err
+		}
+		if uint32(total) == length {
+			return payload, total, nil
+		}
+
+		grown := make([]byte, nextPayloadSize(len(payload), length))
+		copy(grown, payload)
+		payload = grown
+	}
+}
+
+// nextPayloadSize returns the size readPayload grows a full buffer of size
+// bytes to: twice the size, at most length.  It is computed in 64 bits, as
+// twice a buffer over 1 GiB overflows a 32-bit int; length is at most
+// math.MaxInt, which ReadMessageWithEncodingN checks, so the result fits.
+func nextPayloadSize(size int, length uint32) int {
+	return int(min(2*uint64(size), uint64(length)))
+}
+
 // ReadMessageWithEncodingN reads, validates, and parses the next bitcoin Message
 // from r for the provided protocol version and bitcoin network.  It returns the
 // number of bytes read in addition to the parsed Message and raw bytes which
@@ -389,6 +479,15 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, bchnet BitcoinNet,
 			"bytes.", hdr.length, maxMessagePayload())
 		return totalBytes, nil, nil, messageError("ReadMessage", str)
 
+	}
+
+	// The payload is read into a byte slice, whose length is an int, so on
+	// 32-bit platforms it must be less than 2 GiB.
+	if uint64(hdr.length) > math.MaxInt {
+		str := fmt.Sprintf("message payload is too large - header "+
+			"indicates %d bytes, but at most %d bytes can be held on "+
+			"this platform.", hdr.length, math.MaxInt)
+		return totalBytes, nil, nil, messageError("ReadMessage", str)
 	}
 
 	// Check for messages from the wrong bitcoin network.
@@ -427,8 +526,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, bchnet BitcoinNet,
 	}
 
 	// Read payload.
-	payload := make([]byte, hdr.length)
-	n, err = io.ReadFull(r, payload)
+	payload, n, err := readPayload(r, hdr.length)
 	totalBytes += n
 	if err != nil {
 		return totalBytes, nil, nil, err

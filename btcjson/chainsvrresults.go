@@ -55,6 +55,7 @@ type GetBlockVerboseResult struct {
 // whose tx field is an array of transaction hashes. When the verbose flag is set to 2,
 // getblock returns an object whose tx field is an array of raw transactions.
 // Use GetBlockVerboseResult to unmarshal data received from passing verbose=1 to getblock.
+// Verbosity 3 also returns this structure, with prevouts and fees.
 type GetBlockVerboseTxResult struct {
 	Hash          string        `json:"hash"`
 	Confirmations int64         `json:"confirmations"`
@@ -94,6 +95,7 @@ type DecodeScriptResult struct {
 	Type      string   `json:"type"`
 	Addresses []string `json:"addresses,omitempty"`
 	P2sh      string   `json:"p2sh,omitempty"`
+	P2sh32    string   `json:"p2sh_32,omitempty"`
 }
 
 // GetAddedNodeInfoResultAddr models the data of the addresses portion of the
@@ -140,6 +142,7 @@ type GetBlockChainInfoResult struct {
 	Difficulty           float64                             `json:"difficulty"`
 	MedianTime           int64                               `json:"mediantime"`
 	VerificationProgress float64                             `json:"verificationprogress,omitempty"`
+	InitialBlockDownload bool                                `json:"initialblockdownload"`
 	SyncHeight           uint64                              `json:"syncheight,omitempty"`
 	Pruned               bool                                `json:"pruned"`
 	PruneHeight          int32                               `json:"pruneheight,omitempty"`
@@ -152,9 +155,11 @@ type GetBlockChainInfoResult struct {
 // getblocktemplate command.
 type GetBlockTemplateResultTx struct {
 	Data      string  `json:"data"`
+	TxID      string  `json:"txid"`
 	Hash      string  `json:"hash"`
 	Depends   []int64 `json:"depends"`
 	Fee       int64   `json:"fee"`
+	SigOps    int64   `json:"sigops"` // The sigchecks, under BCHN's name
 	SigChecks int64   `json:"sigchecks"`
 	Size      int64   `json:"size"`
 }
@@ -174,6 +179,7 @@ type GetBlockTemplateResult struct {
 	CurTime       int64                      `json:"curtime"`
 	Height        int64                      `json:"height"`
 	PreviousHash  string                     `json:"previousblockhash"`
+	SigOpLimit    int64                      `json:"sigoplimit,omitempty"` // The sigchecks limit, under BCHN's name
 	SizeLimit     int64                      `json:"sizelimit,omitempty"`
 	SigCheckLimit int64                      `json:"sigchecklimit,omitempty"`
 	SigCheckTotal int64                      `json:"sigchecktotal,omitempty"`
@@ -223,6 +229,42 @@ type GetMempoolEntryResult struct {
 	Depends          []string `json:"depends"`
 }
 
+// DSProofOutPoint models the outpoint of a double spend proof.
+type DSProofOutPoint struct {
+	TxID string `json:"txid"`
+	Vout uint32 `json:"vout"`
+}
+
+// DSProofPushData models the data a double spend proof spender pushed.
+type DSProofPushData struct {
+	Asm string `json:"asm"`
+	Hex string `json:"hex"`
+}
+
+// DSProofSpender models one of the two spenders of a double spend proof.
+type DSProofSpender struct {
+	TxVersion       uint32          `json:"txversion"`
+	Sequence        uint32          `json:"sequence"`
+	LockTime        uint32          `json:"locktime"`
+	HashPrevOutputs string          `json:"hashprevoutputs"`
+	HashSequence    string          `json:"hashsequence"`
+	HashOutputs     string          `json:"hashoutputs"`
+	PushData        DSProofPushData `json:"pushdata"`
+}
+
+// GetDSProofResult models a double spend proof returned by the getdsproof
+// and getdsprooflist commands.  Which fields are set depends on the
+// verbosity.  TxID is null for orphan proofs.
+type GetDSProofResult struct {
+	Hex         string           `json:"hex,omitempty"`
+	DSPID       string           `json:"dspid,omitempty"`
+	TxID        *string          `json:"txid"`
+	OutPoint    *DSProofOutPoint `json:"outpoint,omitempty"`
+	Path        []string         `json:"path,omitempty"`
+	Descendants []string         `json:"descendants,omitempty"`
+	Spenders    []DSProofSpender `json:"spenders,omitempty"`
+}
+
 // GetMempoolInfoResult models the data returned from the getmempoolinfo
 // command.
 type GetMempoolInfoResult struct {
@@ -263,6 +305,24 @@ type GetNetworkInfoResult struct {
 	IncrementalFee  float64                `json:"incrementalfee"`
 	LocalAddresses  []LocalAddressesResult `json:"localaddresses"`
 	Warnings        string                 `json:"warnings"`
+}
+
+// ListBannedResult models the data of a ban returned from the listbanned
+// command.
+type ListBannedResult struct {
+	Address       string `json:"address"`
+	BanCreated    int64  `json:"ban_created"`
+	BannedUntil   int64  `json:"banned_until"`
+	BanReason     string `json:"ban_reason"`
+	BanDuration   int64  `json:"ban_duration"`
+	TimeRemaining int64  `json:"time_remaining"`
+}
+
+// ListBcmrIdentitiesResult models the data returned from the listbcmridentities
+// command.
+type ListBcmrIdentitiesResult struct {
+	Identities []GetBcmrIdentityResult `json:"identities"`
+	More       bool                    `json:"more"`
 }
 
 // GetPeerInfoResult models the data returned from the getpeerinfo command.
@@ -315,12 +375,79 @@ type ScriptPubKeyResult struct {
 	Addresses []string `json:"addresses,omitempty"`
 }
 
+// NFTResult models the non-fungible token data of a TokenDataResult.
+type NFTResult struct {
+	Capability string `json:"capability"`
+	Commitment string `json:"commitment"`
+}
+
+// TokenDataResult models the CashTokens data of a transaction output.  The
+// amount is a decimal string so values above 2^53 stay exact.
+type TokenDataResult struct {
+	Category string     `json:"category"`
+	Amount   string     `json:"amount"`
+	NFT      *NFTResult `json:"nft,omitempty"`
+}
+
+// BcmrPublicationOutputResult models a link's BCMR publication output in the
+// getbcmridentity command's answer.
+type BcmrPublicationOutputResult struct {
+	Output    uint32    `json:"output"`
+	Malformed bool      `json:"malformed,omitempty"`
+	Hash      string    `json:"hash,omitempty"`
+	URIs      *[]string `json:"uris,omitempty"`
+}
+
+// BcmrLinkResult models a link of an authchain in the getbcmridentity
+// command's answer.
+type BcmrLinkResult struct {
+	Txid        string                       `json:"txid"`
+	Height      int32                        `json:"height"`
+	BlockHash   string                       `json:"blockhash,omitempty"`
+	Publication *BcmrPublicationOutputResult `json:"publication,omitempty"`
+}
+
+// BcmrPublicationResult models the publication to read in the getbcmridentity
+// command's answer.
+type BcmrPublicationResult struct {
+	Txid    string   `json:"txid"`
+	Height  int32    `json:"height"`
+	Output  uint32   `json:"output"`
+	Hash    string   `json:"hash"`
+	URIs    []string `json:"uris"`
+	Current bool     `json:"current"`
+}
+
+// BcmrProofResult models the merkle proof in the getbcmridentity command's
+// answer.
+type BcmrProofResult struct {
+	Index       string `json:"index"`
+	MerkleBlock string `json:"merkleblock"`
+}
+
+// GetBcmrIdentityResult models the data from the getbcmridentity command.
+// The genesis supply is a decimal string so values above 2^53 stay exact.  The authchain
+// and its info are there, even empty, whenever they were asked for.
+type GetBcmrIdentityResult struct {
+	Authbase       string                     `json:"authbase"`
+	Status         string                     `json:"status"`
+	Head           BcmrLinkResult             `json:"head"`
+	Publication    *BcmrPublicationResult     `json:"publication,omitempty"`
+	GenesisSupply  string                     `json:"genesissupply,omitempty"`
+	IdentityOutput *TokenDataResult           `json:"identityoutput,omitempty"`
+	Authchain      *map[string]string         `json:"authchain,omitempty"`
+	AuthchainInfo  *map[string]BcmrLinkResult `json:"authchaininfo,omitempty"`
+	More           *bool                      `json:"more,omitempty"`
+	Proof          *BcmrProofResult           `json:"proof,omitempty"`
+}
+
 // GetTxOutResult models the data from the gettxout command.
 type GetTxOutResult struct {
 	BestBlock     string             `json:"bestblock"`
 	Confirmations int64              `json:"confirmations"`
 	Value         float64            `json:"value"`
 	ScriptPubKey  ScriptPubKeyResult `json:"scriptPubKey"`
+	TokenData     *TokenDataResult   `json:"tokenData,omitempty"`
 	Coinbase      bool               `json:"coinbase"`
 }
 
@@ -339,15 +466,34 @@ type ScriptSig struct {
 	Hex string `json:"hex"`
 }
 
+// PrevOutScriptPubKeyResult models the script of a getblock prevout.
+type PrevOutScriptPubKeyResult struct {
+	Asm     string `json:"asm"`
+	Hex     string `json:"hex"`
+	Type    string `json:"type"`
+	Address string `json:"address,omitempty"`
+}
+
+// GetBlockPrevOutResult models the output spent by an input in getblock
+// verbosity 3.
+type GetBlockPrevOutResult struct {
+	Generated    bool                      `json:"generated"`
+	Height       int32                     `json:"height"`
+	Value        float64                   `json:"value"`
+	ScriptPubKey PrevOutScriptPubKeyResult `json:"scriptPubKey"`
+	TokenData    *TokenDataResult          `json:"tokenData,omitempty"`
+}
+
 // Vin models parts of the tx data.  It is defined separately since
 // getrawtransaction, decoderawtransaction, and searchrawtransaction use the
 // same structure.
 type Vin struct {
-	Coinbase  string     `json:"coinbase"`
-	Txid      string     `json:"txid"`
-	Vout      uint32     `json:"vout"`
-	ScriptSig *ScriptSig `json:"scriptSig"`
-	Sequence  uint32     `json:"sequence"`
+	Coinbase  string                 `json:"coinbase"`
+	Txid      string                 `json:"txid"`
+	Vout      uint32                 `json:"vout"`
+	ScriptSig *ScriptSig             `json:"scriptSig"`
+	PrevOut   *GetBlockPrevOutResult `json:"prevout,omitempty"`
+	Sequence  uint32                 `json:"sequence"`
 }
 
 // IsCoinBase returns a bool to show if a Vin is a Coinbase one or not.
@@ -369,14 +515,16 @@ func (v *Vin) MarshalJSON() ([]byte, error) {
 	}
 
 	txStruct := struct {
-		Txid      string     `json:"txid"`
-		Vout      uint32     `json:"vout"`
-		ScriptSig *ScriptSig `json:"scriptSig"`
-		Sequence  uint32     `json:"sequence"`
+		Txid      string                 `json:"txid"`
+		Vout      uint32                 `json:"vout"`
+		ScriptSig *ScriptSig             `json:"scriptSig"`
+		PrevOut   *GetBlockPrevOutResult `json:"prevout,omitempty"`
+		Sequence  uint32                 `json:"sequence"`
 	}{
 		Txid:      v.Txid,
 		Vout:      v.Vout,
 		ScriptSig: v.ScriptSig,
+		PrevOut:   v.PrevOut,
 		Sequence:  v.Sequence,
 	}
 	return json.Marshal(txStruct)
@@ -384,8 +532,9 @@ func (v *Vin) MarshalJSON() ([]byte, error) {
 
 // PrevOut represents previous output for an input Vin.
 type PrevOut struct {
-	Addresses []string `json:"addresses,omitempty"`
-	Value     float64  `json:"value"`
+	Addresses []string         `json:"addresses,omitempty"`
+	Value     float64          `json:"value"`
+	TokenData *TokenDataResult `json:"tokenData,omitempty"`
 }
 
 // VinPrevOut is like Vin except it includes PrevOut.  It is used by searchrawtransaction
@@ -438,6 +587,7 @@ type Vout struct {
 	Value        float64            `json:"value"`
 	N            uint32             `json:"n"`
 	ScriptPubKey ScriptPubKeyResult `json:"scriptPubKey"`
+	TokenData    *TokenDataResult   `json:"tokenData,omitempty"`
 }
 
 // GetMiningInfoResult models the data from the getmininginfo command.
@@ -479,18 +629,19 @@ type InfoChainResult struct {
 
 // TxRawResult models the data from the getrawtransaction command.
 type TxRawResult struct {
-	Hex           string `json:"hex,omitempty"`
-	Txid          string `json:"txid"`
-	Hash          string `json:"hash,omitempty"`
-	Size          int32  `json:"size,omitempty"`
-	Version       int32  `json:"version"`
-	LockTime      uint32 `json:"locktime"`
-	Vin           []Vin  `json:"vin"`
-	Vout          []Vout `json:"vout"`
-	BlockHash     string `json:"blockhash,omitempty"`
-	Confirmations uint64 `json:"confirmations,omitempty"`
-	Time          int64  `json:"time,omitempty"`
-	Blocktime     int64  `json:"blocktime,omitempty"`
+	Hex           string   `json:"hex,omitempty"`
+	Txid          string   `json:"txid"`
+	Hash          string   `json:"hash,omitempty"`
+	Size          int32    `json:"size,omitempty"`
+	Version       int32    `json:"version"`
+	LockTime      uint32   `json:"locktime"`
+	Vin           []Vin    `json:"vin"`
+	Vout          []Vout   `json:"vout"`
+	Fee           *float64 `json:"fee,omitempty"`
+	BlockHash     string   `json:"blockhash,omitempty"`
+	Confirmations uint64   `json:"confirmations,omitempty"`
+	Time          int64    `json:"time,omitempty"`
+	Blocktime     int64    `json:"blocktime,omitempty"`
 }
 
 // SearchRawTransactionsResult models the data from the searchrawtransaction
@@ -520,9 +671,31 @@ type TxRawDecodeResult struct {
 	Vout     []Vout `json:"vout"`
 }
 
+// TestMempoolAcceptFees models the fees of a transaction in the
+// testmempoolaccept command.
+type TestMempoolAcceptFees struct {
+	Base             float64 `json:"base"`
+	EffectiveFeeRate float64 `json:"effective-feerate"`
+}
+
+// TestMempoolAcceptResult models the data returned by the testmempoolaccept
+// command for each transaction.
+type TestMempoolAcceptResult struct {
+	Txid          string                 `json:"txid"`
+	Allowed       bool                   `json:"allowed"`
+	Size          int64                  `json:"size,omitempty"`
+	Vsize         int64                  `json:"vsize,omitempty"`
+	Fees          *TestMempoolAcceptFees `json:"fees,omitempty"`
+	RejectReason  string                 `json:"reject-reason,omitempty"`
+	RejectDetails string                 `json:"reject-details,omitempty"`
+}
+
 // ValidateAddressChainResult models the data returned by the chain server
 // validateaddress command.
 type ValidateAddressChainResult struct {
-	IsValid bool   `json:"isvalid"`
-	Address string `json:"address,omitempty"`
+	IsValid      bool   `json:"isvalid"`
+	Address      string `json:"address,omitempty"`
+	ScriptPubKey string `json:"scriptPubKey,omitempty"`
+	IsScript     *bool  `json:"isscript,omitempty"`
+	IsTokenAware *bool  `json:"istokenaware,omitempty"`
 }
