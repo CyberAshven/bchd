@@ -345,6 +345,18 @@ type Tx interface {
 	// implementations.
 	FetchBlocks(hashes []chainhash.Hash) ([][]byte, error)
 
+	// FetchBlockSize returns the size of the serialized block identified
+	// by the given hash without reading the block.  The size is known for
+	// every stored block, also for one whose data was deleted by
+	// DeleteBlocks.
+	//
+	// The interface contract guarantees at least the following errors will
+	// be returned (other implementation-specific errors are possible):
+	//   - ErrBlockNotFound if the requested block hash does not exist
+	//   - ErrTxClosed if the transaction has already been closed
+	//   - ErrCorruption if the database has somehow become corrupted
+	FetchBlockSize(hash *chainhash.Hash) (uint32, error)
+
 	// FetchBlockRegion returns the raw serialized bytes for the given
 	// block region.
 	//
@@ -454,7 +466,8 @@ type DB interface {
 
 	// View invokes the passed function in the context of a managed
 	// read-only transaction.  Any errors returned from the user-supplied
-	// function are returned from this function.
+	// function are returned from this function, unless a read from the
+	// database failed, whose error is returned instead.
 	//
 	// Calling Rollback or Commit on the transaction passed to the
 	// user-supplied function will result in a panic.
@@ -463,8 +476,10 @@ type DB interface {
 	// Update invokes the passed function in the context of a managed
 	// read-write transaction.  Any errors returned from the user-supplied
 	// function will cause the transaction to be rolled back and are
-	// returned from this function.  Otherwise, the transaction is committed
-	// when the user-supplied function returns a nil error.
+	// returned from this function, unless a read from the database failed,
+	// whose error is returned instead, as in View.  Otherwise, the
+	// transaction is committed when the user-supplied function returns a
+	// nil error.
 	//
 	// Calling Rollback or Commit on the transaction passed to the
 	// user-supplied function will result in a panic.

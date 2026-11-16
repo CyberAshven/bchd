@@ -5,8 +5,10 @@
 package txscript
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/big"
+	"math/bits"
 )
 
 const (
@@ -21,7 +23,7 @@ const (
 	defaultSmallScriptNumLen = 4
 
 	// defaultBigScriptNumLen is the default number of bytes
-	// data being interpreted as a biger integer(int64) may be.
+	// data being interpreted as a bigger integer(int64) may be.
 	defaultBigScriptNumLen = 8
 
 	// defaultBigIntScriptNumLen is the default number of bytes
@@ -91,7 +93,7 @@ func checkMinimalDataEncoding(v []byte) error {
 		if len(v) == 1 || v[len(v)-2]&0x80 == 0 {
 			str := fmt.Sprintf("numeric value encoded as %x is "+
 				"not minimally encoded", v)
-			return scriptError(ErrMinimalData, str)
+			return scriptError(ErrMinimalNumber, str)
 		}
 	}
 
@@ -115,7 +117,6 @@ func checkMinimalDataEncoding(v []byte) error {
 //	 32768 -> [0x00 0x80 0x00]
 //	-32768 -> [0x00 0x80 0x80]
 func (n scriptNum) Bytes() []byte {
-
 	bigN := (*big.Int)(&n)
 
 	// Zero encodes as an empty byte slice.
@@ -123,36 +124,50 @@ func (n scriptNum) Bytes() []byte {
 		return nil
 	}
 
-	// Take the absolute bytes and keep track of whether it was originally
-	// negative.
-	absBytes := bigN.Bytes()
-	isNegative := bigN.Sign() == -1
+	// The magnitude takes BitLen/8 bytes rounded up, plus one more byte for
+	// the sign when the high bit of the top byte is taken.  Both cases come
+	// to BitLen/8 + 1.
+	size := bigN.BitLen()/8 + 1
+	result := make([]byte, size)
 
-	// reverse the byte slice to convert to little-endian
-	result := make([]byte, len(absBytes))
-	for i := range absBytes {
-		result[i] = absBytes[len(absBytes)-1-i]
+	// Write the magnitude little-endian straight from its words.  The words
+	// are normalized, so every byte past the magnitude stays zero and the
+	// sign byte, when there is one, is left zero by make.
+	const wordBytes = bits.UintSize / 8
+	words := bigN.Bits()
+	i := 0
+	for _, w := range words {
+		if i+wordBytes <= size {
+			if wordBytes == 8 {
+				binary.LittleEndian.PutUint64(result[i:], uint64(w))
+			} else {
+				binary.LittleEndian.PutUint32(result[i:], uint32(w))
+			}
+			i += wordBytes
+			continue
+		}
+		for ; i < size; i++ {
+			result[i] = byte(w)
+			w >>= 8
+		}
 	}
 
-	// When the most significant byte already has the high bit set, an
-	// additional high byte is required to indicate whether the number is
-	// negative or positive.  The additional byte is removed when converting
-	// back to an integral and its high bit is used to denote the sign.
-	//
-	// Otherwise, when the most significant byte does not already have the
-	// high bit set, use it to indicate the value is negative, if needed.
-	if result[len(result)-1]&0x80 != 0 {
-		extraByte := byte(0x00)
-		if isNegative {
-			extraByte = 0x80
-		}
-		result = append(result, extraByte)
-
-	} else if isNegative {
-		result[len(result)-1] |= 0x80
+	// The high bit of the top byte is free in both cases, so it carries
+	// the sign.
+	if bigN.Sign() < 0 {
+		result[size-1] |= 0x80
 	}
 
 	return result
+}
+
+// byteLen returns the length of the encoding Bytes returns, without encoding.
+func (n *scriptNum) byteLen() int {
+	bigN := (*big.Int)(n)
+	if bigN.Sign() == 0 {
+		return 0
+	}
+	return bigN.BitLen()/8 + 1
 }
 
 // Int32 returns the script number clamped to a valid int32.  That is to say
@@ -238,29 +253,26 @@ func (n *scriptNum) IsLessThan(v *scriptNum) bool {
 
 func (n *scriptNum) IsEqualeToInt(v int64) bool {
 	a := (*big.Int)(n)
-	b := big.NewInt(v)
 
-	result := a.Cmp(b)
-
-	return result == 0
+	return a.IsInt64() && a.Int64() == v
 }
 
 func (n *scriptNum) IsGreaterThanInt(v int64) bool {
 	a := (*big.Int)(n)
-	b := big.NewInt(v)
+	if !a.IsInt64() {
+		return a.Sign() > 0
+	}
 
-	result := a.Cmp(b)
-
-	return result == 1
+	return a.Int64() > v
 }
 
 func (n *scriptNum) IsLessThanInt(v int64) bool {
 	a := (*big.Int)(n)
-	b := big.NewInt(v)
+	if !a.IsInt64() {
+		return a.Sign() < 0
+	}
 
-	result := a.Cmp(b)
-
-	return result == -1
+	return a.Int64() < v
 }
 
 // Add sets n to the sum x+y and returns n.
@@ -269,7 +281,7 @@ func (n *scriptNum) Add(x, y *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 	b := (*big.Int)(y)
 
-	(*big.Int)(n).Set(new(big.Int).Add(a, b))
+	(*big.Int)(n).Add(a, b)
 
 	return n
 }
@@ -280,7 +292,7 @@ func (n *scriptNum) Sub(x, y *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 	b := (*big.Int)(y)
 
-	(*big.Int)(n).Set(new(big.Int).Sub(a, b))
+	(*big.Int)(n).Sub(a, b)
 
 	return n
 }
@@ -291,7 +303,7 @@ func (n *scriptNum) Div(x, y *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 	b := (*big.Int)(y)
 
-	(*big.Int)(n).Set(new(big.Int).Quo(a, b))
+	(*big.Int)(n).Quo(a, b)
 
 	return n
 }
@@ -302,7 +314,7 @@ func (n *scriptNum) Mul(x, y *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 	b := (*big.Int)(y)
 
-	(*big.Int)(n).Set(new(big.Int).Mul(a, b))
+	(*big.Int)(n).Mul(a, b)
 
 	return n
 }
@@ -313,7 +325,7 @@ func (n *scriptNum) Mod(x, y *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 	b := (*big.Int)(y)
 
-	(*big.Int)(n).Set(new(big.Int).Rem(a, b))
+	(*big.Int)(n).Rem(a, b)
 
 	return n
 }
@@ -323,7 +335,7 @@ func (n *scriptNum) Mod(x, y *scriptNum) *scriptNum {
 func (n *scriptNum) Neg(x *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 
-	(*big.Int)(n).Set(new(big.Int).Neg(a))
+	(*big.Int)(n).Neg(a)
 
 	return n
 }
@@ -333,7 +345,7 @@ func (n *scriptNum) Neg(x *scriptNum) *scriptNum {
 func (n *scriptNum) Abs(x *scriptNum) *scriptNum {
 	a := (*big.Int)(x)
 
-	(*big.Int)(n).Set(new(big.Int).Abs(a))
+	(*big.Int)(n).Abs(a)
 
 	return n
 }
@@ -343,7 +355,7 @@ func (n *scriptNum) Abs(x *scriptNum) *scriptNum {
 func (n *scriptNum) LShift(x *scriptNum, shift uint) *scriptNum {
 	a := (*big.Int)(x)
 
-	(*big.Int)(n).Set(new(big.Int).Lsh(a, shift))
+	(*big.Int)(n).Lsh(a, shift)
 
 	return n
 }
@@ -353,7 +365,7 @@ func (n *scriptNum) LShift(x *scriptNum, shift uint) *scriptNum {
 func (n *scriptNum) RShift(x *scriptNum, shift uint) *scriptNum {
 	a := (*big.Int)(x)
 
-	(*big.Int)(n).Set(new(big.Int).Rsh(a, shift))
+	(*big.Int)(n).Rsh(a, shift)
 
 	return n
 }
@@ -378,6 +390,59 @@ func makeScriptNumFromUInt64(v uint64) *scriptNum {
 	return (*scriptNum)(num)
 }
 
+// numberRangeErrorCode returns the code of the error for a number outside the
+// range of numbers of at most scriptNumLen bytes, as BCHN names it: a range of
+// 32 bits below 8 bytes, of 64 bits at 8 and of big integers above.
+func numberRangeErrorCode(scriptNumLen int) ErrorCode {
+	switch {
+	case scriptNumLen > defaultBigScriptNumLen:
+		return ErrNumberRangeBigInt
+	case scriptNumLen == defaultBigScriptNumLen:
+		return ErrNumberRange64Bit
+	}
+	return ErrNumberRange32Bit
+}
+
+// checkScriptNum returns the error makeScriptNum returns for v, if any: v is
+// longer than scriptNumLen bytes, or, when requireMinimal is set, it is not
+// minimally encoded.
+func checkScriptNum(v []byte, requireMinimal bool, scriptNumLen int) error {
+	// Interpreting data requires that it is not larger than
+	// the passed scriptNumLen value.
+	if len(v) > scriptNumLen {
+		str := fmt.Sprintf("numeric value encoded as %x is %d bytes "+
+			"which exceeds the max allowed of %d", v, len(v),
+			scriptNumLen)
+		return scriptError(numberRangeErrorCode(scriptNumLen), str)
+	}
+
+	// Enforce minimal encoded if requested.
+	if requireMinimal {
+		if err := checkMinimalDataEncoding(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// decodeSmallScriptNum returns the value of the script number encoded in v,
+// which is at most 8 bytes long, so its magnitude fits in 63 bits.  An empty
+// v is zero.
+func decodeSmallScriptNum(v []byte) int64 {
+	if len(v) == 0 {
+		return 0
+	}
+	var abs uint64
+	for i := len(v) - 1; i >= 0; i-- {
+		abs = abs<<8 | uint64(v[i])
+	}
+	signBit := uint64(0x80) << (8 * (len(v) - 1))
+	if abs&signBit != 0 {
+		return -int64(abs &^ signBit)
+	}
+	return int64(abs)
+}
+
 // makeScriptNum interprets the passed serialized bytes as an encoded integer
 // and returns the result as a script number.
 //
@@ -389,58 +454,59 @@ func makeScriptNumFromUInt64(v uint64) *scriptNum {
 // requireMinimal enabled.
 //
 // The scriptNumLen is the maximum number of bytes the encoded value can be
-// before an ErrStackNumberTooBig is returned.  This effectively limits the
-// range of allowed values and is important, for example, where script
-// arguments are allowed only in a limited range on a per opcode basis.
+// before the error numberRangeErrorCode gives is returned.  This effectively
+// limits the range of allowed values and is important, for example, where
+// script arguments are allowed only in a limited range on a per opcode basis.
 //
 // WARNING:  Great care should be taken if passing a value larger than
 // defaultScriptNumLen, which could lead to undefined behavior.
 //
 // See the Bytes function documentation for example encodings.
 func makeScriptNum(v []byte, requireMinimal bool, scriptNumLen int) (scriptNum, error) {
-	// Interpreting data requires that it is not larger than
-	// the passed scriptNumLen value.
-	if len(v) > scriptNumLen {
-		str := fmt.Sprintf("numeric value encoded as %x is %d bytes "+
-			"which exceeds the max allowed of %d", v, len(v),
-			scriptNumLen)
-		return *makeScriptNumFromInt(0), scriptError(ErrNumberTooBig, str)
-	}
-
-	// Enforce minimal encoded if requested.
-	if requireMinimal {
-		if err := checkMinimalDataEncoding(v); err != nil {
-			return *makeScriptNumFromInt(0), err
-		}
+	if err := checkScriptNum(v, requireMinimal, scriptNumLen); err != nil {
+		return *makeScriptNumFromInt(0), err
 	}
 
 	// Zero is encoded as an empty byte slice.
 	if len(v) == 0 {
 		return *makeScriptNumFromInt(0), nil
 	}
-	// reverse the byte slice to convert to big-endian
-	bigEndian := make([]byte, len(v))
-	for i := range v {
-		bigEndian[i] = v[len(v)-1-i]
+
+	// Up to 8 bytes the magnitude fits in 63 bits.
+	if len(v) <= 8 {
+		var result big.Int
+		result.SetInt64(decodeSmallScriptNum(v))
+		return scriptNum(result), nil
 	}
 
-	// When the most significant byte of the input bytes has the sign bit
-	// set, the result is negative.  So, remove the sign bit from the result
-	// and set the isNegative to true.
-	isNegative := false
-	if bigEndian[0]&0x80 != 0 {
-		bigEndian[0] = bigEndian[0] & ^byte(0x80)
-		isNegative = true
+	// Read the little-endian magnitude straight into words, leaving out the
+	// sign bit, which is the high bit of the last byte.
+	const wordBytes = bits.UintSize / 8
+	words := make([]big.Word, (len(v)+wordBytes-1)/wordBytes)
+	full := len(v) / wordBytes
+	for k := 0; k < full; k++ {
+		if wordBytes == 8 {
+			words[k] = big.Word(binary.LittleEndian.Uint64(v[8*k:]))
+		} else {
+			words[k] = big.Word(binary.LittleEndian.Uint32(v[4*k:]))
+		}
 	}
-
-	result := new(big.Int).SetBytes(bigEndian)
-
-	// Make the result negative.
+	for i := full * wordBytes; i < len(v); i++ {
+		words[full] |= big.Word(v[i]) << (8 * (i - full*wordBytes))
+	}
+	last := len(v) - 1
+	isNegative := v[last]&0x80 != 0
 	if isNegative {
-		result.Neg(result)
+		words[last/wordBytes] &^= big.Word(0x80) << (8 * (last % wordBytes))
 	}
 
-	return (scriptNum)(*result), nil
+	var result big.Int
+	result.SetBits(words)
+	if isNegative {
+		result.Neg(&result)
+	}
+
+	return scriptNum(result), nil
 }
 
 // minimallyEncode takes in a byte slice and returns a slice that contains a
@@ -478,10 +544,11 @@ func minimallyEncode(data []byte) (ret []byte) {
 		// We found a non zero byte, time to encode.
 		if ret[i-1] != 0 {
 			if ret[i-1]&0x80 > 0 {
-				// We found a byte with it sign bit set so we need one more
-				// byte.
-				i++
+				// We found a byte with its sign bit set so we need one more
+				// byte.  The sign byte goes directly after it, at index i,
+				// and is kept.
 				ret[i] = last
+				i++
 			} else {
 				// the sign bit is clear, we can use it.
 				ret[i-1] |= last

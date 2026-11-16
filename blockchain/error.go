@@ -56,7 +56,7 @@ const (
 	// most recent checkpoint.
 	ErrTimeTooOld
 
-	// ErrTimeTooNew indicates the time is too far in the future as compared
+	// ErrTimeTooNew indicates the time is too far in the future as compared to
 	// the current time.
 	ErrTimeTooNew
 
@@ -66,12 +66,12 @@ const (
 
 	// ErrUnexpectedDifficulty indicates specified bits do not align with
 	// the expected value either because it doesn't match the calculated
-	// valued based on difficulty regarted rules or it is out of the valid
+	// value based on difficulty retarget rules or it is out of the valid
 	// range.
 	ErrUnexpectedDifficulty
 
 	// ErrHighHash indicates the block does not hash to a value which is
-	// lower than the required target difficultly.
+	// lower than the required target difficulty.
 	ErrHighHash
 
 	// ErrBadMerkleRoot indicates the calculated merkle root does not match
@@ -116,7 +116,11 @@ const (
 	ErrTxTooManySigChecks
 
 	// ErrBadTxOutValue indicates an output value for a transaction is
-	// invalid in some way such as being out of range.
+	// invalid in some way such as being out of range.  The checks now
+	// return ErrTxOutValueNegative, ErrTxOutValueTooHigh,
+	// ErrTxOutTotalTooHigh or ErrTxInValueOutOfRange instead, so that each
+	// gets its own reason, as in Bitcoin Cash Node; it is kept for code that
+	// names it.
 	ErrBadTxOutValue
 
 	// ErrDuplicateTxInputs indicates a transaction references the same
@@ -226,6 +230,39 @@ const (
 
 	// ErrCashTokensValidation indicates the token data is invalid in some way
 	ErrCashTokensValidation
+
+	// ErrBadTxVersion indicates a transaction version is outside of the
+	// range allowed once Upgrade9 is active.
+	ErrBadTxVersion
+
+	// ErrCoinbaseHasTokens indicates the coinbase transaction has an output
+	// with a token prefix once Upgrade9 is active.
+	ErrCoinbaseHasTokens
+
+	// ErrForkBeforeFinalized indicates a block forks the chain below the
+	// finalized block.
+	ErrForkBeforeFinalized
+
+	// ErrUnrequestedBlock indicates a block that was not requested was
+	// not stored because it can't extend the best chain soon.
+	ErrUnrequestedBlock
+
+	// ErrTxOutValueNegative indicates a transaction output has a negative
+	// value.
+	ErrTxOutValueNegative
+
+	// ErrTxOutValueTooHigh indicates a transaction output has a value
+	// above the money supply.
+	ErrTxOutValueTooHigh
+
+	// ErrTxOutTotalTooHigh indicates the outputs of a transaction are
+	// together worth more than the money supply.
+	ErrTxOutTotalTooHigh
+
+	// ErrTxInValueOutOfRange indicates an output a transaction spends has a
+	// value out of range, or the outputs it spends are together worth more
+	// than the money supply.
+	ErrTxInValueOutOfRange
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -274,6 +311,14 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrTooManySigChecks:      "ErrTooManySigChecks",
 	ErrTxTooManySigChecks:    "ErrTxTooManySigChecks",
 	ErrCashTokensValidation:  "ErrCashTokensValidation",
+	ErrBadTxVersion:          "ErrBadTxVersion",
+	ErrCoinbaseHasTokens:     "ErrCoinbaseHasTokens",
+	ErrForkBeforeFinalized:   "ErrForkBeforeFinalized",
+	ErrUnrequestedBlock:      "ErrUnrequestedBlock",
+	ErrTxOutValueNegative:    "ErrTxOutValueNegative",
+	ErrTxOutValueTooHigh:     "ErrTxOutValueTooHigh",
+	ErrTxOutTotalTooHigh:     "ErrTxOutTotalTooHigh",
+	ErrTxInValueOutOfRange:   "ErrTxInValueOutOfRange",
 }
 
 // String returns the ErrorCode as a human-readable name.
@@ -292,6 +337,12 @@ func (e ErrorCode) String() string {
 type RuleError struct {
 	ErrorCode   ErrorCode // Describes the kind of error
 	Description string    // Human readable description of the issue
+
+	// ScriptErr is the script engine's error and InputIndex the index of
+	// the input whose script failed, for ErrScriptMalformed and
+	// ErrScriptValidation.  ScriptErr is nil for other errors.
+	ScriptErr  error
+	InputIndex int
 }
 
 // Error satisfies the error interface and prints human-readable errors.

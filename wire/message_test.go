@@ -8,9 +8,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 	"net"
 	"reflect"
+	"runtime"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -75,6 +78,10 @@ func TestMessage(t *testing.T) {
 		[]byte("payload"))
 	msgCFHeaders := NewMsgCFHeaders()
 	msgCFCheckpt := NewMsgCFCheckpt(GCSFilterRegular, &chainhash.Hash{}, 0)
+	msgSendAddrV2 := NewMsgSendAddrV2()
+	msgAddrV2 := NewMsgAddrV2()
+	msgDSProof := NewMsgDSProof(OutPoint{}, DSProofSpender{PushData: [][]byte{}},
+		DSProofSpender{PushData: [][]byte{}})
 
 	tests := []struct {
 		in     Message    // Value to encode
@@ -109,6 +116,9 @@ func TestMessage(t *testing.T) {
 		{msgCFilter, msgCFilter, pver, MainNet, 65},
 		{msgCFHeaders, msgCFHeaders, pver, MainNet, 90},
 		{msgCFCheckpt, msgCFCheckpt, pver, MainNet, 58},
+		{msgSendAddrV2, msgSendAddrV2, pver, MainNet, 24},
+		{msgAddrV2, msgAddrV2, pver, MainNet, 25},
+		{msgDSProof, msgDSProof, pver, MainNet, 278},
 	}
 
 	t.Logf("Running %d tests", len(tests))
@@ -378,6 +388,457 @@ func TestReadMessageWireErrors(t *testing.T) {
 	}
 }
 
+// TestReadMessageShortPayloadAlloc ensures that reading a message whose header
+// claims a large payload, but which only delivers a few bytes of it, fails
+// with the expected error and does not allocate memory for the full claimed
+// length.
+func TestReadMessageShortPayloadAlloc(t *testing.T) {
+	pver := ProtocolVersion
+	bchnet := MainNet
+
+	// The cmpctblock message accepts payloads larger than a block, so a
+	// header claiming its max payload passes the length checks and the
+	// payload read is attempted.
+	payloadLen := (&MsgCmpctBlock{}).MaxPayloadLength(pver)
+	if payloadLen <= MaxBlockPayload() {
+		t.Fatalf("test payload length %d is not above the block "+
+			"limit %d", payloadLen, MaxBlockPayload())
+	}
+
+	tests := []struct {
+		name    string // Name of the test
+		sent    int    // Num payload bytes delivered before EOF
+		readErr error  // Expected read error
+	}{
+		{"no payload", 0, io.EOF},
+		{"a few bytes", 5, io.ErrUnexpectedEOF},
+		{"64 KiB", 64 * 1024, io.ErrUnexpectedEOF},
+	}
+
+	for _, test := range tests {
+		buf := makeHeader(bchnet, CmdCmpctBlock, payloadLen, 0)
+		buf = append(buf, make([]byte, test.sent)...)
+		r := bytes.NewReader(buf)
+
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		nr, msg, payload, err := ReadMessageN(r, pver, bchnet)
+		runtime.ReadMemStats(&after)
+
+		if err != test.readErr {
+			t.Errorf("%s: wrong error - got %v <%T>, want %v <%T>",
+				test.name, err, err, test.readErr, test.readErr)
+		}
+		if msg != nil || payload != nil {
+			t.Errorf("%s: unexpected message or payload returned",
+				test.name)
+		}
+		if want := MessageHeaderSize + test.sent; nr != want {
+			t.Errorf("%s: unexpected num bytes read - got %d, "+
+				"want %d", test.name, nr, want)
+		}
+
+		// The claimed length is over a hundred MiB, while the bytes that
+		// actually arrive are at most 64 KiB.  Reading them should only
+		// take a small multiple of that, so 1 MiB leaves plenty of room
+		// for incidental allocations while still being far below the
+		// claimed length.
+		const maxAlloc = 1024 * 1024
+		alloc := after.TotalAlloc - before.TotalAlloc
+		if alloc > maxAlloc {
+			t.Errorf("%s: allocated %d bytes for a header claiming "+
+				"%d bytes with %d delivered, want at most %d",
+				test.name, alloc, payloadLen, test.sent,
+				maxAlloc)
+		}
+	}
+}
+
+// TestCFilterClaimedSizeAlloc ensures a cfilter whose filter claims the
+// largest size, while its payload ends sooner, is refused without allocating
+// the claimed size.  The cfilter limit grows with the block limit, to 34 MB
+// at the default block size, so a message of a few dozen bytes could
+// otherwise make the node allocate that much.
+func TestCFilterClaimedSizeAlloc(t *testing.T) {
+	pver := ProtocolVersion
+	SetLimits(32000000)
+	t.Cleanup(func() { SetLimits(fixedExcessiveBlockSize) })
+
+	claimed := maxCFilterDataSize()
+	tests := []struct {
+		sent int   // Filter bytes in the payload
+		err  error // Expected decode error
+	}{
+		{0, io.EOF},
+		{5, io.ErrUnexpectedEOF},
+	}
+	for _, test := range tests {
+		var payload bytes.Buffer
+		payload.WriteByte(byte(GCSFilterRegular))
+		payload.Write(make([]byte, chainhash.HashSize))
+		_ = WriteVarInt(&payload, pver, uint64(claimed))
+		payload.Write(make([]byte, test.sent))
+
+		var msg MsgCFilter
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		err := msg.BchDecode(&payload, pver, BaseEncoding)
+		runtime.ReadMemStats(&after)
+		if err != test.err {
+			t.Errorf("%d bytes sent: got %v, want %v", test.sent, err,
+				test.err)
+		}
+		const maxAlloc = 1024 * 1024
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > maxAlloc {
+			t.Errorf("%d bytes sent: allocated %d bytes for a filter "+
+				"claiming %d, want at most %d", test.sent, alloc,
+				claimed, maxAlloc)
+		}
+	}
+}
+
+// TestReadMessageLargePayload ensures that large messages, whose payloads
+// span many reads and several increases of the payload buffer, still read
+// back identically to what was written.
+func TestReadMessageLargePayload(t *testing.T) {
+	pver := ProtocolVersion
+	bchnet := MainNet
+
+	// Build blocks of a few MiB by adding transactions with large output
+	// scripts.  The sizes are chosen so the payload lengths are not powers
+	// of two.
+	for _, size := range []int{3*1024*1024 + 12345, 9 * 1000 * 1000} {
+		block := NewMsgBlock(&blockOne.Header)
+		const scriptLen = 100000
+		for i := 0; i < size/scriptLen; i++ {
+			tx := blockOne.Transactions[0].Copy()
+			tx.TxOut[0].PkScript = bytes.Repeat([]byte{byte(i)},
+				scriptLen)
+			if err := block.AddTransaction(tx); err != nil {
+				t.Fatalf("AddTransaction: %v", err)
+			}
+		}
+
+		var buf bytes.Buffer
+		nw, err := WriteMessageN(&buf, block, pver, bchnet)
+		if err != nil {
+			t.Fatalf("WriteMessageN: %v", err)
+		}
+		encoded := buf.Bytes()
+
+		// Read through a reader that returns only part of what is
+		// requested to exercise short reads.
+		r := iotest.HalfReader(bytes.NewReader(encoded))
+		nr, msg, payload, err := ReadMessageN(r, pver, bchnet)
+		if err != nil {
+			t.Fatalf("ReadMessageN (size %d): %v", size, err)
+		}
+		if nr != nw {
+			t.Errorf("ReadMessageN (size %d): unexpected num bytes "+
+				"read - got %d, want %d", size, nr, nw)
+		}
+		if cap(payload) != len(payload) {
+			t.Errorf("ReadMessageN (size %d): payload capacity %d "+
+				"does not match its length %d", size,
+				cap(payload), len(payload))
+		}
+		if !bytes.Equal(payload, encoded[MessageHeaderSize:]) {
+			t.Errorf("ReadMessageN (size %d): payload does not "+
+				"match the written payload", size)
+		}
+		if !reflect.DeepEqual(msg, block) {
+			t.Errorf("ReadMessageN (size %d): message does not "+
+				"match the written block", size)
+		}
+	}
+}
+
+// TestPayloadLimits ensures the message types whose limit was set by the block
+// size read the largest message a peer can validly send at the block size the
+// limits are set for, and refuse a header claiming more than their limit, so
+// its payload is skipped rather than held.  tx, getblocktxn and reject have
+// the 2 MiB BCHN applies to every message but block, cmpctblock and blocktxn;
+// the others the largest valid message.  A tx message could be as large as a
+// block message, and the others about twice as large, so a peer could make a
+// node hold that much for messages that are never near that size.
+func TestPayloadLimits(t *testing.T) {
+	pver := ProtocolVersion
+	bchnet := MainNet
+
+	// A small block size keeps the largest messages small, while blocks
+	// can still hold the largest transaction.
+	SetLimits(500000)
+	t.Cleanup(func() { SetLimits(fixedExcessiveBlockSize) })
+	blockLimit := MaxBlockPayload()
+	maxTxs := maxTxPerBlock()
+
+	// The largest block holds as many of the smallest transactions, with
+	// no inputs and no outputs, as fit, and an output on the last one that
+	// fills the block limit exactly.
+	block := NewMsgBlock(&blockOne.Header)
+	n := (int(blockLimit) - MaxBlockHeaderPayload - 2*MaxVarIntPayload) /
+		minTxPayload
+	for range n {
+		_ = block.AddTransaction(&MsgTx{Version: 1})
+	}
+	pad := int(blockLimit) - block.SerializeSize() - MinTxOutPayload
+	block.Transactions[n-1].AddTxOut(NewTxOut(0, make([]byte, pad),
+		TokenData{}))
+	if size := block.SerializeSize(); size != int(blockLimit) {
+		t.Fatalf("largest block is %d bytes, want %d", size, blockLimit)
+	}
+
+	// The largest transaction consensus allows.
+	tx := &MsgTx{Version: 1}
+	tx.AddTxOut(NewTxOut(0, make([]byte, 1000000-23), TokenData{}))
+
+	// A request for every transaction of the largest block, and the reply.
+	getBlockTxns := NewMsgGetBlockTxns(block.BlockHash(), make([]uint32, n))
+	blockTxns := NewMsgBlockTxns(block.BlockHash(), block.Transactions)
+
+	// The largest block with every transaction prefilled.
+	cmpctBlock, err := NewMsgCmpctBlockFromBlock(block, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// As many filter headers as a cfcheckpt can have.
+	cfCheckpt := NewMsgCFCheckpt(GCSFilterRegular, &chainhash.Hash{},
+		maxCFHeadersLen)
+	for range maxCFHeadersLen {
+		_ = cfCheckpt.AddCFHeader(&chainhash.Hash{})
+	}
+
+	// A reject whose reason fills the limit other nodes apply to every
+	// message but block, cmpctblock and blocktxn.
+	reject := NewMsgReject(CmdTx, RejectInvalid,
+		string(make([]byte, 2*1024*1024-41)))
+
+	tests := []struct {
+		msg   Message
+		size  int    // Payload size of the message
+		limit uint32 // Largest payload the header may claim
+	}{
+		{tx, 1000000, 2 * 1024 * 1024},
+		{getBlockTxns, chainhash.HashSize + 5 + n, 2 * 1024 * 1024},
+		{blockTxns, int(blockLimit) - MaxBlockHeaderPayload +
+			chainhash.HashSize, blockLimit},
+		{cmpctBlock, int(blockLimit) + 9 + n, blockLimit + 9 + maxTxs},
+		{cfCheckpt, 1 + chainhash.HashSize + 5 +
+			maxCFHeadersLen*chainhash.HashSize,
+			1 + chainhash.HashSize + 5 +
+				maxCFHeadersLen*chainhash.HashSize},
+		{reject, 2 * 1024 * 1024, 2 * 1024 * 1024},
+	}
+	for _, test := range tests {
+		cmd := test.msg.Command()
+		if mpl := test.msg.MaxPayloadLength(pver); mpl != test.limit {
+			t.Errorf("%s: limit is %d bytes, want %d", cmd, mpl,
+				test.limit)
+		}
+
+		var buf bytes.Buffer
+		nw, err := WriteMessageN(&buf, test.msg, pver, bchnet)
+		if err != nil {
+			t.Errorf("%s: WriteMessageN: %v", cmd, err)
+			continue
+		}
+		if size := nw - MessageHeaderSize; size != test.size {
+			t.Errorf("%s: largest message is %d bytes, want %d",
+				cmd, size, test.size)
+		}
+		written := bytes.Clone(buf.Bytes())
+		msg, _, err := ReadMessage(&buf, pver, bchnet)
+		if err != nil {
+			t.Errorf("%s: largest message not read: %v", cmd, err)
+		} else {
+			var again bytes.Buffer
+			_ = WriteMessage(&again, msg, pver, bchnet)
+			if !bytes.Equal(again.Bytes(), written) {
+				t.Errorf("%s: largest message read back "+
+					"differently", cmd)
+			}
+		}
+
+		// A header claiming one byte more is refused as too long, rather
+		// than read until its payload runs out.
+		hdr := makeHeader(bchnet, cmd, test.limit+1, 0)
+		_, _, err = ReadMessage(bytes.NewReader(hdr), pver, bchnet)
+		if _, ok := err.(*MessageError); !ok {
+			t.Errorf("%s: header claiming %d bytes got %v, want it "+
+				"refused at the header", cmd, test.limit+1, err)
+		}
+	}
+}
+
+// TestSetLimitsLargeBlockSize ensures the limits stay usable at the largest
+// excessive block sizes: the block limit, four times the size, stops at the 2
+// GB no block may exceed, so neither it nor the limits computed from it wrap
+// around 32 bits.  At 512 MB the overall limit wrapped to 0, so no message
+// with a payload, not even a version message, could be read.
+func TestSetLimitsLargeBlockSize(t *testing.T) {
+	pver := ProtocolVersion
+	bchnet := MainNet
+	t.Cleanup(func() { SetLimits(fixedExcessiveBlockSize) })
+
+	version := NewMsgVersion(&NetAddress{}, &NetAddress{}, 1, 0)
+	tests := []struct {
+		size       uint32 // Excessive block size
+		blockLimit uint32 // Limit of a block message
+	}{
+		{32000000, 128000000},
+		{499999999, 1999999996},
+		{500000000, 2000000000},
+		{512000000, 2000000000},
+		{1 << 30, 2000000000},
+		{math.MaxUint32, 2000000000},
+	}
+	for _, test := range tests {
+		SetLimits(test.size)
+		if got := MaxBlockPayload(); got != test.blockLimit {
+			t.Errorf("size %d: block limit %d, want %d", test.size,
+				got, test.blockLimit)
+		}
+		if got := maxMessagePayload(); got < MaxBlockPayload() {
+			t.Errorf("size %d: overall limit %d is below the block "+
+				"limit %d", test.size, got, MaxBlockPayload())
+		}
+		for _, msg := range []Message{&MsgBlock{}, &MsgBlockTxns{},
+			&MsgCmpctBlock{}} {
+
+			if got := msg.MaxPayloadLength(pver); got < MaxBlockPayload() {
+				t.Errorf("size %d: %s limit %d is below the "+
+					"block limit %d", test.size,
+					msg.Command(), got, MaxBlockPayload())
+			}
+		}
+
+		var buf bytes.Buffer
+		if err := WriteMessage(&buf, version, pver, bchnet); err != nil {
+			t.Errorf("size %d: WriteMessage: %v", test.size, err)
+			continue
+		}
+		if _, _, err := ReadMessage(&buf, pver, bchnet); err != nil {
+			t.Errorf("size %d: version message not read: %v",
+				test.size, err)
+		}
+	}
+}
+
+// TestSetMaxBlockSizeLookAhead ensures the block message limit follows the
+// block size look-ahead the chain sets, at twice it as in BCHN, never below
+// the limit SetLimits sets nor above 2 GB, and that a block header claiming
+// the limit is read on while one claiming a byte more is refused.  The limit
+// was fixed at startup, so a valid block larger than four times the excessive
+// block size, which ABLA allows after a long run of full blocks, could not be
+// received.
+func TestSetMaxBlockSizeLookAhead(t *testing.T) {
+	pver := ProtocolVersion
+	bchnet := MainNet
+	SetLimits(32000000)
+	t.Cleanup(func() {
+		SetMaxBlockSizeLookAhead(0)
+		SetLimits(fixedExcessiveBlockSize)
+	})
+
+	tests := []struct {
+		size       uint64 // Block size look-ahead
+		blockLimit uint32 // Limit of a block message
+	}{
+		{0, 128000000},
+		{35847033, 128000000}, // ABLA's floor on mainnet
+		{64000000, 128000000},
+		{64000001, 128000002},
+		{170902942, 341805884},
+		{999999999, 1999999998},
+		{1000000000, 2000000000},
+		{2000000000, 2000000000}, // ABLA's largest block
+		{math.MaxUint64, 2000000000},
+		{35847033, 128000000},
+	}
+	for _, test := range tests {
+		SetMaxBlockSizeLookAhead(test.size)
+		if got := MaxBlockPayload(); got != test.blockLimit {
+			t.Errorf("look-ahead %d: block limit %d, want %d",
+				test.size, got, test.blockLimit)
+		}
+		cmpctLimit := (&MsgCmpctBlock{}).MaxPayloadLength(pver)
+		if got := maxMessagePayload(); got < cmpctLimit {
+			t.Errorf("look-ahead %d: overall limit %d is below the "+
+				"cmpctblock limit %d", test.size, got, cmpctLimit)
+		}
+
+		hdr := makeHeader(bchnet, CmdBlock, test.blockLimit, 0)
+		_, _, err := ReadMessage(bytes.NewReader(hdr), pver, bchnet)
+		if err != io.EOF {
+			t.Errorf("look-ahead %d: header claiming %d bytes got %v, "+
+				"want the payload read", test.size, test.blockLimit,
+				err)
+		}
+		hdr = makeHeader(bchnet, CmdBlock, test.blockLimit+1, 0)
+		_, _, err = ReadMessage(bytes.NewReader(hdr), pver, bchnet)
+		if _, ok := err.(*MessageError); !ok {
+			t.Errorf("look-ahead %d: header claiming %d bytes got %v, "+
+				"want it refused at the header", test.size,
+				test.blockLimit+1, err)
+		}
+	}
+
+	// A larger limit from SetLimits still applies.
+	SetMaxBlockSizeLookAhead(170902942)
+	SetLimits(100000000)
+	if got := MaxBlockPayload(); got != 400000000 {
+		t.Errorf("block limit %d, want 400000000", got)
+	}
+}
+
+// TestSetMaxBlockSizeLookAheadConcurrent ensures the block size look-ahead can
+// be set, as the chain does whenever its tip changes, while peers read
+// messages, which the race detector checks.
+func TestSetMaxBlockSizeLookAheadConcurrent(t *testing.T) {
+	t.Cleanup(func() { SetMaxBlockSizeLookAhead(0) })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for size := range uint64(1000) {
+			SetMaxBlockSizeLookAhead(100000000 + size)
+		}
+	}()
+	hdr := makeHeader(MainNet, CmdBlock, 200000000, 0)
+	for range 1000 {
+		_, _, _ = ReadMessage(bytes.NewReader(hdr), ProtocolVersion,
+			MainNet)
+	}
+	<-done
+}
+
+// TestReadMessageLengthFitsInt ensures a header claiming more than an int can
+// hold, which a cmpctblock may claim at the largest block sizes, is refused
+// rather than read.  On 32-bit platforms the payload buffer's size, taken as
+// an int, turned negative, and growing the buffer panicked.
+func TestReadMessageLengthFitsInt(t *testing.T) {
+	if math.MaxInt > math.MaxUint32 {
+		t.Skip("every 32-bit length fits in an int")
+	}
+	pver := ProtocolVersion
+	bchnet := MainNet
+	SetLimits(500000000)
+	t.Cleanup(func() { SetLimits(fixedExcessiveBlockSize) })
+
+	const length uint32 = math.MaxInt32 + 1
+	if mpl := (&MsgCmpctBlock{}).MaxPayloadLength(pver); mpl < length {
+		t.Fatalf("cmpctblock limit %d is below the claimed %d", mpl,
+			length)
+	}
+	buf := makeHeader(bchnet, CmdCmpctBlock, length, 0)
+	buf = append(buf, make([]byte, 64*1024)...)
+	_, _, err := ReadMessage(bytes.NewReader(buf), pver, bchnet)
+	if _, ok := err.(*MessageError); !ok {
+		t.Fatalf("header claiming %d bytes got %v, want it refused",
+			length, err)
+	}
+}
+
 // TestWriteMessageWireErrors performs negative tests against wire encoding from
 // concrete messages to confirm error paths work correctly.
 func TestWriteMessageWireErrors(t *testing.T) {
@@ -452,6 +913,31 @@ func TestWriteMessageWireErrors(t *testing.T) {
 					test.err, test.err)
 				continue
 			}
+		}
+	}
+}
+
+// TestNextPayloadSize ensures the payload buffer grows to twice its size, at
+// most the payload's length, without overflowing a 32-bit int: twice a buffer
+// over 1 GiB is more than math.MaxInt32, which made a 32-bit build panic once
+// a peer had sent that much of one message.
+func TestNextPayloadSize(t *testing.T) {
+	tests := []struct {
+		size   int
+		length uint32
+		want   int
+	}{
+		{32 * 1024, 100000, 64 * 1024},
+		{64 * 1024, 100000, 100000},
+		{1 << 29, 1<<31 - 1, 1 << 30},
+		{1 << 30, 1<<31 - 1, 1<<31 - 1},
+		{1<<30 + 1, 1<<31 - 1, 1<<31 - 1},
+	}
+	for _, test := range tests {
+		got := nextPayloadSize(test.size, test.length)
+		if got != test.want {
+			t.Errorf("nextPayloadSize(%d, %d) = %d, want %d",
+				test.size, test.length, got, test.want)
 		}
 	}
 }

@@ -86,7 +86,7 @@ func resultStructHelp(xT descLookupFunc, rt reflect.Type, indentLevel int) []str
 	// Generate the help for each of the fields in the result struct.
 	numField := rt.NumField()
 	results := make([]string, 0, numField)
-	for i := 0; i < numField; i++ {
+	for i := range numField {
 		rtf := rt.Field(i)
 
 		// The field name to display is the json name when it's
@@ -100,7 +100,7 @@ func resultStructHelp(xT descLookupFunc, rt reflect.Type, indentLevel int) []str
 
 		// Deference pointer if needed.
 		rtfType := rtf.Type
-		if rtfType.Kind() == reflect.Ptr {
+		if rtfType.Kind() == reflect.Pointer {
 			rtfType = rtf.Type.Elem()
 		}
 
@@ -142,7 +142,7 @@ func resultStructHelp(xT descLookupFunc, rt reflect.Type, indentLevel int) []str
 // differently.
 func reflectTypeToJSONExample(xT descLookupFunc, rt reflect.Type, indentLevel int, fieldDescKey string) ([]string, bool) {
 	// Indirect pointer if needed.
-	if rt.Kind() == reflect.Ptr {
+	if rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
 	}
 	kind := rt.Kind()
@@ -286,7 +286,7 @@ func argTypeHelp(xT descLookupFunc, structField reflect.StructField, defaultVal 
 	// Indirect the pointer if needed and track if it's an optional field.
 	fieldType := structField.Type
 	var isOptional bool
-	if fieldType.Kind() == reflect.Ptr {
+	if fieldType.Kind() == reflect.Pointer {
 		fieldType = fieldType.Elem()
 		isOptional = true
 	}
@@ -337,7 +337,7 @@ func argHelp(xT descLookupFunc, rtp reflect.Type, defaults map[int]reflect.Value
 	// simplifying assumptions are made here because the RegisterCmd
 	// function has already rigorously enforced the layout.
 	args := make([]string, 0, numFields)
-	for i := 0; i < numFields; i++ {
+	for i := range numFields {
 		rtf := rt.Field(i)
 		var defaultVal *reflect.Value
 		if defVal, ok := defaults[i]; ok {
@@ -353,7 +353,7 @@ func argHelp(xT descLookupFunc, rtp reflect.Type, defaults map[int]reflect.Value
 		// For types which require a JSON object, or an array of JSON
 		// objects, generate the full syntax for the argument.
 		fieldType := rtf.Type
-		if fieldType.Kind() == reflect.Ptr {
+		if fieldType.Kind() == reflect.Pointer {
 			fieldType = fieldType.Elem()
 		}
 		kind := fieldType.Kind()
@@ -524,7 +524,7 @@ func GenerateHelp(method string, descs map[string]string, resultTypes ...interfa
 		}
 
 		rtp := reflect.TypeOf(resultType)
-		if rtp.Kind() != reflect.Ptr {
+		if rtp.Kind() != reflect.Pointer {
 			str := fmt.Sprintf("result #%d (%v) is not a pointer",
 				i, rtp.Kind())
 			return "", makeError(ErrInvalidType, str)

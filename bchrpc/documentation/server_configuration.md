@@ -2,13 +2,19 @@
 
 Running the gRPC server is done via the command line or config file options.
 
+The gRPC server only starts when the JSON-RPC server is enabled, which needs `rpcuser` and
+`rpcpass` (or `rpclimituser` and `rpclimitpass`). Without them, or with `--norpc`, `--grpclisten`
+has no effect. The examples after the first leave the credentials out, as if they were set in
+`bchd.conf`.
+
 To run the gRPC server on localhost:
 ```bash
-bchd --grpclisten=127.0.0.1
+bchd --rpcuser=your_user --rpcpass=your_password --grpclisten=127.0.0.1
 ```
 
-By default it will run on port 8335 on mainnet (18335 on testnet and regtest). If you wish
-to change the port you can do so:
+By default it will run on port 8335 on mainnet (18335 on testnet3, testnet4, chipnet and regtest,
+18557 on simnet). Only one address is served: if `--grpclisten` is given more than once, only the
+first is used. If you wish to change the port you can do so:
 
 ```bash
 bchd --grpclisten=127.0.0.1:443
@@ -19,9 +25,11 @@ To bind to all interfaces and allow anyone to connect use:
 bchd --grpclisten=0.0.0.0
 ```
 
-It should be noted that Go's HTTP/2 implementation does not support cleartext connections. So TLS must always
-be used. By default bchd's self signed cert (found in the data directory) will be used. If you wish to use
-an actual TLS certificate signed by a valid CA then you can use the following options:
+The gRPC server always uses TLS; `--notls` does not apply to it. By default BCHD's self signed cert,
+`rpc.cert` and `rpc.key` in BCHD's home directory (`~/.bchd` on Linux, `~/Library/Application Support/Bchd`
+on macOS, `%LOCALAPPDATA%\Bchd` on Windows), will be used. BCHD creates them on first start, but not when
+run with `--notls`, so they must then already exist. If you wish to use an actual TLS certificate signed
+by a valid CA then you can use the following options:
 
 ```bash
 bchd  --grpclisten=0.0.0.0 --rpccert=/path/to/your/cert --rpckey=/path/to/your/key
@@ -42,6 +50,41 @@ ctx := metadata.NewOutgoingContext(context.Background(), md)
 response, err := client.SomeRPC(ctx, someRequest)
 ```
 
+Clients may hold at most 100 subscriptions at once, over all the subscription calls, and a
+call over the limit fails with `ResourceExhausted`. Without `--grpcauthtoken`, one IPv4 address,
+or one IPv6 /56, may hold at most a quarter of them, so one such client cannot take them all;
+a client with several addresses can still hold more. Clients at loopback, private or link-local
+addresses, such as a proxy in front of the server, share only the overall limit. A public server
+with more subscribers can raise it:
+
+```bash
+bchd --grpclisten=0.0.0.0 --grpcmaxsubscriptions=1000
+```
+
+A subscription's transaction filter may hold at most 100,000 entries, an address, outpoint or
+token ID counting once and a data element once for each 20 bytes, and a request that takes a
+filter past that fails with `ResourceExhausted`. A server for wallets that watch more can raise
+it with `--grpcmaxfilterentries`.
+
+At most 16 other calls are in progress at once, from reading the request until the reply is
+ready to send. Up to 64 more wait for a place, and a call beyond those fails with
+`ResourceExhausted`. A public server with many clients can raise the limit:
+
+```bash
+bchd --grpclisten=0.0.0.0 --grpcmaxconcurrentcalls=64
+```
+
+While the replies being sent hold more than 512 MiB together, each counting its whole message
+and at least 64 KiB, a reply whose client has taken no 64 KiB part of it in the last 2 seconds
+is reset, those stalled longest first, and the connection of a client that takes none of the
+reset either is closed. A stream whose client takes at least 32 KiB a second, a 64 KiB part
+every 2 seconds, is never reset for room, so replies read that fast may hold more; a slower
+stream can be reset while the replies in flight hold more than 512 MiB.
+
+None of these limits has an unlimited setting. A limit of 0 refuses everything it covers:
+`--grpcmaxsubscriptions=0` refuses every subscription, `--grpcmaxfilterentries=0` every filter
+entry and `--grpcmaxconcurrentcalls=0` every call other than subscriptions.
+
 Finally you don't need to use indexes to use the gRPC API but it's recommended so
 you have access to all API calls. This obviously means you should not run in either
 `--prune` mode or `--fastsync` mode. To use the indexes run with:
@@ -49,3 +92,10 @@ you have access to all API calls. This obviously means you should not run in eit
 ```bash
 bchd --grpclisten=0.0.0.0 --txindex --addrindex
 ```
+
+`GetSlpTokenMetadata`, `GetSlpTrustedValidation`, `CheckSlpTransaction` and the
+`include_token_metadata` request option also need `--slpindex`, and `GetSlpGraphSearch` needs
+`--slpgraphsearch`, which in turn needs both `--txindex` and `--slpindex`. `GetBlockFilter` needs
+the committed filter index, which is on unless `--nocfilters` or `--fastsync` is set.
+`GetBcmrIdentity` needs `--bcmrindex`, which `GetBlockchainInfo`'s `bcmr_index` reports. A call
+whose index is off fails with `Unavailable`.

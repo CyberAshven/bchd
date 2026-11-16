@@ -13,8 +13,8 @@ import (
 // KnownAddress tracks information about a known network address that is used
 // to determine how viable an address is.
 type KnownAddress struct {
-	na          *wire.NetAddress
-	srcAddr     *wire.NetAddress
+	na          *wire.NetAddressV2
+	srcAddr     *wire.NetAddressV2
 	attempts    int
 	lastattempt time.Time
 	lastsuccess time.Time
@@ -22,15 +22,22 @@ type KnownAddress struct {
 	refs        int // reference count of new buckets
 }
 
-// NetAddress returns the underlying wire.NetAddress associated with the
+// NetAddress returns the underlying wire.NetAddressV2 associated with the
 // known address.
-func (ka *KnownAddress) NetAddress() *wire.NetAddress {
+func (ka *KnownAddress) NetAddress() *wire.NetAddressV2 {
 	return ka.na
 }
 
 // LastAttempt returns the last time the known address was attempted.
 func (ka *KnownAddress) LastAttempt() time.Time {
 	return ka.lastattempt
+}
+
+// LastSuccess returns the last time a connection to the known address was
+// marked good, which also marks it attempted, so it is before LastAttempt
+// only if an attempt has failed since.
+func (ka *KnownAddress) LastSuccess() time.Time {
+	return ka.lastsuccess
 }
 
 // Services returns the services supported by the peer with the known address.
@@ -52,8 +59,13 @@ func (ka *KnownAddress) chance() float64 {
 		c *= 0.01
 	}
 
-	// Failed attempts deprioritise.
-	for i := ka.attempts; i > 0; i-- {
+	// Failed attempts deprioritise, but only the first eight count, as in
+	// Bitcoin Core's addrman.  Counting them all sank the chance of an
+	// address that failed thousands of times, as the only one a client
+	// without network keeps trying does, so far that GetAddress, which
+	// loops while holding the lock until it picks an address by its
+	// chance, took seconds to pick it, and longer with every attempt.
+	for i := min(ka.attempts, 8); i > 0; i-- {
 		c /= 1.5
 	}
 

@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
-	"sort"
+	"slices"
+
+	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
 // AggregatePublicKeys aggregates the given public keys using
@@ -22,11 +25,13 @@ func AggregatePublicKeys(keys ...*PublicKey) (*PublicKey, error) {
 // hash using the provided private keys.
 func SignMuSig(hash []byte, keys ...*PrivateKey) (*Signature, error) {
 	sessionID := make([]byte, 32)
-	rand.Read(sessionID)
+	if _, err := io.ReadFull(rand.Reader, sessionID); err != nil {
+		return nil, fmt.Errorf("generate MuSig session ID: %w", err)
+	}
 
 	// Sort the private keys by their corresponding public keys
-	sort.Slice(keys, func(i, j int) bool {
-		return keys[i].PubKey().X.Cmp(keys[j].PubKey().X) < 0
+	slices.SortFunc(keys, func(a, b *PrivateKey) int {
+		return a.PubKey().X.Cmp(b.PubKey().X)
 	})
 
 	pubkeys := make([]*PublicKey, 0, len(keys))
@@ -70,15 +75,17 @@ func aggregatePubkeys(tweak []byte, keys ...*PublicKey) (*PublicKey, error) {
 
 	tweak0 := sha256.Sum256(append(tweak, k.SerializeCompressed()...))
 
-	x0, y0, z0 := S256().scalarMultJacobian(k.X, k.Y, tweak0[:])
+	var agg secp.JacobianPoint
+	S256().scalarMultJacobian(k.X, k.Y, tweak0[:], &agg)
 
 	for _, key := range keys[1:] {
 		tweaki := sha256.Sum256(append(tweak, key.SerializeCompressed()...))
-		x, y, z := S256().scalarMultJacobian(key.X, key.Y, tweaki[:])
-		S256().addJacobian(x, y, z, x0, y0, z0, x0, y0, z0)
+		var point secp.JacobianPoint
+		S256().scalarMultJacobian(key.X, key.Y, tweaki[:], &point)
+		secp.AddNonConst(&agg, &point, &agg)
 	}
 
-	x, y := S256().fieldJacobianToBigAffine(x0, y0, z0)
+	x, y := jacobianToBigAffine(&agg)
 
 	return &PublicKey{
 		X:     x,
@@ -265,7 +272,7 @@ func calculateAggregateSignature(aggregateNonce *PublicKey, svals ...*big.Int) *
 }
 
 func sortPubkeys(keys []*PublicKey) {
-	sort.Slice(keys, func(i, j int) bool {
-		return keys[i].X.Cmp(keys[j].X) < 0
+	slices.SortFunc(keys, func(a, b *PublicKey) int {
+		return a.X.Cmp(b.X)
 	})
 }

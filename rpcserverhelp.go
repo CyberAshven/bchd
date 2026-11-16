@@ -29,9 +29,42 @@ var helpDescsEnUS = map[string]string{
 	"debuglevel--result0":    "The string 'Done.'",
 	"debuglevel--result1":    "The list of subsystems",
 
+	// SetBanCmd help.
+	"setban--synopsis": "Attempts to add or remove an IP address or subnet from the banned list, and disconnects the peers a new ban applies to.",
+	"setban-subnet":    "The IP address, or a subnet as an IP address with a netmask, such as 192.168.0.0/24; or an onion address",
+	"setban-command":   "'add' to ban it, 'remove' to lift the ban of exactly it",
+	"setban-bantime":   "How long the ban lasts in seconds, or until when if absolute is set; 0 or less means the time of --banduration",
+	"setban-absolute":  "Whether bantime is a time in seconds since the Unix epoch",
+
+	// ListBcmrIdentitiesCmd help.
+	"listbcmridentities--synopsis": "Returns what the BCMR index knows of the identity of each token, as getbcmridentity does, from the chain alone, a page at a time, " +
+		"in the order of the bytes of their category IDs, the authbases.  Pages can be of different blocks.  Requires --bcmrindex.",
+	"listbcmridentities-after": "The authbase of the last identity of the page before, or empty for the start",
+	"listbcmridentities-limit": "The most identities to return, from 1; more than 1000 counts as 1000",
+
+	// ListBcmrIdentitiesResult help.
+	"listbcmridentitiesresult-identities": "The identities",
+	"listbcmridentitiesresult-more":       "Whether there are more identities after these",
+
+	// ListBannedCmd help.
+	"listbanned--synopsis": "Returns the bans in force, those of setban and those of ban scores, as an array of json objects.",
+
+	// ListBannedResult help.
+	"listbannedresult-address":        "The IP address or subnet of the ban, or the onion address",
+	"listbannedresult-ban_created":    "When the ban was created, in seconds since the Unix epoch",
+	"listbannedresult-banned_until":   "When the ban ends, in seconds since the Unix epoch",
+	"listbannedresult-ban_reason":     "'manually added' for a ban of setban, 'node misbehaving' for one of a ban score",
+	"listbannedresult-ban_duration":   "How long the ban lasts in seconds",
+	"listbannedresult-time_remaining": "The seconds until the ban ends",
+
+	// ClearBannedCmd help.
+	"clearbanned--synopsis": "Lifts every ban of the chosen kinds.",
+	"clearbanned-manual":    "Whether to lift the bans of setban",
+	"clearbanned-automatic": "Whether to lift the bans of ban scores",
+
 	// AddNodeCmd help.
 	"addnode--synopsis": "Attempts to add or remove a persistent peer.",
-	"addnode-addr":      "IP address and port of the peer to operate on",
+	"addnode-addr":      "IP address, host name or Tor v3 onion address and port of the peer to operate on",
 	"addnode-subcmd":    "'add' to add a persistent peer, 'remove' to remove a persistent peer, or 'onetry' to try a single connection to a peer",
 
 	// NodeCmd help.
@@ -41,24 +74,25 @@ var helpDescsEnUS = map[string]string{
 	"node-connectsubcmd": "'perm' to make the connected peer a permanent one, 'temp' to try a single connect to a peer",
 
 	// TransactionInput help.
-	"transactioninput-txid": "The hash of the input transaction",
-	"transactioninput-vout": "The specific output of the input transaction to redeem",
+	"transactioninput-txid":     "The hash of the input transaction",
+	"transactioninput-vout":     "The specific output of the input transaction to redeem",
+	"transactioninput-sequence": "Optional sequence number of the input; 4294967295 when omitted, or 4294967294 with a non-zero locktime",
 
 	// CreateRawTransactionCmd help.
-	"createrawtransaction--synopsis": "Returns a new transaction spending the provided inputs and sending to the provided addresses.\n" +
+	"createrawtransaction--synopsis": "Returns a new version 2 transaction spending the provided inputs and sending to the provided addresses, with the outputs in the order given.\n" +
 		"The transaction inputs are not signed in the created transaction.\n" +
 		"The signrawtransaction RPC command provided by wallet must be used to sign the resulting transaction.",
 	"createrawtransaction-inputs":           "The inputs to the transaction",
-	"createrawtransaction-amounts":          "JSON object with the destination addresses as keys and amounts as values",
+	"createrawtransaction-amounts":          "JSON object with the destination addresses as keys and amounts as values, or, as in BCHN, an array of objects with one such member each; a value may also be an object with the amount and the output's tokenData, {\"category\":\"hex\",\"amount\":n,\"nft\":{\"capability\":\"none|mutable|minting\",\"commitment\":\"hex\"}}, and a \"data\" key with the hex of a push, or an array of them, adds a null data output with those pushes; a destination may appear only once, even in a different form, such as the plain and token-aware cashaddr of the same hash",
 	"createrawtransaction-amounts--key":     "address",
 	"createrawtransaction-amounts--value":   "n.nnn",
 	"createrawtransaction-amounts--desc":    "The destination address as the key and the amount in BTC as the value",
-	"createrawtransaction-cashtokens":       "JSON object containing the cashtokens data of the transaction outputs",
-	"transactionoutputcashtoken-address":    "address",
-	"transactionoutputcashtoken-category":   "Hex-encoded bytes of token category",
-	"transactionoutputcashtoken-amount":     "n",
-	"transactionoutputcashtoken-capability": "none, mutable, minting",
-	"transactionoutputcashtoken-commitment": "Hex-encoded bytes of commitment",
+	"createrawtransaction-cashtokens":       "Optional list of CashTokens to add to the outputs, at most one entry per output address; as in BCHN, a number given here, as the last param, is the locktime",
+	"transactionoutputcashtoken-address":    "The output address, which must pay to the same destination as a key of the amounts object, in any form, cashaddr or legacy",
+	"transactionoutputcashtoken-category":   "The token category, in the byte order used to display transaction hashes, like a txid",
+	"transactionoutputcashtoken-amount":     "The fungible token amount, as an integer or a decimal string; 0 or omitted for no fungible tokens",
+	"transactionoutputcashtoken-capability": "The NFT capability: none, mutable or minting; omit for no NFT",
+	"transactionoutputcashtoken-commitment": "Optional hex-encoded NFT commitment of up to 128 bytes; requires a capability",
 	"createrawtransaction-locktime":         "Locktime value; a non-zero value will also locktime-activate the inputs",
 	"createrawtransaction--result0":         "Hex-encoded bytes of the serialized transaction",
 
@@ -69,6 +103,7 @@ var helpDescsEnUS = map[string]string{
 	// PrevOut help.
 	"prevout-addresses": "previous output addresses",
 	"prevout-value":     "previous output value",
+	"prevout-tokenData": "previous output CashTokens data as a JSON object (only if the output carries a token)",
 
 	// VinPrevOut help.
 	"vinprevout-coinbase":    "The hex-encoded bytes of the signature script (coinbase txns only)",
@@ -85,7 +120,21 @@ var helpDescsEnUS = map[string]string{
 	"vin-vout":        "The index of the output being redeemed from the origin transaction (non-coinbase txns only)",
 	"vin-scriptSig":   "The signature script used to redeem the origin transaction as a JSON object (non-coinbase txns only)",
 	"vin-txinwitness": "The witness used to redeem the input encoded as a string array of its items",
+	"vin-prevout":     "The output spent by this input as a JSON object (non-coinbase txns only, only when getblock verbosity>=3)",
 	"vin-sequence":    "The script sequence number",
+
+	// GetBlockPrevOutResult help.
+	"getblockprevoutresult-generated":    "Whether the spent output was created by a coinbase transaction",
+	"getblockprevoutresult-height":       "The height of the block that contains the spent output",
+	"getblockprevoutresult-value":        "The value of the spent output in BCH",
+	"getblockprevoutresult-scriptPubKey": "The public key script of the spent output as a JSON object",
+	"getblockprevoutresult-tokenData":    "The CashTokens data of the spent output as a JSON object (only if the output carries a token)",
+
+	// PrevOutScriptPubKeyResult help.
+	"prevoutscriptpubkeyresult-asm":     "Disassembly of the script",
+	"prevoutscriptpubkeyresult-hex":     "Hex-encoded bytes of the script",
+	"prevoutscriptpubkeyresult-type":    "The type of the script (e.g. 'pubkeyhash')",
+	"prevoutscriptpubkeyresult-address": "The address the script pays to (only if it pays to a single address)",
 
 	// ScriptPubKeyResult help.
 	"scriptpubkeyresult-asm":       "Disassembly of the script",
@@ -94,10 +143,20 @@ var helpDescsEnUS = map[string]string{
 	"scriptpubkeyresult-type":      "The type of the script (e.g. 'pubkeyhash')",
 	"scriptpubkeyresult-addresses": "The bitcoin addresses associated with this script",
 
+	// TokenDataResult help.
+	"tokendataresult-category": "The token category ID, hex-encoded in the same byte order as a transaction hash",
+	"tokendataresult-amount":   "The fungible token amount as a decimal string, \"0\" if the output only carries a non-fungible token",
+	"tokendataresult-nft":      "The non-fungible token as a JSON object (only if the output carries one)",
+
+	// NFTResult help.
+	"nftresult-capability": "The capability of the non-fungible token: none, mutable or minting",
+	"nftresult-commitment": "Hex-encoded bytes of the non-fungible token commitment",
+
 	// Vout help.
 	"vout-value":        "The amount in BTC",
 	"vout-n":            "The index of this transaction output",
 	"vout-scriptPubKey": "The public key script used to pay coins as a JSON object",
+	"vout-tokenData":    "The CashTokens data as a JSON object (only if the output carries a token)",
 
 	// TxRawDecodeResult help.
 	"txrawdecoderesult-txid":     "The hash of the transaction",
@@ -116,6 +175,7 @@ var helpDescsEnUS = map[string]string{
 	"decodescriptresult-type":      "The type of the script (e.g. 'pubkeyhash')",
 	"decodescriptresult-addresses": "The bitcoin addresses associated with this script",
 	"decodescriptresult-p2sh":      "The script hash for use in pay-to-script-hash transactions (only present if the provided redeem script is not already a pay-to-script-hash script)",
+	"decodescriptresult-p2sh_32":   "The pay-to-script-hash32 address of the script, which pays to its 32-byte hash (only present if the provided redeem script is not already a pay-to-script-hash script)",
 
 	// DecodeScriptCmd help.
 	"decodescript--synopsis": "Returns a JSON object with information about the provided hex-encoded script.",
@@ -153,6 +213,61 @@ var helpDescsEnUS = map[string]string{
 	"getaddednodeinfo--condition1": "dns=true",
 	"getaddednodeinfo--result0":    "List of added peers",
 
+	// GetBcmrIdentityCmd help.
+	"getbcmridentity--synopsis": "Returns what the BCMR index knows of an identity, as CHIP-BCMR defines it, " +
+		"a token's or that of any transaction of an authchain the index tracks, " +
+		"with the links of its authchain in the mempool: the authhead, the BCMR publication to read and a token's genesis supply, " +
+		"and on request the authchain itself with a merkle proof. The index tracks every token's authchain and, " +
+		"from where it begins, every authchain that holds a publication, unless more than 100,000 transactions it doesn't " +
+		"otherwise track are behind the publication; it finds the transactions behind a publication in the background, " +
+		"once the publication's block is connected. Requires --bcmrindex.",
+	"getbcmridentity-authbase":         "The identity's authbase: a token's category ID, or any transaction of an authchain the index tracks",
+	"getbcmridentity-includeauthchain": "Also return the authchain's transactions, from the authbase, or from the link after the one given in after",
+	"getbcmridentity-after":            "The txid of a link of the authchain, which the client knows the authchain up to, to return the links after it, or empty for the start, with includeauthchain; a link a reorganization took off the authchain is an error",
+	"getbcmridentity-limit":            "The most links to return, from 1, with includeauthchain; more than 1000 counts as 1000, and an answer also holds no more after the link that takes its transactions to 1 MB",
+
+	// GetBcmrIdentityResult help.
+	"getbcmridentityresult-authbase":             "The identity's authbase",
+	"getbcmridentityresult-status":               "active, or burned if the authhead spent the identity output to a data-carrier output",
+	"getbcmridentityresult-head":                 "The authhead, the newest link of the authchain, confirmed or in the mempool",
+	"getbcmridentityresult-publication":          "The BCMR publication to read: the authhead's if it has a well-formed one, or else the newest earlier link's (only if a link has one)",
+	"getbcmridentityresult-genesissupply":        "The number of fungible tokens the token's genesis created, as a decimal string (only for a token's identity)",
+	"getbcmridentityresult-identityoutput":       "The CashTokens data of the authhead's identity output, output 0, as it is (only if it carries a token)",
+	"getbcmridentityresult-authchain":            "The authchain's transactions, keyed by their index from the authbase as 0, in the shape of CHIP-BCMR's authchain extension (only with includeauthchain)",
+	"getbcmridentityresult-authchain--key":       "index",
+	"getbcmridentityresult-authchain--value":     "transaction",
+	"getbcmridentityresult-authchain--desc":      "The link's hex-encoded transaction",
+	"getbcmridentityresult-authchaininfo":        "The height, block and publication of each link in authchain, keyed the same way (only with includeauthchain)",
+	"getbcmridentityresult-authchaininfo--key":   "index",
+	"getbcmridentityresult-authchaininfo--value": "link",
+	"getbcmridentityresult-authchaininfo--desc":  "The link",
+	"getbcmridentityresult-more":                 "Whether later links didn't fit in the answer, to ask for with after set to the last one (only with includeauthchain)",
+	"getbcmridentityresult-proof":                "A merkle proof of the newest confirmed link, which proves the earlier links too, since each spends the one before (only when the answer's links reach the authhead and a link is confirmed)",
+
+	// BcmrLinkResult help.
+	"bcmrlinkresult-txid":        "The link's txid",
+	"bcmrlinkresult-height":      "The height of the link's block, or 0 while it is in the mempool",
+	"bcmrlinkresult-blockhash":   "The hash of the link's block (only if it is confirmed)",
+	"bcmrlinkresult-publication": "The link's BCMR publication output (only if it has one)",
+
+	// BcmrPublicationOutputResult help.
+	"bcmrpublicationoutputresult-output":    "The index of the publication output",
+	"bcmrpublicationoutputresult-malformed": "Whether the output starts with the publication prefix but is malformed, and has no hash or URIs here",
+	"bcmrpublicationoutputresult-hash":      "The SHA-256 of the registry, hex-encoded in the byte order it was pushed in, which SHA-256 tools print",
+	"bcmrpublicationoutputresult-uris":      "The URIs pushed after the hash, as they are, which may be none (only if well-formed)",
+
+	// BcmrPublicationResult help.
+	"bcmrpublicationresult-txid":    "The txid of the link with the publication",
+	"bcmrpublicationresult-height":  "The height of its block, or 0 while it is in the mempool",
+	"bcmrpublicationresult-output":  "The index of the publication output",
+	"bcmrpublicationresult-hash":    "The SHA-256 of the registry, hex-encoded in the byte order it was pushed in, which SHA-256 tools print",
+	"bcmrpublicationresult-uris":    "The URIs pushed after the hash, as they are",
+	"bcmrpublicationresult-current": "Whether it is the authhead's publication; if not, it is the newest earlier one, which may be out of date",
+
+	// BcmrProofResult help.
+	"bcmrproofresult-index":       "The index of the proven link in the authchain",
+	"bcmrproofresult-merkleblock": "The proof, hex-encoded as gettxoutproof encodes one, which verifytxoutproof checks",
+
 	// GetBestBlockResult help.
 	"getbestblockresult-hash":   "Hex-encoded bytes of the best block hash",
 	"getbestblockresult-height": "Height of the best block",
@@ -168,13 +283,13 @@ var helpDescsEnUS = map[string]string{
 	// GetBlockCmd help.
 	"getblock--synopsis":   "Returns information about a block given its hash.",
 	"getblock-hash":        "The hash of the block",
-	"getblock-verbosity":   "Specifies whether the block data should be returned as a hex-encoded string (0), as parsed data with a slice of TXIDs (1), or as parsed data with parsed transaction data (2) ",
+	"getblock-verbosity":   "Specifies whether the block data should be returned as a hex-encoded string (0), as parsed data with a slice of TXIDs (1), as parsed data with parsed transaction data and the fee of each transaction (2), or as parsed data with parsed transaction data that also includes the output spent by each input (3); a higher verbosity is treated as 3",
 	"getblock--condition0": "verbosity=0",
-	"getblock--condition1": "verbosity=1",
-	"getblock--condition2": "verbosity=2",
+	"getblock--condition1": "verbosity=1 or verbosity=2",
+	"getblock--condition2": "verbosity>=3",
 	"getblock--result0":    "Hex-encoded bytes of the serialized block",
 	"getblock--result1":    "JSON object with information about the block",
-	"getblock--result2":    "JSON object with information about the block and each transaction",
+	"getblock--result2":    "JSON object with information about the block and each transaction, including the output spent by each input and the fee",
 
 	// GetBlockChainInfoCmd help.
 	"getblockchaininfo--synopsis": "Returns information about the current blockchain state and the status of any active soft-fork deployments.",
@@ -187,6 +302,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockchaininforesult-difficulty":            "The current chain difficulty",
 	"getblockchaininforesult-mediantime":            "The median time from the PoV of the best block in the chain",
 	"getblockchaininforesult-verificationprogress":  "An estimate for how much of the best chain we've verified",
+	"getblockchaininforesult-initialblockdownload":  "Whether the node is still in its initial block download: true until the best chain is current for the first time (after the latest checkpoint, with the minimum chain work, and a tip less than 24 hours old), then false",
 	"getblockchaininforesult-syncheight":            "The block height obtained from the best peer",
 	"getblockchaininforesult-pruned":                "A bool that indicates if the node is pruned or not",
 	"getblockchaininforesult-pruneheight":           "The lowest block retained in the current pruned chain",
@@ -210,6 +326,7 @@ var helpDescsEnUS = map[string]string{
 	"txrawresult-locktime":      "The transaction lock time",
 	"txrawresult-vin":           "The transaction inputs as JSON objects",
 	"txrawresult-vout":          "The transaction outputs as JSON objects",
+	"txrawresult-fee":           "The transaction fee in BCH (non-coinbase txns only, only when getblock verbosity>=2)",
 	"txrawresult-blockhash":     "Hash of the block the transaction is part of",
 	"txrawresult-confirmations": "Number of confirmations of the block",
 	"txrawresult-time":          "Transaction time in seconds since 1 Jan 1970 GMT",
@@ -249,7 +366,24 @@ var helpDescsEnUS = map[string]string{
 	"getblockverboseresult-difficulty":        "The proof-of-work difficulty as a multiple of the minimum difficulty",
 	"getblockverboseresult-previousblockhash": "The hash of the previous block",
 	"getblockverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
-	"getblockverboseresult-strippedsize":      "The size of the block without witness data",
+	"getblockverboseresult-strippedsize":      "Always 0, as Bitcoin Cash blocks have no witness data",
+
+	// GetBlockVerboseTxResult help.
+	"getblockverbosetxresult-hash":              "The hash of the block (same as provided)",
+	"getblockverbosetxresult-confirmations":     "The number of confirmations",
+	"getblockverbosetxresult-strippedsize":      "Always 0, as Bitcoin Cash blocks have no witness data",
+	"getblockverbosetxresult-size":              "The size of the block",
+	"getblockverbosetxresult-height":            "The height of the block in the block chain",
+	"getblockverbosetxresult-version":           "The block version",
+	"getblockverbosetxresult-versionHex":        "The block version in hexadecimal",
+	"getblockverbosetxresult-merkleroot":        "Root hash of the merkle tree",
+	"getblockverbosetxresult-tx":                "The transactions as JSON objects, with the output spent by each input and the fee of each transaction",
+	"getblockverbosetxresult-time":              "The block time in seconds since 1 Jan 1970 GMT",
+	"getblockverbosetxresult-nonce":             "The block nonce",
+	"getblockverbosetxresult-bits":              "The bits which represent the block difficulty",
+	"getblockverbosetxresult-difficulty":        "The proof-of-work difficulty as a multiple of the minimum difficulty",
+	"getblockverbosetxresult-previousblockhash": "The hash of the previous block",
+	"getblockverbosetxresult-nextblockhash":     "The hash of the next block (only if there is one)",
 
 	// GetBlockCountCmd help.
 	"getblockcount--synopsis": "Returns the number of blocks in the longest block chain.",
@@ -295,10 +429,11 @@ var helpDescsEnUS = map[string]string{
 
 	// GetBlockTemplateResultTx help.
 	"getblocktemplateresulttx-data":      "Hex-encoded transaction data (byte-for-byte)",
+	"getblocktemplateresulttx-txid":      "The transaction id, the same as hash, as in BCHN",
 	"getblocktemplateresulttx-hash":      "Hex-encoded transaction hash (little endian if treated as a 256-bit number)",
-	"getblocktemplateresulttx-depends":   "Other transactions before this one (by 1-based index in the 'transactions'  list) that must be present in the final block if this one is",
+	"getblocktemplateresulttx-depends":   "Other transactions (by 1-based index in the 'transactions' list) that must be present in the final block if this one is",
 	"getblocktemplateresulttx-fee":       "Difference in value between transaction inputs and outputs (in Satoshi)",
-	"getblocktemplateresulttx-sigops":    "Total number of signature operations as counted for purposes of block limits",
+	"getblocktemplateresulttx-sigops":    "The number of signature checks, the same as sigchecks, under the name BCHN keeps",
 	"getblocktemplateresulttx-sigchecks": "Total number of signature checks as counted for purposes of block limits",
 	"getblocktemplateresulttx-size":      "The size of the transaction",
 
@@ -310,7 +445,7 @@ var helpDescsEnUS = map[string]string{
 	"getblocktemplateresult-curtime":                    "Current time as seen by the server (recommended for block time); must fall within mintime/maxtime rules",
 	"getblocktemplateresult-height":                     "Height of the block to be solved",
 	"getblocktemplateresult-previousblockhash":          "Hex-encoded big-endian hash of the previous block",
-	"getblocktemplateresult-sigoplimit":                 "Number of sigops allowed in blocks ",
+	"getblocktemplateresult-sigoplimit":                 "The maximum number of signature checks allowed by the consensus rules, the same as sigchecklimit, under the name BCHN keeps",
 	"getblocktemplateresult-sizelimit":                  "Number of bytes allowed in blocks",
 	"getblocktemplateresult-transactions":               "Array of transactions as JSON objects",
 	"getblocktemplateresult-version":                    "The block version",
@@ -366,6 +501,56 @@ var helpDescsEnUS = map[string]string{
 	"getdifficulty--synopsis": "Returns the proof-of-work difficulty as a multiple of the minimum difficulty.",
 	"getdifficulty--result0":  "The difficulty",
 
+	// GetDSProofCmd help.
+	"getdsproof--synopsis": "Returns a double spend proof, looked up by its id, by the transaction it is for (or one of its unconfirmed descendants), or by the double spent output.\n" +
+		"Returns null when no proof is found.",
+	"getdsproof-query":     "The proof id, a transaction id, or an outpoint object with the keys txid (string) and vout (numeric)",
+	"getdsproof-verbosity": "0 or 1 returns the serialized proof and the txid, 2 (or true) returns the id, txid and outpoint, 3 adds the two spenders",
+	"getdsproof-recursive": "When looking up by txid, also search the transaction's unconfirmed ancestors, depth first; a search past 1000 of them fails",
+	"getdsproof--result0":  "The proof",
+
+	// GetDSProofListCmd help.
+	"getdsprooflist--synopsis":      "Lists the double spend proofs for memory pool transactions.",
+	"getdsprooflist-verbosity":      "0 (or false) returns the proof ids, 1 to 3 return objects as getdsproof does",
+	"getdsprooflist-includeorphans": "Also list the proofs whose transaction is not in the memory pool",
+	"getdsprooflist--condition0":    "verbosity=0",
+	"getdsprooflist--condition1":    "verbosity>0",
+	"getdsprooflist--result0":       "The proof ids",
+
+	// GetDSProofScoreCmd help.
+	"getdsproofscore--synopsis": "Returns how far a memory pool transaction can be trusted not to be double spent.\n" +
+		"1.0 means neither it nor an unconfirmed ancestor has a double spend proof and one is possible for all of them.\n" +
+		"0.0 means one of them has a proof, or one of them spends an output a proof is not possible for (not pay-to-pubkey-hash).\n" +
+		"0.25 means an input of one of them does not sign all inputs and outputs, or there are too many unconfirmed ancestors to check.",
+	"getdsproofscore-txid":     "The hash of the memory pool transaction",
+	"getdsproofscore--result0": "The score",
+
+	// GetDSProofResult help.
+	"getdsproofresult-hex":         "The serialized proof (verbosity 0 and 1)",
+	"getdsproofresult-dspid":       "The proof id (verbosity 2 and 3)",
+	"getdsproofresult-txid":        "The memory pool transaction spending the double spent output, or null for an orphan proof",
+	"getdsproofresult-outpoint":    "The double spent output (verbosity 2 and 3)",
+	"getdsproofresult-path":        "When looking up by txid with recursive set, the transactions from the one looked up to the one with the proof",
+	"getdsproofresult-descendants": "The transaction with the proof and its memory pool descendants, at most the 1000 nearest (getdsproof at verbosity 1 and above only)",
+	"getdsproofresult-spenders":    "The two spenders (verbosity 3)",
+
+	// DSProofOutPoint help.
+	"dsproofoutpoint-txid": "The hash of the transaction",
+	"dsproofoutpoint-vout": "The index of the output",
+
+	// DSProofSpender help.
+	"dsproofspender-txversion":       "The transaction version",
+	"dsproofspender-sequence":        "The input sequence number",
+	"dsproofspender-locktime":        "The transaction lock time",
+	"dsproofspender-hashprevoutputs": "The hash of the outpoints spent by the transaction",
+	"dsproofspender-hashsequence":    "The hash of the input sequence numbers",
+	"dsproofspender-hashoutputs":     "The hash of the outputs",
+	"dsproofspender-pushdata":        "The data the input pushed",
+
+	// DSProofPushData help.
+	"dsproofpushdata-asm": "Disassembly of the pushes",
+	"dsproofpushdata-hex": "Hex-encoded pushes",
+
 	// GetGenerateCmd help.
 	"getgenerate--synopsis": "Returns if the server is set to generate coins (mine) or not.",
 	"getgenerate--result0":  "True if mining, false if not",
@@ -382,8 +567,8 @@ var helpDescsEnUS = map[string]string{
 	"infochainresult-connections":     "The number of connected peers",
 	"infochainresult-proxy":           "The proxy used by the server",
 	"infochainresult-difficulty":      "The current target difficulty",
-	"infochainresult-testnet":         "Whether or not server is using testnet",
-	"infochainresult-relayfee":        "The minimum relay fee for non-free transactions in BTC/KB",
+	"infochainresult-testnet":         "Whether or not server is on a public test network (testnet3, testnet4 or chipnet)",
+	"infochainresult-relayfee":        "The minimum relay fee for transactions in BTC/KB",
 	"infochainresult-errors":          "Any current errors",
 
 	// InfoWalletResult help.
@@ -401,7 +586,7 @@ var helpDescsEnUS = map[string]string{
 	"infowalletresult-keypoolsize":     "The number of new keys that are pre-generated",
 	"infowalletresult-unlocked_until":  "The timestamp in seconds since 1 Jan 1970 GMT that the wallet is unlocked for transfers, or 0 if the wallet is locked",
 	"infowalletresult-paytxfee":        "The transaction fee set in BTC/KB",
-	"infowalletresult-relayfee":        "The minimum relay fee for non-free transactions in BTC/KB",
+	"infowalletresult-relayfee":        "The minimum relay fee for transactions in BTC/KB",
 	"infowalletresult-errors":          "Any current errors",
 
 	// GetHeadersCmd help.
@@ -431,7 +616,7 @@ var helpDescsEnUS = map[string]string{
 	"getmininginforesult-hashespersec":     "Recent hashes per second performance measurement while generating coins",
 	"getmininginforesult-networkhashps":    "Estimated network hashes per second for the most recent blocks",
 	"getmininginforesult-pooledtx":         "Number of transactions in the memory pool",
-	"getmininginforesult-testnet":          "Whether or not server is using testnet",
+	"getmininginforesult-testnet":          "Whether or not server is on a public test network (testnet3, testnet4 or chipnet)",
 
 	// GetMiningInfoCmd help.
 	"getmininginfo--synopsis": "Returns a JSON object containing mining-related information.",
@@ -443,10 +628,7 @@ var helpDescsEnUS = map[string]string{
 	"getnetworkhashps--result0":  "Estimated hashes per second",
 
 	// GetNetworkInfo help.
-	"getnetworkinfo--synopsis":       "Returns an object containing various state info regarding P2P networking.",
-	"getnetworkinfo--result0--desc":  "GetNetworkInfo object",
-	"getnetworkinfo--result0--key":   "Field name",
-	"getnetworkinfo--result0--value": "Object containing the network info",
+	"getnetworkinfo--synopsis": "Returns an object containing various state info regarding P2P networking.",
 
 	// GetNetworkInfoResult help.
 	"getnetworkinforesult-version":         "The server version",
@@ -462,6 +644,18 @@ var helpDescsEnUS = map[string]string{
 	"getnetworkinforesult-incrementalfee":  "Minimum fee increment for mempool limiting or BIP 125 replacement in BTC/kB",
 	"getnetworkinforesult-localaddresses":  "List of local addresses",
 	"getnetworkinforesult-warnings":        "Any network and blockchain warnings",
+
+	// NetworksResult help.
+	"networksresult-name":                        "The network (ipv4, ipv6 or onion)",
+	"networksresult-limited":                     "Always false, as bchd has no option like BCHN's -onlynet to limit the networks",
+	"networksresult-reachable":                   "Whether the network is reachable",
+	"networksresult-proxy":                       "The proxy used for this network, or empty if none",
+	"networksresult-proxy_randomize_credentials": "Whether randomized credentials are used",
+
+	// LocalAddressesResult help.
+	"localaddressesresult-address": "The network address",
+	"localaddressesresult-port":    "The network port",
+	"localaddressesresult-score":   "The relative score",
 
 	// GetNetTotalsCmd help.
 	"getnettotals--synopsis": "Returns a JSON object containing network traffic statistics.",
@@ -504,16 +698,16 @@ var helpDescsEnUS = map[string]string{
 	"getrawmempoolverboseresult-fee":              "Transaction fee in bitcoins",
 	"getrawmempoolverboseresult-time":             "Local time transaction entered pool in seconds since 1 Jan 1970 GMT",
 	"getrawmempoolverboseresult-height":           "Block height when transaction entered the pool",
-	"getrawmempoolverboseresult-startingpriority": "Priority when transaction entered the pool",
-	"getrawmempoolverboseresult-currentpriority":  "Current priority",
+	"getrawmempoolverboseresult-startingpriority": "Deprecated, always 0",
+	"getrawmempoolverboseresult-currentpriority":  "Deprecated, always 0",
 	"getrawmempoolverboseresult-depends":          "Unconfirmed transactions used as inputs for this transaction",
 	"getrawmempoolverboseresult-vsize":            "The virtual size of a transaction",
 
 	// GetRawMempoolCmd help.
 	"getrawmempool--synopsis":   "Returns information about all of the transactions currently in the memory pool.",
-	"getrawmempool-verbose":     "Returns JSON object when true or an array of transaction hashes when false",
+	"getrawmempool-verbose":     "Returns a JSON object with an entry for each transaction hash when true or an array of transaction hashes when false",
 	"getrawmempool--condition0": "verbose=false",
-	"getrawmempool--condition1": "verbose=true",
+	"getrawmempool--condition1": "verbose=true, the entry for each transaction hash",
 	"getrawmempool--result0":    "Array of transaction hashes",
 
 	// GetRawTransactionCmd help.
@@ -525,23 +719,24 @@ var helpDescsEnUS = map[string]string{
 	"getrawtransaction--result0":    "Hex-encoded bytes of the serialized transaction",
 
 	// GetTxOutResult help.
-	"gettxoutresult-bestblock":     "The block hash that contains the transaction output",
+	"gettxoutresult-bestblock":     "The hash of the best block",
 	"gettxoutresult-confirmations": "The number of confirmations",
 	"gettxoutresult-value":         "The transaction amount in BTC",
 	"gettxoutresult-scriptPubKey":  "The public key script used to pay coins as a JSON object",
+	"gettxoutresult-tokenData":     "The CashTokens data as a JSON object (only if the output carries a token)",
 	"gettxoutresult-version":       "The transaction version",
 	"gettxoutresult-coinbase":      "Whether or not the transaction is a coinbase",
 
 	// GetTxOutCmd help.
-	"gettxout--synopsis":      "Returns information about an unspent transaction output..",
+	"gettxout--synopsis":      "Returns information about an unspent transaction output.",
 	"gettxout-txid":           "The hash of the transaction",
 	"gettxout-vout":           "The index of the output",
-	"gettxout-includemempool": "Include the mempool when true",
+	"gettxout-includemempool": "Include the mempool when true, so that the outputs of its transactions are found and the outputs they spend are not",
 
 	// GetTxOutProofCmd help.
 	"gettxoutproof--synopsis": "Returns hex encoded merkle proof for a given transaction set",
 	"gettxoutproof-txids":     "A list of transaction hashes to generate proof for",
-	"gettxoutproof-blockhash": "The block hash the transactions are in",
+	"gettxoutproof-blockhash": "The block hash the transactions are in; without it the block is found with the transaction index, or else from an unspent output of the first transaction",
 	"gettxoutproof--result0":  "Hex encoded merkle proof",
 
 	// VerifyTxOutProofCmd help.
@@ -572,21 +767,51 @@ var helpDescsEnUS = map[string]string{
 	"searchrawtransactions--condition0": "verbose=0",
 	"searchrawtransactions--condition1": "verbose=1",
 	"searchrawtransactions-skip":        "The number of leading transactions to leave out of the final response",
-	"searchrawtransactions-count":       "The maximum number of transactions to return",
+	"searchrawtransactions-count":       "The maximum number of transactions to return (at most 10000)",
 	"searchrawtransactions-vinextra":    "Specify that extra data from previous output will be returned in vin",
 	"searchrawtransactions-reverse":     "Specifies that the transactions should be returned in reverse chronological order",
 	"searchrawtransactions-filteraddrs": "Address list.  Only inputs or outputs with matching address will be returned",
 	"searchrawtransactions--result0":    "Hex-encoded serialized transaction",
 
 	// SendRawTransactionCmd help.
-	"sendrawtransaction--synopsis":     "Submits the serialized, hex-encoded transaction to the local peer and relays it to the network.",
+	"sendrawtransaction--synopsis": "Submits the serialized, hex-encoded transaction to the local peer and relays it to the network.\n" +
+		"A transaction already in the mempool is relayed again.\n" +
+		"A rejected transaction fails with code -26 and, as in BCHN, the reason, the description and the reject code.",
 	"sendrawtransaction-hextx":         "Serialized, hex-encoded signed transaction",
-	"sendrawtransaction-allowhighfees": "Whether or not to allow insanely high fees (bchd does not yet implement this parameter, so it has no effect)",
+	"sendrawtransaction-allowhighfees": "Allow a fee above the --maxtxfee option",
 	"sendrawtransaction--result0":      "The hash of the transaction",
+
+	// TestMempoolAcceptCmd help.
+	"testmempoolaccept--synopsis":     "Returns whether the raw transaction would be accepted by the mempool, without adding it.",
+	"testmempoolaccept-rawtxs":        "An array with exactly one serialized, hex-encoded transaction",
+	"testmempoolaccept-allowhighfees": "Allow a fee above the --maxtxfee option",
+
+	// TestMempoolAcceptResult help.
+	"testmempoolacceptresult-txid":           "The hash of the transaction",
+	"testmempoolacceptresult-allowed":        "Whether the mempool would accept the transaction",
+	"testmempoolacceptresult-size":           "The serialized size of the transaction in bytes (only present when allowed)",
+	"testmempoolacceptresult-vsize":          "The size used for fee calculations, which is larger than the size for transactions with many signature checks (only present when allowed)",
+	"testmempoolacceptresult-fees":           "The fees of the transaction (only present when allowed)",
+	"testmempoolacceptresult-reject-reason":  "The reject code and BCHN's short reason, such as 18: txn-mempool-conflict, or missing-inputs (only present when not allowed)",
+	"testmempoolacceptresult-reject-details": "The reason followed by the description (only present when not allowed, except for missing inputs)",
+
+	// TestMempoolAcceptFees help.
+	"testmempoolacceptfees-base":              "The fee of the transaction in BCH",
+	"testmempoolacceptfees-effective-feerate": "The fee rate in BCH per kB of virtual size",
 
 	// ReconsiderBlockCmd
 	"reconsiderblock--synopsis": "Reconsider a block for validation.",
 	"reconsiderblock-blockhash": "Hash of the block you want to reconsider",
+
+	// FinalizeBlockCmd
+	"finalizeblock--synopsis": "Treats a block as final, so that the chain can't be reorganized below it.\n" +
+		"When the block is not in the main chain, the main chain is disconnected down to the fork point and the block's chain is connected.\n" +
+		"Used on a chain with less work, this takes the node out of consensus.",
+	"finalizeblock-blockhash": "Hash of the block to finalize",
+
+	// GetFinalizedBlockHashCmd
+	"getfinalizedblockhash--synopsis": "Returns the hash of the finalized block, below which the chain can't be reorganized, or an empty string if no block is finalized.",
+	"getfinalizedblockhash--result0":  "The hex-encoded block hash, or an empty string",
 
 	// InvalidateBlockCmd
 	"invalidateblock--synopsis": "Invalidate a block.",
@@ -609,12 +834,15 @@ var helpDescsEnUS = map[string]string{
 	"submitblock-hexblock":    "Serialized, hex-encoded block",
 	"submitblock-options":     "This parameter is currently ignored",
 	"submitblock--condition0": "Block successfully submitted",
-	"submitblock--condition1": "Block rejected",
-	"submitblock--result1":    "The reason the block was rejected",
+	"submitblock--condition1": "Block not accepted",
+	"submitblock--result1":    "The BIP22 reason the block was not accepted, such as duplicate, inconclusive for a valid block that is not on the main chain, or the reason it is invalid",
 
 	// ValidateAddressResult help.
-	"validateaddresschainresult-isvalid": "Whether or not the address is valid",
-	"validateaddresschainresult-address": "The bitcoin address (only when isvalid is true)",
+	"validateaddresschainresult-isvalid":      "Whether or not the address is valid",
+	"validateaddresschainresult-address":      "The address validated, as a cashaddr, in its token-aware form for a token-aware cashaddr; a legacy address is shown as the cashaddr of the same destination, as in BCHN, and a public key as the cashaddr of its key hash (only when isvalid is true)",
+	"validateaddresschainresult-scriptPubKey": "The hex-encoded script the address pays to (only when isvalid is true)",
+	"validateaddresschainresult-isscript":     "Whether the address pays to a script (only when isvalid is true)",
+	"validateaddresschainresult-istokenaware": "Whether the address is a token-aware cashaddr, which signals that it can receive CashTokens (only when isvalid is true)",
 
 	// ValidateAddressCmd help.
 	"validateaddress--synopsis": "Verify an address is valid.",
@@ -632,7 +860,7 @@ var helpDescsEnUS = map[string]string{
 
 	// VerifyMessageCmd help.
 	"verifymessage--synopsis": "Verify a signed message.",
-	"verifymessage-address":   "The bitcoin address to use for the signature",
+	"verifymessage-address":   "The P2PKH address, cashaddr or legacy, to use for the signature",
 	"verifymessage-signature": "The base-64 encoded signature provided by the signer",
 	"verifymessage-message":   "The signed message",
 	"verifymessage--result0":  "Whether or not the signature verified",
@@ -655,6 +883,14 @@ var helpDescsEnUS = map[string]string{
 
 	// StopNotifyNewTransactionsCmd help.
 	"stopnotifynewtransactions--synopsis": "Stop sending either a txaccepted or a txacceptedverbose notification when a new transaction is accepted into the mempool.",
+
+	// NotifyDSProofsCmd help.
+	"notifydsproofs--synopsis": "Send a dsproof notification when a double spend proof becomes associated with a memory pool transaction.\n" +
+		"The proofs already in the memory pool are sent when the client subscribes, not when it calls again while subscribed, so a proof that arrives while subscribing can be sent twice.",
+	"notifydsproofs-verbosity": "0 or 1 sends the serialized proof and the txid, 2 (the default) the id, txid and outpoint, 3 adds the two spenders, as getdsproof does",
+
+	// StopNotifyDSProofsCmd help.
+	"stopnotifydsproofs--synopsis": "Stop sending dsproof notifications.",
 
 	// NotifyReceivedCmd help.
 	"notifyreceived--synopsis": "Send a recvtx notification when a transaction added to mempool or appears in a newly-attached block contains a txout pkScript sending to any of the passed addresses.\n" +
@@ -726,16 +962,22 @@ var helpDescsEnUS = map[string]string{
 // pointer to the type (or nil to indicate no return value).
 var rpcResultTypes = map[string][]interface{}{
 	"addnode":               nil,
+	"clearbanned":           nil,
+	"listbanned":            {(*[]btcjson.ListBannedResult)(nil)},
+	"listbcmridentities":    {(*btcjson.ListBcmrIdentitiesResult)(nil)},
+	"setban":                nil,
 	"createrawtransaction":  {(*string)(nil)},
 	"debuglevel":            {(*string)(nil), (*string)(nil)},
 	"decoderawtransaction":  {(*btcjson.TxRawDecodeResult)(nil)},
 	"decodescript":          {(*btcjson.DecodeScriptResult)(nil)},
 	"estimatefee":           {(*float64)(nil)},
+	"finalizeblock":         nil,
 	"generate":              {(*[]string)(nil)},
 	"getaddednodeinfo":      {(*[]string)(nil), (*[]btcjson.GetAddedNodeInfoResult)(nil)},
+	"getbcmridentity":       {(*btcjson.GetBcmrIdentityResult)(nil)},
 	"getbestblock":          {(*btcjson.GetBestBlockResult)(nil)},
 	"getbestblockhash":      {(*string)(nil)},
-	"getblock":              {(*string)(nil), (*btcjson.GetBlockVerboseResult)(nil)},
+	"getblock":              {(*string)(nil), (*btcjson.GetBlockVerboseResult)(nil), (*btcjson.GetBlockVerboseTxResult)(nil)},
 	"getblockcount":         {(*int64)(nil)},
 	"getblockhash":          {(*string)(nil)},
 	"getblockheader":        {(*string)(nil), (*btcjson.GetBlockHeaderVerboseResult)(nil)},
@@ -746,6 +988,10 @@ var rpcResultTypes = map[string][]interface{}{
 	"getconnectioncount":    {(*int32)(nil)},
 	"getcurrentnet":         {(*uint32)(nil)},
 	"getdifficulty":         {(*float64)(nil)},
+	"getdsproof":            {(*btcjson.GetDSProofResult)(nil)},
+	"getdsprooflist":        {(*[]string)(nil), (*[]btcjson.GetDSProofResult)(nil)},
+	"getdsproofscore":       {(*float64)(nil)},
+	"getfinalizedblockhash": {(*string)(nil)},
 	"getgenerate":           {(*bool)(nil)},
 	"gethashespersec":       {(*float64)(nil)},
 	"getheaders":            {(*[]string)(nil)},
@@ -754,7 +1000,7 @@ var rpcResultTypes = map[string][]interface{}{
 	"getmininginfo":         {(*btcjson.GetMiningInfoResult)(nil)},
 	"getnettotals":          {(*btcjson.GetNetTotalsResult)(nil)},
 	"getnetworkhashps":      {(*float64)(nil)},
-	"getnetworkinfo":        {(*map[string]btcjson.GetNetworkInfoResult)(nil)},
+	"getnetworkinfo":        {(*btcjson.GetNetworkInfoResult)(nil)},
 	"getpeerinfo":           {(*[]btcjson.GetPeerInfoResult)(nil)},
 	"getrawmempool":         {(*[]string)(nil), (*btcjson.GetRawMempoolVerboseResult)(nil)},
 	"getrawtransaction":     {(*string)(nil), (*btcjson.TxRawResult)(nil)},
@@ -770,6 +1016,7 @@ var rpcResultTypes = map[string][]interface{}{
 	"setgenerate":           nil,
 	"stop":                  {(*string)(nil)},
 	"submitblock":           {nil, (*string)(nil)},
+	"testmempoolaccept":     {(*[]btcjson.TestMempoolAcceptResult)(nil)},
 	"uptime":                {(*int64)(nil)},
 	"validateaddress":       {(*btcjson.ValidateAddressChainResult)(nil)},
 	"verifychain":           {(*bool)(nil)},
@@ -783,6 +1030,8 @@ var rpcResultTypes = map[string][]interface{}{
 	"notifyblocks":              nil,
 	"stopnotifyblocks":          nil,
 	"notifynewtransactions":     nil,
+	"notifydsproofs":            nil,
+	"stopnotifydsproofs":        nil,
 	"stopnotifynewtransactions": nil,
 	"notifyreceived":            nil,
 	"stopnotifyreceived":        nil,
