@@ -15,6 +15,7 @@ import (
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchutil"
 )
 
 // TestOpcodeDisabled tests the opcodeDisabled function manually because all
@@ -64,10 +65,10 @@ func TestOpcodeDisasm(t *testing.T) {
 		0x84: "OP_AND", 0x85: "OP_OR", 0x86: "OP_XOR",
 		0x87: "OP_EQUAL", 0x88: "OP_EQUALVERIFY", 0x89: "OP_DEFINE",
 		0x8a: "OP_INVOKE", 0x8b: "OP_1ADD", 0x8c: "OP_1SUB",
-		0x8d: "OP_2MUL", 0x8e: "OP_2DIV", 0x8f: "OP_NEGATE",
+		0x8d: "OP_LSHIFTNUM", 0x8e: "OP_RSHIFTNUM", 0x8f: "OP_NEGATE",
 		0x90: "OP_ABS", 0x91: "OP_NOT", 0x92: "OP_0NOTEQUAL",
 		0x93: "OP_ADD", 0x94: "OP_SUB", 0x95: "OP_MUL", 0x96: "OP_DIV",
-		0x97: "OP_MOD", 0x98: "OP_LSHIFT", 0x99: "OP_RSHIFT",
+		0x97: "OP_MOD", 0x98: "OP_LSHIFTBIN", 0x99: "OP_RSHIFTBIN",
 		0x9a: "OP_BOOLAND", 0x9b: "OP_BOOLOR", 0x9c: "OP_NUMEQUAL",
 		0x9d: "OP_NUMEQUALVERIFY", 0x9e: "OP_NUMNOTEQUAL",
 		0x9f: "OP_LESSTHAN", 0xa0: "OP_GREATERTHAN",
@@ -91,6 +92,7 @@ func TestOpcodeDisasm(t *testing.T) {
 		0xce: "OP_UTXOTOKENCATEGORY", 0xcf: "OP_UTXOTOKENCOMMITMENT",
 		0xd0: "OP_UTXOTOKENAMOUNT", 0xd1: "OP_OUTPUTTOKENCATEGORY",
 		0xd2: "OP_OUTPUTTOKENCOMMITMENT", 0xd3: "OP_OUTPUTTOKENAMOUNT",
+		0xd4: "OP_RESERVED3", 0xd5: "OP_RESERVED4",
 		0xef: "SPECIAL_TOKEN_PREFIX",
 	}
 	for opcodeVal, expectedStr := range expectedStrings {
@@ -137,7 +139,7 @@ func TestOpcodeDisasm(t *testing.T) {
 			}
 
 		// OP_UNKNOWN#.
-		case (opcodeVal >= 0xbd && opcodeVal <= 0xbf) || (opcodeVal >= 0xd4 && opcodeVal <= 0xf9 && opcodeVal != 0xef) || opcodeVal == 0xfc:
+		case (opcodeVal >= 0xbd && opcodeVal <= 0xbf) || (opcodeVal >= 0xd6 && opcodeVal <= 0xf9 && opcodeVal != 0xef) || opcodeVal == 0xfc:
 			expectedStr = "OP_UNKNOWN" + strconv.Itoa(opcodeVal)
 		}
 
@@ -203,7 +205,7 @@ func TestOpcodeDisasm(t *testing.T) {
 			}
 
 		// OP_UNKNOWN#.
-		case (opcodeVal >= 0xbd && opcodeVal <= 0xbf) || (opcodeVal >= 0xd4 && opcodeVal <= 0xf9 && opcodeVal != 0xef) || opcodeVal == 0xfc:
+		case (opcodeVal >= 0xbd && opcodeVal <= 0xbf) || (opcodeVal >= 0xd6 && opcodeVal <= 0xf9 && opcodeVal != 0xef) || opcodeVal == 0xfc:
 			expectedStr = "OP_UNKNOWN" + strconv.Itoa(opcodeVal)
 		}
 
@@ -240,6 +242,13 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 		}
 		return b
 	}
+
+	// pushdataBytecode is OP_0 OP_IF, an empty OP_PUSHDATA1, OP_PUSHDATA2
+	// and OP_PUSHDATA4 push, OP_ENDIF OP_ACTIVEBYTECODE OP_EQUAL.  The
+	// pushes are in a branch that does not run, so they need not be
+	// minimal.  Their length fields of -1, -2 and -4 once made the size of
+	// the active bytecode negative.
+	const pushdataBytecode = "00634c004d00004e0000000068c187"
 
 	testVectors := [][]struct {
 		name          string
@@ -370,6 +379,32 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 				index:         0,
 				expectedError: ErrDisabledOpcode,
 			},
+			{
+				name:         "OP_ACTIVEBYTECODE OP_PUSHDATA1, 2 and 4",
+				scriptPubkey: fromHex(pushdataBytecode),
+				scriptSig:    fromHex("0f" + pushdataBytecode),
+				index:        0,
+				flags:        may2026TestFlags,
+			},
+			{
+				name: "OP_ACTIVEBYTECODE OP_PUSHDATA1, 2 and 4 in a P2SH redeem script",
+				scriptPubkey: newScript(NewScriptBuilder().
+					AddOp(OP_HASH160).
+					AddData(bchutil.Hash160(fromHex(pushdataBytecode))).
+					AddOp(OP_EQUAL)),
+				scriptSig: fromHex("0f" + pushdataBytecode + "0f" +
+					pushdataBytecode),
+				index: 0,
+				flags: may2026TestFlags,
+			},
+			{
+				// <body> OP_1 OP_DEFINE OP_1 OP_INVOKE
+				name:         "OP_ACTIVEBYTECODE OP_PUSHDATA1, 2 and 4 in a function",
+				scriptPubkey: fromHex("0f" + pushdataBytecode + "5189518a"),
+				scriptSig:    fromHex("0f" + pushdataBytecode),
+				index:        0,
+				flags:        may2026TestFlags,
+			},
 		},
 		// OP_TXVERSION (nullary)
 		{
@@ -486,7 +521,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_UTXOVALUE missing arg",
@@ -539,7 +574,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_UTXOBYTECODE missing arg",
@@ -591,7 +626,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_OUTPOINTTXHASH missing arg",
@@ -643,7 +678,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_OUTPOINTINDEX missing arg",
@@ -700,7 +735,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_INPUTBYTECODE missing arg",
@@ -752,7 +787,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxInputIndex,
 			},
 			{
 				name: "OP_INPUTSEQUENCENUMBER missing arg",
@@ -804,7 +839,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxOutputIndex,
 			},
 			{
 				name: "OP_OUTPUTVALUE missing arg",
@@ -857,7 +892,7 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 					AddOp(OP_EQUAL)),
 				index:         0,
 				flags:         ScriptVerifyNativeIntrospection,
-				expectedError: ErrInvalidIndex,
+				expectedError: ErrInvalidTxOutputIndex,
 			},
 			{
 				name: "OP_OUTPUTBYTECODE missing arg",
@@ -959,6 +994,493 @@ func TestNativeIntrospectionOpcodes(t *testing.T) {
 				}
 			}
 			tx.TxIn[test.index].SignatureScript = nil
+		}
+	}
+}
+
+// TestActiveBytecodeBufferSize ensures OP_ACTIVEBYTECODE pushes exactly the
+// active bytecode, in a buffer of its exact size, when the bytecode holds data
+// pushes of every kind, run or not.  The size comes from each opcode's
+// encoding, which for OP_PUSHDATA1, OP_PUSHDATA2 and OP_PUSHDATA4 is not their
+// length field.
+func TestActiveBytecodeBufferSize(t *testing.T) {
+	t.Parallel()
+
+	// Pushes of 20, 76 and 256 bytes take OP_DATA_20, OP_PUSHDATA1 and
+	// OP_PUSHDATA2.  The rest is OP_0 OP_IF, an empty push of each kind,
+	// OP_ENDIF OP_ACTIVEBYTECODE.
+	script, err := NewScriptBuilder().
+		AddData(bytes.Repeat([]byte{1}, 20)).
+		AddData(bytes.Repeat([]byte{2}, 76)).
+		AddData(bytes.Repeat([]byte{3}, 256)).
+		AddOp(OP_2DROP).
+		AddOp(OP_DROP).
+		Script()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := hex.DecodeString("00634c004d00004e0000000068c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script = append(script, tail...)
+
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{1}},
+		Sequence:         0xffffffff,
+	})
+	tx.AddTxOut(wire.NewTxOut(1000, []byte{OP_1}, wire.TokenData{}))
+	utxos := NewUtxoCache()
+	utxos.AddEntry(0, *wire.NewTxOut(2000, script, wire.TokenData{}))
+	vm, err := NewEngine(script, tx, 0, may2026TestFlags, nil, nil, utxos,
+		2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for done := false; !done; {
+		if done, err = vm.Step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := vm.dstack.PeekByteArray(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, script) {
+		t.Fatalf("OP_ACTIVEBYTECODE pushed %x, want %x", got, script)
+	}
+	if cap(got) != len(got) {
+		t.Fatalf("OP_ACTIVEBYTECODE pushed %d bytes in a buffer of %d",
+			len(got), cap(got))
+	}
+}
+
+// TestRenamedOpcodes ensures the earlier names of renamed opcodes still name
+// the same opcodes, while disassembly uses the current names.
+func TestRenamedOpcodes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		oldName string
+		newName string
+		value   byte
+	}{
+		{"OP_2MUL", "OP_LSHIFTNUM", OP_LSHIFTNUM},
+		{"OP_2DIV", "OP_RSHIFTNUM", OP_RSHIFTNUM},
+		{"OP_LSHIFT", "OP_LSHIFTBIN", OP_LSHIFTBIN},
+		{"OP_RSHIFT", "OP_RSHIFTBIN", OP_RSHIFTBIN},
+		{"OP_UNKNOWN212", "OP_RESERVED3", OP_RESERVED3},
+		{"OP_UNKNOWN213", "OP_RESERVED4", OP_RESERVED4},
+	}
+	for _, test := range tests {
+		if OpcodeByName[test.oldName] != test.value ||
+			OpcodeByName[test.newName] != test.value {
+
+			t.Errorf("%s: unexpected values %#x and %#x", test.newName,
+				OpcodeByName[test.oldName], OpcodeByName[test.newName])
+		}
+		disasm, err := DisasmString([]byte{test.value})
+		if err != nil || disasm != test.newName {
+			t.Errorf("%s: unexpected disassembly %q (%v)", test.newName,
+				disasm, err)
+		}
+	}
+
+	// The short form used by the reference tests accepts both names.
+	for _, short := range []string{"LSHIFT", "LSHIFTBIN", "2MUL", "LSHIFTNUM"} {
+		if _, err := parseShortForm(short); err != nil {
+			t.Errorf("%s: %v", short, err)
+		}
+	}
+}
+
+// TestTokenOpcodesBeforeTokens ensures the token opcodes fail as reserved
+// opcodes when executed before tokens are enabled, and are skipped in
+// branches that are not executed.
+func TestTokenOpcodesBeforeTokens(t *testing.T) {
+	t.Parallel()
+
+	flags := ScriptVerifyNativeIntrospection
+	ops := []byte{OP_UTXOTOKENCATEGORY, OP_UTXOTOKENCOMMITMENT,
+		OP_UTXOTOKENAMOUNT, OP_OUTPUTTOKENCATEGORY,
+		OP_OUTPUTTOKENCOMMITMENT, OP_OUTPUTTOKENAMOUNT}
+	for _, op := range ops {
+		name := opcodeArray[op].name
+		for _, cond := range []byte{OP_0, OP_1} {
+			pkScript := []byte{OP_0, cond, OP_IF, op, OP_ENDIF,
+				OP_DROP, OP_1}
+			tx := createSpendingTx(nil, pkScript, 0)
+			vm, err := NewEngine(pkScript, tx, 0, flags, nil, nil,
+				nil, 0)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			err = vm.Execute()
+			if cond == OP_0 && err != nil {
+				t.Errorf("%s in an unexecuted branch: %v", name, err)
+			}
+			if cond == OP_1 && !IsErrorCode(err, ErrReservedOpcode) {
+				t.Errorf("%s: got %v, want %v", name, err,
+					ErrReservedOpcode)
+			}
+		}
+	}
+}
+
+// num2binTestFlags returns the script flag sets used by the OP_NUM2BIN tests:
+// the rules before the May 2022 upgrade (32-bit integers), the May 2022 rules
+// (64-bit integers) and the current rules (big integers and larger stack
+// elements).
+func num2binTestFlags() map[string]ScriptFlags {
+	legacy := ScriptBip16 | ScriptVerifyDERSignatures |
+		ScriptVerifyCheckLockTimeVerify | ScriptVerifyCheckSequenceVerify |
+		ScriptVerifyStrictEncoding | ScriptVerifyBip143SigHash |
+		ScriptVerifyLowS | ScriptVerifyNullFail | ScriptVerifySigPushOnly |
+		ScriptVerifyCleanStack | ScriptVerifyCheckDataSig |
+		ScriptVerifySchnorr | ScriptVerifyAllowSegwitRecovery |
+		ScriptVerifyMinimalData | ScriptVerifySchnorrMultisig |
+		ScriptReportSigChecks | ScriptVerifyReverseBytes
+	may2022 := legacy | ScriptVerify64BitIntegers |
+		ScriptVerifyNativeIntrospection
+	current := may2022 | ScriptAllowCashTokens | ScriptAllowMay2025 |
+		ScriptAllowMay2026
+
+	return map[string]ScriptFlags{
+		"pre-May 2022": legacy,
+		"May 2022":     may2022,
+		"current":      current,
+	}
+}
+
+// runNum2binTestScript executes the given short form signature and public key
+// scripts with the passed flags.
+func runNum2binTestScript(t *testing.T, sigScript, pkScript string,
+	flags ScriptFlags) error {
+
+	t.Helper()
+
+	sig, err := parseShortForm(sigScript)
+	if err != nil {
+		t.Fatalf("parse %q: %v", sigScript, err)
+	}
+	pk, err := parseShortForm(pkScript)
+	if err != nil {
+		t.Fatalf("parse %q: %v", pkScript, err)
+	}
+
+	tx := createSpendingTx(sig, pk, 1000)
+	utxos := NewUtxoCache()
+	utxos.AddEntry(0, *wire.NewTxOut(1000, pk, wire.TokenData{}))
+	vm, err := NewEngine(pk, tx, 0, flags, nil, nil, utxos, 1000)
+	if err != nil {
+		return err
+	}
+	return vm.Execute()
+}
+
+// TestNum2binNonMinimalNegative ensures OP_NUM2BIN keeps the sign and value of
+// negative operands that are not minimally encoded, matching Bitcoin Cash
+// Node.  OP_BIN2NUM is checked against the same operands for comparison.
+func TestNum2binNonMinimalNegative(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		sigScript string
+		pkScript  string
+		err       ErrorCode
+		wantErr   bool
+	}{
+		// -255 with one padding byte.
+		{sigScript: "0x03 0xff0080 2", pkScript: "NUM2BIN 0x02 0xff80 EQUAL"},
+		{sigScript: "0x03 0xff0080 3", pkScript: "NUM2BIN 0x03 0xff0080 EQUAL"},
+		{sigScript: "0x03 0xff0080 4", pkScript: "NUM2BIN 0x04 0xff000080 EQUAL"},
+		{
+			sigScript: "0x03 0xff0080 1",
+			pkScript:  "NUM2BIN DROP 1",
+			err:       ErrImpossibleEncoding,
+			wantErr:   true,
+		},
+		{sigScript: "0x03 0xff0080", pkScript: "BIN2NUM 0x02 0xff80 EQUAL"},
+
+		// -128 with two padding bytes.
+		{sigScript: "0x04 0x80000080 2", pkScript: "NUM2BIN 0x02 0x8080 EQUAL"},
+		{sigScript: "0x04 0x80000080 3", pkScript: "NUM2BIN 0x03 0x800080 EQUAL"},
+		{sigScript: "0x04 0x80000080", pkScript: "BIN2NUM 0x02 0x8080 EQUAL"},
+
+		// -32768 with one padding byte.
+		{sigScript: "0x04 0x00800080 3", pkScript: "NUM2BIN 0x03 0x008080 EQUAL"},
+
+		// Positive values whose most significant byte uses the sign bit.
+		{sigScript: "0x03 0xff0000 2", pkScript: "NUM2BIN 0x02 0xff00 EQUAL"},
+		{sigScript: "0x04 0x80000000 2", pkScript: "NUM2BIN 0x02 0x8000 EQUAL"},
+	}
+
+	for name, flags := range num2binTestFlags() {
+		for _, test := range tests {
+			err := runNum2binTestScript(t, test.sigScript, test.pkScript,
+				flags)
+			switch {
+			case test.wantErr && !IsErrorCode(err, test.err):
+				t.Errorf("%s: [%s] [%s]: got error %v, want %v", name,
+					test.sigScript, test.pkScript, err, test.err)
+			case !test.wantErr && err != nil:
+				t.Errorf("%s: [%s] [%s]: unexpected error %v", name,
+					test.sigScript, test.pkScript, err)
+			}
+		}
+	}
+}
+
+// TestNum2binSizeBounds ensures the size operand of OP_NUM2BIN is bounds
+// checked on its full 64-bit value, so that sizes which do not fit in a
+// 32-bit int are rejected the same way on every platform.
+func TestNum2binSizeBounds(t *testing.T) {
+	t.Parallel()
+
+	type num2binSizeTest struct {
+		name      string
+		sigScript string
+		err       ErrorCode
+		wantErr   bool
+	}
+
+	common := []num2binSizeTest{
+		{name: "negative", sigScript: "1 -3", err: ErrElementTooBig, wantErr: true},
+		{name: "max legacy element", sigScript: "1 520"},
+	}
+	wide := []num2binSizeTest{
+		{
+			name:      "2^31",
+			sigScript: "1 0x05 0x0000008000",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		},
+		{
+			name:      "2^32+2",
+			sigScript: "1 0x05 0x0200000001",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		},
+		{
+			name:      "-(2^32-3)",
+			sigScript: "1 0x05 0xfdffffff80",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		},
+		{
+			name:      "2^63-1",
+			sigScript: "1 0x08 0xffffffffffffff7f",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		},
+	}
+
+	tests := map[string][]num2binSizeTest{
+		"pre-May 2022": append(common, num2binSizeTest{
+			name:      "max legacy element + 1",
+			sigScript: "1 521",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		}),
+		"May 2022": append(append(common, wide...), num2binSizeTest{
+			name:      "max legacy element + 1",
+			sigScript: "1 521",
+			err:       ErrElementTooBig,
+			wantErr:   true,
+		}),
+		"current": append(append(common, wide...),
+			num2binSizeTest{name: "max element", sigScript: "1 10000"},
+			num2binSizeTest{
+				name:      "max element + 1",
+				sigScript: "1 10001",
+				err:       ErrElementTooBig,
+				wantErr:   true,
+			},
+			num2binSizeTest{
+				name:      "2^64+2",
+				sigScript: "1 0x09 0x020000000000000001",
+				err:       ErrNumberRange64Bit,
+				wantErr:   true,
+			},
+		),
+	}
+
+	flagSets := num2binTestFlags()
+	for name, flagTests := range tests {
+		for _, test := range flagTests {
+			err := runNum2binTestScript(t, test.sigScript,
+				"NUM2BIN DROP 1", flagSets[name])
+			switch {
+			case test.wantErr && !IsErrorCode(err, test.err):
+				t.Errorf("%s: %s: got error %v, want %v", name, test.name,
+					err, test.err)
+			case !test.wantErr && err != nil:
+				t.Errorf("%s: %s: unexpected error %v", name, test.name,
+					err)
+			}
+		}
+	}
+}
+
+// TestCheckSequenceVerifyVersion ensures OP_CHECKSEQUENCEVERIFY reads the
+// transaction version as unsigned, as BIP68 and BCHN do, so a version that is
+// negative as a signed number is at least 2 and the relative lock applies.
+func TestCheckSequenceVerifyVersion(t *testing.T) {
+	t.Parallel()
+
+	pkScript := mustParseShortForm("10 CHECKSEQUENCEVERIFY")
+	tests := []struct {
+		version int32
+		valid   bool
+	}{
+		{version: 0, valid: false},
+		{version: 1, valid: false},
+		{version: 2, valid: true},
+		{version: -1, valid: true},
+		{version: -1 << 31, valid: true},
+	}
+	for _, test := range tests {
+		tx := wire.NewMsgTx(test.version)
+		tx.AddTxIn(&wire.TxIn{Sequence: 10})
+		tx.AddTxOut(wire.NewTxOut(0, []byte{OP_TRUE}, wire.TokenData{}))
+		vm, err := NewEngine(pkScript, tx, 0,
+			ScriptVerifyCheckSequenceVerify, nil, nil, nil, 0)
+		if err != nil {
+			t.Fatalf("version %d: NewEngine: %v", test.version, err)
+		}
+		err = vm.Execute()
+		switch {
+		case test.valid && err != nil:
+			t.Errorf("version %d: %v", test.version, err)
+		case !test.valid && !IsErrorCode(err, ErrUnsatisfiedLockTime):
+			t.Errorf("version %d: got %v, want ErrUnsatisfiedLockTime",
+				test.version, err)
+		}
+	}
+}
+
+// TestSharedBytesUnchanged ensures no opcode writes into the shared slices
+// of true, -1 and 1 to 16: each value is put through every opcode that makes
+// bytes, bare and through P2SH, and the slices must be unchanged after.
+func TestSharedBytesUnchanged(t *testing.T) {
+	wantTrue := append([]byte(nil), trueBytes...)
+	wantNegOne := append([]byte(nil), negOneBytes...)
+	var wantSmall [17][]byte
+	for n := 1; n <= 16; n++ {
+		wantSmall[n] = append([]byte(nil), smallIntBytes[n]...)
+	}
+
+	// The values, each pushed by a script, the shared true one by
+	// OP_EQUAL, the others by their own opcodes, which a P2SH signature
+	// script can hold.
+	type value struct {
+		name     string
+		push     []byte
+		pushOnly bool
+	}
+	values := []value{{"true", []byte{OP_1, OP_1, OP_EQUAL}, false},
+		{"-1", []byte{OP_1NEGATE}, true}}
+	for n := byte(1); n <= 16; n++ {
+		values = append(values, value{fmt.Sprintf("%d", n),
+			[]byte{OP_1 - 1 + n}, true})
+	}
+
+	// Each case takes the value on top of the stack.  0x55 is pushed as
+	// data, as no shared slice holds it, so writing it into one shows.
+	cases := []struct {
+		name string
+		ops  []byte
+	}{
+		{"OP_NUM2BIN padded", []byte{OP_4, OP_NUM2BIN}},
+		{"OP_NUM2BIN at its size", []byte{OP_1, OP_NUM2BIN}},
+		{"OP_BIN2NUM", []byte{OP_BIN2NUM}},
+		{"OP_REVERSEBYTES", []byte{OP_REVERSEBYTES}},
+		{"OP_INVERT", []byte{OP_INVERT}},
+		{"OP_AND", []byte{OP_DUP, OP_AND}},
+		{"OP_OR", []byte{OP_DUP, OP_OR}},
+		{"OP_XOR", []byte{OP_DUP, OP_XOR}},
+		{"OP_LSHIFTBIN", []byte{OP_1, OP_LSHIFTBIN}},
+		{"OP_RSHIFTBIN", []byte{OP_1, OP_RSHIFTBIN}},
+		{"OP_CAT", []byte{OP_DUP, OP_CAT}},
+		{"OP_SPLIT at 0, OP_CAT", []byte{OP_0, OP_SPLIT, OP_DROP,
+			OP_DATA_1, 0x55, OP_CAT}},
+		{"OP_SPLIT at 1, OP_CAT", []byte{OP_1, OP_SPLIT, OP_DATA_1, 0x55,
+			OP_CAT, OP_CAT}},
+		{"OP_1ADD", []byte{OP_1ADD}},
+		{"OP_1SUB", []byte{OP_1SUB}},
+		{"OP_NEGATE", []byte{OP_NEGATE}},
+		{"OP_ABS", []byte{OP_ABS}},
+		{"OP_NOT", []byte{OP_NOT}},
+		{"OP_0NOTEQUAL", []byte{OP_0NOTEQUAL}},
+		{"OP_ADD", []byte{OP_DUP, OP_ADD}},
+		{"OP_SUB", []byte{OP_DUP, OP_SUB}},
+		{"OP_MUL", []byte{OP_DUP, OP_MUL}},
+		{"OP_DIV", []byte{OP_DUP, OP_DIV}},
+		{"OP_MOD", []byte{OP_DUP, OP_MOD}},
+		{"OP_BOOLAND", []byte{OP_DUP, OP_BOOLAND}},
+		{"OP_BOOLOR", []byte{OP_DUP, OP_BOOLOR}},
+		{"OP_NUMEQUAL", []byte{OP_DUP, OP_NUMEQUAL}},
+		{"OP_NUMNOTEQUAL", []byte{OP_DUP, OP_NUMNOTEQUAL}},
+		{"OP_LESSTHAN", []byte{OP_DUP, OP_LESSTHAN}},
+		{"OP_GREATERTHAN", []byte{OP_DUP, OP_GREATERTHAN}},
+		{"OP_LESSTHANOREQUAL", []byte{OP_DUP, OP_LESSTHANOREQUAL}},
+		{"OP_GREATERTHANOREQUAL", []byte{OP_DUP, OP_GREATERTHANOREQUAL}},
+		{"OP_MIN", []byte{OP_DUP, OP_MIN}},
+		{"OP_MAX", []byte{OP_DUP, OP_MAX}},
+		{"OP_WITHIN", []byte{OP_DUP, OP_DUP, OP_WITHIN}},
+		{"alt stack", []byte{OP_TOALTSTACK, OP_FROMALTSTACK}},
+		{"OP_PICK", []byte{OP_DUP, OP_1, OP_PICK}},
+		{"OP_ROLL", []byte{OP_DUP, OP_1, OP_ROLL}},
+	}
+
+	// Clean stack is left out, so each script just ends with true.
+	flags := RelayVerifyFlags &^ ScriptVerifyCleanStack
+	run := func(msg string, sigScript, pkScript []byte) {
+		tx := wire.NewMsgTx(2)
+		tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, sigScript))
+		tx.AddTxOut(wire.NewTxOut(0, nil, wire.TokenData{}))
+		vm, err := NewEngine(pkScript, tx, 0, flags, nil, nil, nil, 0)
+		if err == nil {
+			err = vm.Execute()
+		}
+		if err != nil {
+			t.Errorf("%s: %v", msg, err)
+		}
+	}
+	for _, v := range values {
+		for _, c := range cases {
+			msg := fmt.Sprintf("%s, %s", v.name, c.name)
+			redeem := append(append([]byte(nil), c.ops...), OP_1)
+			run(msg, nil, append(append([]byte(nil), v.push...), redeem...))
+			if !v.pushOnly {
+				continue
+			}
+			sigScript, err := NewScriptBuilder().AddOps(v.push).
+				AddData(redeem).Script()
+			if err != nil {
+				t.Fatal(err)
+			}
+			p2sh, err := NewScriptBuilder().AddOp(OP_HASH160).
+				AddData(bchutil.Hash160(redeem)).AddOp(OP_EQUAL).Script()
+			if err != nil {
+				t.Fatal(err)
+			}
+			run(msg+", P2SH", sigScript, p2sh)
+		}
+	}
+
+	if !bytes.Equal(trueBytes, wantTrue) {
+		t.Errorf("trueBytes = %x, want %x", trueBytes, wantTrue)
+	}
+	if !bytes.Equal(negOneBytes, wantNegOne) {
+		t.Errorf("negOneBytes = %x, want %x", negOneBytes, wantNegOne)
+	}
+	for n := 1; n <= 16; n++ {
+		if !bytes.Equal(smallIntBytes[n], wantSmall[n]) {
+			t.Errorf("smallIntBytes[%d] = %x, want %x", n, smallIntBytes[n],
+				wantSmall[n])
 		}
 	}
 }

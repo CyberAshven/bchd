@@ -86,6 +86,38 @@ func TestScriptNumBytes(t *testing.T) {
 	}
 }
 
+// TestNumberRangeErrorCode ensures a number too long for a limit is given
+// BCHN's error for the limit: the 32-bit range below 8 bytes, the 64-bit range
+// at 8 and the big integer range above.
+func TestNumberRangeErrorCode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		scriptNumLen int
+		want         ErrorCode
+	}{
+		{defaultSmallScriptNumLen, ErrNumberRange32Bit},
+		{5, ErrNumberRange32Bit},
+		{defaultBigScriptNumLen - 1, ErrNumberRange32Bit},
+		{defaultBigScriptNumLen, ErrNumberRange64Bit},
+		{defaultBigScriptNumLen + 1, ErrNumberRangeBigInt},
+		{defaultBigIntScriptNumLen, ErrNumberRangeBigInt},
+	}
+	for _, test := range tests {
+		if got := numberRangeErrorCode(test.scriptNumLen); got != test.want {
+			t.Errorf("%d bytes: got %v, want %v", test.scriptNumLen, got,
+				test.want)
+		}
+	}
+	long := make([]byte, defaultBigIntScriptNumLen+1)
+	long[len(long)-1] = 1
+	_, err := makeScriptNum(long, true, defaultBigIntScriptNumLen)
+	if !IsErrorCode(err, ErrNumberRangeBigInt) {
+		t.Errorf("number of %d bytes: got %v, want %v", len(long), err,
+			ErrNumberRangeBigInt)
+	}
+}
+
 // TestMakeScriptNum ensures that converting from byte representations to
 // integral script numbers works as expected.
 func TestMakeScriptNum(t *testing.T) {
@@ -93,8 +125,9 @@ func TestMakeScriptNum(t *testing.T) {
 
 	// Errors used in the tests below defined here for convenience and to
 	// keep the horizontal test size shorter.
-	errNumTooBig := scriptError(ErrNumberTooBig, "")
-	errMinimalData := scriptError(ErrMinimalData, "")
+	errRange32 := scriptError(ErrNumberRange32Bit, "")
+	errRange64 := scriptError(ErrNumberRange64Bit, "")
+	errMinimalNumber := scriptError(ErrMinimalNumber, "")
 
 	tests := []struct {
 		serialized      []byte
@@ -104,7 +137,7 @@ func TestMakeScriptNum(t *testing.T) {
 		err             error
 	}{
 		// Minimal encoding must reject negative 0.
-		{hexToBytes("80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},
+		{hexToBytes("80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},
 
 		// Minimally encoded valid values with minimal encoding flag.
 		// Should not error and return expected integral number.
@@ -174,38 +207,38 @@ func TestMakeScriptNum(t *testing.T) {
 		// Minimally encoded values that are out of range for data that
 		// is interpreted as script numbers with the minimal encoding
 		// flag set.  Should error and return 0.
-		{hexToBytes("0000008000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("0000008080"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("0000009000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("0000009080"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("0000000001"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("0000000081"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffffff7f"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffffffff"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errNumTooBig},
+		{hexToBytes("0000008000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("0000008080"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("0000009000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("0000009080"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("0000000001"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("0000000081"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffffff00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffffff80"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffffff7f"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
+		{hexToBytes("ffffffffffffffff"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errRange32},
 
-		{hexToBytes("ffffffffffffff7fff"), *makeScriptNumFromInt64(0), defaultBigScriptNumLen, true, errNumTooBig},
-		{hexToBytes("ffffffffffffffffff"), *makeScriptNumFromInt64(0), defaultBigScriptNumLen, true, errNumTooBig},
+		{hexToBytes("ffffffffffffff7fff"), *makeScriptNumFromInt64(0), defaultBigScriptNumLen, true, errRange64},
+		{hexToBytes("ffffffffffffffffff"), *makeScriptNumFromInt64(0), defaultBigScriptNumLen, true, errRange64},
 
 		// Non-minimally encoded, but otherwise valid values with
 		// minimal encoding flag.  Should error and return 0.
-		{hexToBytes("00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},       // 0
-		{hexToBytes("0100"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},     // 1
-		{hexToBytes("7f00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},     // 127
-		{hexToBytes("800000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},   // 128
-		{hexToBytes("810000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},   // 129
-		{hexToBytes("000100"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},   // 256
-		{hexToBytes("ff7f00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData},   // 32767
-		{hexToBytes("00800000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData}, // 32768
-		{hexToBytes("ffff0000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData}, // 65535
-		{hexToBytes("00000800"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData}, // 524288
-		{hexToBytes("00007000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalData}, // 7340032
-		{hexToBytes("0009000100"), *makeScriptNumFromInt64(0), 5, true, errMinimalData},                      // 16779520
+		{hexToBytes("00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},       // 0
+		{hexToBytes("0100"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},     // 1
+		{hexToBytes("7f00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},     // 127
+		{hexToBytes("800000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},   // 128
+		{hexToBytes("810000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},   // 129
+		{hexToBytes("000100"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},   // 256
+		{hexToBytes("ff7f00"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber},   // 32767
+		{hexToBytes("00800000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber}, // 32768
+		{hexToBytes("ffff0000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber}, // 65535
+		{hexToBytes("00000800"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber}, // 524288
+		{hexToBytes("00007000"), *makeScriptNumFromInt64(0), defaultSmallScriptNumLen, true, errMinimalNumber}, // 7340032
+		{hexToBytes("0009000100"), *makeScriptNumFromInt64(0), 5, true, errMinimalNumber},                      // 16779520
 
 		// Non-minimally encoded, but otherwise valid values without
 		// minimal encoding flag.  Should not error and return expected
@@ -388,9 +421,21 @@ func Test_minimallyEncode(t *testing.T) {
 			[]byte{0x01, 0x80},
 			[]byte{0x81},
 		},
+
+		// The sign byte must follow the most significant non-zero byte
+		// when that byte has its high bit set, as in Bitcoin Cash Node.
+		{[]byte{0xff, 0x00, 0x80}, []byte{0xff, 0x80}},
+		{[]byte{0xff, 0x00, 0x00, 0x80}, []byte{0xff, 0x80}},
+		{[]byte{0x80, 0x00, 0x00, 0x80}, []byte{0x80, 0x80}},
+		{[]byte{0x00, 0x80, 0x00, 0x80}, []byte{0x00, 0x80, 0x80}},
+		{[]byte{0xff, 0x00, 0x00}, []byte{0xff, 0x00}},
+		{[]byte{0x80, 0x00, 0x00, 0x00}, []byte{0x80, 0x00}},
+		{[]byte{0x7f, 0x00, 0x80}, []byte{0xff}},
+		{[]byte{0xff, 0x80}, []byte{0xff, 0x80}},
 	}
 
 	for i, test := range tests {
+		orig := append([]byte(nil), test.data...)
 		result := minimallyEncode(test.data)
 		if !bytes.Equal(result, test.expected) {
 			t.Errorf("Test %d: Expected %v, got %v", i, test.expected, result)
@@ -398,6 +443,90 @@ func Test_minimallyEncode(t *testing.T) {
 
 		if checkMinimalDataEncoding(result) != nil {
 			t.Errorf("Test %d: Result not minimally encoded", i)
+		}
+
+		if !bytes.Equal(test.data, orig) {
+			t.Errorf("Test %d: Input modified from %x to %x", i, orig,
+				test.data)
+		}
+
+		// The encoding must not change the numeric value.
+		want, err := makeScriptNum(orig, false, len(orig))
+		if err != nil {
+			t.Fatalf("Test %d: makeScriptNum(%x): %v", i, orig, err)
+		}
+		got, err := makeScriptNum(result, true, len(orig))
+		if err != nil {
+			t.Fatalf("Test %d: makeScriptNum(%x): %v", i, result, err)
+		}
+		if !got.IsEqualeTo(&want) {
+			t.Errorf("Test %d: Value changed from %v to %v", i, want, got)
+		}
+	}
+}
+
+// TestMinimallyEncodeBCHNVectors runs the minimize_encoding_test vectors from
+// src/test/scriptnum_tests.cpp in Bitcoin Cash Node against minimallyEncode
+// for both the legacy and the current maximum element size.
+func TestMinimallyEncodeBCHNVectors(t *testing.T) {
+	t.Parallel()
+
+	check := func(data, expected []byte) {
+		t.Helper()
+
+		result := minimallyEncode(data)
+		if !bytes.Equal(result, expected) {
+			t.Fatalf("minimallyEncode(%x) = %x, want %x", data, result,
+				expected)
+		}
+
+		// The input must only change when it is not minimally encoded.
+		minimal := checkMinimalDataEncoding(data) == nil
+		if minimal != bytes.Equal(result, data) {
+			t.Fatalf("minimallyEncode(%x): minimally encoded %v, but "+
+				"result %x", data, minimal, result)
+		}
+	}
+
+	check([]byte{}, []byte{})
+
+	for _, elemSize := range []int{MaxScriptElementSizeLegacy, MaxScriptElementSize} {
+		// Positive and negative zeros encode to nothing.
+		var zero, negZero []byte
+		for i := 0; i < elemSize; i++ {
+			zero = append(zero, 0x00)
+			check(zero, []byte{})
+
+			negZero = append(negZero, 0x80)
+			check(negZero, []byte{})
+
+			negZero[len(negZero)-1] = 0x00
+		}
+
+		// Keep one leading zero when the sign bit is used.
+		n, negn := []byte{0x80, 0x00}, []byte{0x80, 0x80}
+		npadded := append([]byte(nil), n...)
+		negnpadded := append([]byte(nil), negn...)
+		for i := 0; i < elemSize; i++ {
+			check(npadded, n)
+			npadded = append(npadded, 0x00)
+
+			check(negnpadded, negn)
+			negnpadded[len(negnpadded)-1] = 0x00
+			negnpadded = append(negnpadded, 0x80)
+		}
+
+		// Merge the sign into the leading byte when its sign bit is unused.
+		k, negk := []byte{0x7f}, []byte{0xff}
+		kpadded := append([]byte(nil), k...)
+		negkpadded := append([]byte(nil), negk...)
+		for i := 0; i < elemSize; i++ {
+			check(kpadded, k)
+			kpadded = append(kpadded, 0x00)
+
+			check(negkpadded, negk)
+			negkpadded[len(negkpadded)-1] &= 0x7f
+			negkpadded = append(negkpadded, 0x80)
 		}
 	}
 }

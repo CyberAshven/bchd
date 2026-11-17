@@ -86,7 +86,7 @@ func HashToBig(hash *chainhash.Hash) *big.Int {
 	// big-endian, so reverse them.
 	buf := *hash
 	blen := len(buf)
-	for i := 0; i < blen/2; i++ {
+	for i := range blen / 2 {
 		buf[i], buf[blen-1-i] = buf[blen-1-i], buf[i]
 	}
 
@@ -532,9 +532,9 @@ func (b *BlockChain) calcLegacyRequiredDifficulty(lastNode *blockNode, newBlockT
 // This function is safe for concurrent access.
 func (b *BlockChain) CalcNextRequiredDifficulty(timestamp time.Time) (uint32, error) {
 	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
 	tip := b.bestChain.Tip()
 	difficulty, err := b.calcNextRequiredDifficulty(tip, timestamp,
 		b.SelectDifficultyAdjustmentAlgorithm(tip))
-	b.chainLock.Unlock()
 	return difficulty, err
 }

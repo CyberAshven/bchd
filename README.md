@@ -1,9 +1,8 @@
 bchd
 ====
 [![Build Status](https://github.com/gcash/bchd/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/gcash/bchd/actions/workflows/main.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/gcash/bchd)](https://goreportcard.com/report/github.com/gcash/bchd)
 [![ISC License](http://img.shields.io/badge/license-ISC-blue.svg)](http://copyfree.org)
-[![GoDoc](https://img.shields.io/badge/godoc-reference-blue.svg)](http://godoc.org/github.com/gcash/bchd)
+[![GoDoc](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/gcash/bchd)
 
 bchd is an alternative full node bitcoin cash implementation written in Go (golang).
 
@@ -28,7 +27,7 @@ that communicates with your running bchd instance via the API.
 
 ## Requirements
 
-[Go](http://golang.org) 1.24.0 or newer.
+[Go](http://golang.org) 1.26.0 or newer; use 1.26.9 or 1.27.2 or newer for the gRPC server's HTTP/2 security fixes, and preferably the latest point release (1.26.10 or 1.27.3).
 
 ## Install
 
@@ -46,12 +45,12 @@ If you prefer to install from source do the following:
 - Run the following commands to obtain bchd, all dependencies, and install it:
 
 ```bash
-go install github.com/gcash/bchd@v0.22.0
+go install github.com/gcash/bchd@v0.22.4
 ```
 
 This will download the source code into your GOPATH and compile `bchd` and install it in your path.
 
-For developers if you wish to place the working directory outside your GOPATH you can do so with Go >=1.12.x as follows:
+For developers if you wish to place the working directory outside your GOPATH you can do so as follows:
 ```bash
 mkdir workspace
 cd workspace
@@ -64,8 +63,7 @@ Dependencies will be automatically installed to `$GOPATH/pkg/mod`.
 If you are a bchd contributor and would like to change the default config file (`bchd.conf`), make any changes to `sample-bchd.conf` and then run the following commands:
 
 ```bash
-go-bindata sample-bchd.conf  # requires github.com/go-bindata/go-bindata/
-gofmt -s -w bindata.go
+make bindata  # requires github.com/go-bindata/go-bindata/
 ```
 
 ## Getting Started
@@ -126,6 +124,8 @@ docker exec <container> bchctl <command>
 ## Documentation
 
 The documentation is a work-in-progress.  It is located in the [docs](https://github.com/gcash/bchd/tree/master/docs) folder.
+The gRPC API is documented in [bchrpc](https://github.com/gcash/bchd/tree/master/bchrpc), the changes of each release are
+listed in the [CHANGELOG](https://github.com/gcash/bchd/blob/master/CHANGELOG.md) and Kubernetes configs are in [kube](https://github.com/gcash/bchd/tree/master/kube).
 
 ## Contributing
 

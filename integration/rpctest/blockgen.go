@@ -68,7 +68,7 @@ func solveBlock(header *wire.BlockHeader, targetDifficulty *big.Int) bool {
 	stopNonce := uint32(math.MaxUint32)
 	numCores := uint32(runtime.NumCPU())
 	noncesPerCore := (stopNonce - startNonce) / numCores
-	for i := uint32(0); i < numCores; i++ {
+	for i := range numCores {
 		rangeStart := startNonce + (noncesPerCore * i)
 		rangeStop := startNonce + (noncesPerCore * (i + 1)) - 1
 		if i == numCores-1 {
@@ -76,7 +76,7 @@ func solveBlock(header *wire.BlockHeader, targetDifficulty *big.Int) bool {
 		}
 		go solver(*header, rangeStart, rangeStop)
 	}
-	for i := uint32(0); i < numCores; i++ {
+	for range numCores {
 		result := <-results
 		if result.found {
 			close(quit)
@@ -128,9 +128,15 @@ func createCoinbaseTx(coinbaseScript []byte, nextBlockHeight int32,
 		}
 	}
 
-	if tx.SerializeSize() < blockchain.MinTransactionSize {
+	// Until Upgrade9 lowered it, the minimum transaction size was the
+	// larger Magnetic Anomaly one.
+	minSize := blockchain.MinTransactionSize
+	if nextBlockHeight <= net.Upgrade9ForkHeight {
+		minSize = blockchain.MagneticAnomalyMinTransactionSize
+	}
+	if tx.SerializeSize() < minSize {
 		tx.TxIn[0].SignatureScript = append(tx.TxIn[0].SignatureScript,
-			make([]byte, blockchain.MinTransactionSize-tx.SerializeSize())...)
+			make([]byte, minSize-tx.SerializeSize())...)
 	}
 
 	return bchutil.NewTx(tx), nil

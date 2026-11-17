@@ -34,21 +34,40 @@ var (
 //   block height    uint32           4 bytes
 // -----------------------------------------------------------------------------
 
-// dbPutIndexerTip uses an existing database transaction to update or add the
-// current tip for the given index to the provided values.
-func dbPutIndexerTip(dbTx database.Tx, idxKey []byte, hash *chainhash.Hash, height int32) error {
+// serializeIndexerTip serializes the provided index tip according to the
+// format described above.
+func serializeIndexerTip(hash *chainhash.Hash, height int32) []byte {
 	serialized := make([]byte, chainhash.HashSize+4)
 	copy(serialized, hash[:])
 	byteOrder.PutUint32(serialized[chainhash.HashSize:], uint32(height))
+	return serialized
+}
 
+// dbPutIndexerTip uses an existing database transaction to update or add the
+// current tip for the given index to the provided values.
+func dbPutIndexerTip(dbTx database.Tx, idxKey []byte, hash *chainhash.Hash, height int32) error {
 	indexesBucket := dbTx.Metadata().Bucket(indexTipsBucketName)
-	return indexesBucket.Put(idxKey, serialized)
+	if indexesBucket == nil {
+		return database.Error{
+			ErrorCode: database.ErrBucketNotFound,
+			Description: fmt.Sprintf("bucket %s does not exist for "+
+				"index %q tip", indexTipsBucketName, string(idxKey)),
+		}
+	}
+	return indexesBucket.Put(idxKey, serializeIndexerTip(hash, height))
 }
 
 // dbFetchIndexerTip uses an existing database transaction to retrieve the
 // hash and height of the current tip for the provided index.
 func dbFetchIndexerTip(dbTx database.Tx, idxKey []byte) (*chainhash.Hash, int32, error) {
 	indexesBucket := dbTx.Metadata().Bucket(indexTipsBucketName)
+	if indexesBucket == nil {
+		return nil, 0, database.Error{
+			ErrorCode: database.ErrBucketNotFound,
+			Description: fmt.Sprintf("bucket %s does not exist for "+
+				"index %q tip", indexTipsBucketName, string(idxKey)),
+		}
+	}
 	serialized := indexesBucket.Get(idxKey)
 	if len(serialized) < chainhash.HashSize+4 {
 		return nil, 0, database.Error{
@@ -144,6 +163,86 @@ func indexDropKey(idxKey []byte) []byte {
 	dropKey[0] = 'd'
 	copy(dropKey[1:], idxKey)
 	return dropKey
+}
+
+// indexVersionKey returns the key, in the index tips bucket, of the version
+// of the records of the index with the passed key.  It is the key of the index
+// with the letter 'v' prepended.
+func indexVersionKey(idxKey []byte) []byte {
+	versionKey := make([]byte, len(idxKey)+1)
+	versionKey[0] = 'v'
+	copy(versionKey[1:], idxKey)
+	return versionKey
+}
+
+// dbFetchIndexVersion uses an existing database transaction to retrieve the
+// version of the records of the index with the passed key, or 0 if the index
+// stores none, as one built before indexes stored their versions doesn't.
+func dbFetchIndexVersion(dbTx database.Tx, idxKey []byte) (uint32, error) {
+	var serialized []byte
+	if indexesBucket := dbTx.Metadata().Bucket(indexTipsBucketName); indexesBucket != nil {
+		serialized = indexesBucket.Get(indexVersionKey(idxKey))
+	}
+	if serialized == nil {
+		return 0, nil
+	}
+	if len(serialized) != 4 {
+		return 0, database.Error{
+			ErrorCode: database.ErrCorruption,
+			Description: fmt.Sprintf("version of index %q has %d bytes",
+				string(idxKey), len(serialized)),
+		}
+	}
+	return byteOrder.Uint32(serialized), nil
+}
+
+// dbPutIndexVersion uses an existing database transaction to store the
+// version of the records of the index with the passed key, in the bucket of
+// index tips, which it creates if the index manager hasn't yet.
+func dbPutIndexVersion(dbTx database.Tx, idxKey []byte, version uint32) error {
+	indexesBucket, err := dbTx.Metadata().CreateBucketIfNotExists(indexTipsBucketName)
+	if err != nil {
+		return err
+	}
+	serialized := make([]byte, 4)
+	byteOrder.PutUint32(serialized, version)
+	return indexesBucket.Put(indexVersionKey(idxKey), serialized)
+}
+
+// checkIndexVersion returns the version of the records of the index with the
+// passed key and name, or an error if it is later than version, the latest
+// this bchd reads, since a later bchd built the index.  Dropping the index,
+// with dropFlag, has it rebuilt.
+func checkIndexVersion(db database.DB, idxKey []byte, idxName, dropFlag string, version uint32) (uint32, error) {
+	var stored uint32
+	err := db.View(func(dbTx database.Tx) error {
+		var err error
+		stored, err = dbFetchIndexVersion(dbTx, idxKey)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	if stored > version {
+		return 0, fmt.Errorf("the %s has version %d, which a later bchd "+
+			"built, and this one reads up to version %d; drop it with "+
+			"--%s, and it is rebuilt", idxName, stored, version, dropFlag)
+	}
+	return stored, nil
+}
+
+// stampIndexVersion marks an index that stores no version, as one built
+// before indexes stored their versions doesn't, as the passed version, whose
+// records it has.
+func stampIndexVersion(db database.DB, idxKey []byte, idxName string, version uint32) error {
+	return db.Update(func(dbTx database.Tx) error {
+		stored, err := dbFetchIndexVersion(dbTx, idxKey)
+		if err != nil || stored != 0 {
+			return err
+		}
+		log.Infof("Marking the %s as version %d", idxName, version)
+		return dbPutIndexVersion(dbTx, idxKey, version)
+	})
 }
 
 // maybeFinishDrops determines if each of the enabled indexes are in the middle
@@ -248,6 +347,13 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 		return errInterruptRequested
 	}
 
+	// Hand the chain to the indexes that read it.
+	for _, indexer := range m.enabledIndexes {
+		if user, ok := indexer.(ChainUser); ok {
+			user.UseChain(chain)
+		}
+	}
+
 	// Finish and drops that were previously interrupted.
 	if err := m.maybeFinishDrops(interrupt); err != nil {
 		return err
@@ -341,10 +447,18 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 			}
 
 			// We'll also grab the set of outputs spent by this
-			// block so we can remove them from the index.
-			spentTxos, err := chain.FetchSpendJournal(block)
-			if err != nil {
-				return err
+			// block so we can remove them from the index.  The
+			// journal of a block off the main chain may be gone, so
+			// only an index that needs them asks for them, and it
+			// can only be rebuilt without them.
+			var spentTxos []blockchain.SpentTxOut
+			if indexNeedsInputs(indexer) {
+				spentTxos, err = chain.FetchSpendJournal(block)
+				if err != nil {
+					return fmt.Errorf("can't roll the %s back from "+
+						"block %v, drop the index to rebuild it: %w",
+						indexer.Name(), hash, err)
+				}
 			}
 
 			// With the block and stxo set for that block retrieved,
@@ -352,11 +466,14 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 			err = m.db.Update(func(dbTx database.Tx) error {
 				// Remove all of the index entries associated
 				// with the block and update the indexer tip.
+				// The index's failure names it, while a read of
+				// the database that fails fails the update
+				// instead, as the database error it is.
 				err = dbIndexDisconnectBlock(
 					dbTx, indexer, block, spentTxos,
 				)
 				if err != nil {
-					return err
+					return indexError{name: indexer.Name(), err: err}
 				}
 
 				// Update the tip to the previous block.
@@ -453,9 +570,13 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 			}
 
 			err := m.db.Update(func(dbTx database.Tx) error {
-				return dbIndexConnectBlock(
+				err := dbIndexConnectBlock(
 					dbTx, indexer, block, spentTxos,
 				)
+				if err != nil {
+					return indexError{name: indexer.Name(), err: err}
+				}
+				return nil
 			})
 			if err != nil {
 				return err
@@ -515,6 +636,31 @@ func dbFetchTx(dbTx database.Tx, hash *chainhash.Hash) (*wire.MsgTx, error) {
 	return &msgTx, nil
 }
 
+// indexError is the error of an index that failed to connect or disconnect a
+// block, which names the index, so that the chain logs the failure as the
+// index's rather than as one to write the chain state.  It is not a
+// database.Error, which the chain answers with advice to rebuild the utxo set,
+// which leaves the index as it is.
+type indexError struct {
+	name string
+	err  error
+}
+
+// Error implements the error interface.
+func (e indexError) Error() string {
+	return e.err.Error()
+}
+
+// IndexName returns the name of the index that failed.
+func (e indexError) IndexName() string {
+	return e.name
+}
+
+// Unwrap returns the index's error.
+func (e indexError) Unwrap() error {
+	return e.err
+}
+
 // ConnectBlock must be invoked when a block is extending the main chain.  It
 // keeps track of the state of each index it is managing, performs some sanity
 // checks, and invokes each indexer.
@@ -548,7 +694,7 @@ func (m *Manager) ConnectBlock(dbTx database.Tx, block *bchutil.Block,
 
 		err := dbIndexConnectBlock(dbTx, index, block, stxos)
 		if err != nil {
-			return err
+			return indexError{name: index.Name(), err: err}
 		}
 	}
 	return nil
@@ -568,7 +714,7 @@ func (m *Manager) DisconnectBlock(dbTx database.Tx, block *bchutil.Block,
 	for _, index := range m.enabledIndexes {
 		err := dbIndexDisconnectBlock(dbTx, index, block, stxo)
 		if err != nil {
-			return err
+			return indexError{name: index.Name(), err: err}
 		}
 	}
 	return nil
@@ -584,6 +730,10 @@ func NewManager(db database.DB, enabledIndexes []Indexer) *Manager {
 		enabledIndexes: enabledIndexes,
 	}
 }
+
+// dropIndexBatch is the number of entries dropIndex deletes per database
+// transaction.
+var dropIndexBatch = 2000000
 
 // dropIndex drops the passed index from the database.  Since indexes can be
 // massive, it deletes the index in multiple database transactions in order to
@@ -627,7 +777,7 @@ func dropIndex(db database.DB, idxKey []byte, idxName string, interrupt <-chan s
 	// to avoid this, use a cursor to delete a maximum number of entries out
 	// of the bucket at a time. Recurse buckets depth-first to delete any
 	// sub-buckets.
-	const maxDeletions = 2000000
+	maxDeletions := dropIndexBatch
 	var totalDeleted uint64
 
 	// Recurse through all buckets in the index, cataloging each for
@@ -655,19 +805,28 @@ func dropIndex(db database.DB, idxKey []byte, idxName string, interrupt <-chan s
 		})
 	}
 
-	// Call subBucketClosure with top-level bucket.
+	// Call subBucketClosure with top-level bucket.  A drop resumed after
+	// the top-level bucket was deleted has no entries left to delete.
 	err = db.View(func(dbTx database.Tx) error {
+		if dbTx.Metadata().Bucket(idxKey) == nil {
+			return nil
+		}
 		return subBucketClosure(dbTx, idxKey, nil)
 	})
 	if err != nil {
-		return nil
+		return err
 	}
 
 	// Iterate through each sub-bucket in reverse, deepest-first, deleting
 	// all keys inside them and then dropping the buckets themselves.
 	for i := range subBuckets {
 		bucketName := subBuckets[len(subBuckets)-1-i]
-		// Delete maxDeletions key/value pairs at a time.
+		// Delete maxDeletions key/value pairs at a time.  Each batch
+		// continues after the last key the previous one deleted.  The
+		// deleted keys stay in the database until it compacts them, and a
+		// cursor started from the first key would step over all of them
+		// again, which makes the drop quadratic.
+		var last []byte
 		for numDeleted := maxDeletions; numDeleted == maxDeletions; {
 			numDeleted = 0
 			err := db.Update(func(dbTx database.Tx) error {
@@ -676,9 +835,14 @@ func dropIndex(db database.DB, idxKey []byte, idxName string, interrupt <-chan s
 					subBucket = subBucket.Bucket(subBucketName)
 				}
 				cursor := subBucket.Cursor()
-				for ok := cursor.First(); ok; ok = cursor.Next() &&
-					numDeleted < maxDeletions {
-
+				var ok bool
+				if last == nil {
+					ok = cursor.First()
+				} else {
+					ok = cursor.Seek(last)
+				}
+				for ; ok && numDeleted < maxDeletions; ok = cursor.Next() {
+					last = append(last[:0], cursor.Key()...)
 					if err := cursor.Delete(); err != nil {
 						return err
 					}
@@ -695,16 +859,18 @@ func dropIndex(db database.DB, idxKey []byte, idxName string, interrupt <-chan s
 				log.Infof("Deleted %d keys (%d total) from %s",
 					numDeleted, totalDeleted, idxName)
 			}
-		}
 
-		if interruptRequested(interrupt) {
-			return errInterruptRequested
+			// The drop is resumed on the next start, so it can stop
+			// between batches.
+			if interruptRequested(interrupt) {
+				return errInterruptRequested
+			}
 		}
 
 		// Drop the bucket itself.
 		err = db.Update(func(dbTx database.Tx) error {
 			bucket := dbTx.Metadata()
-			for j := 0; j < len(bucketName)-1; j++ {
+			for j := range len(bucketName) - 1 {
 				bucket = bucket.Bucket(bucketName[j])
 			}
 			return bucket.DeleteBucket(bucketName[len(bucketName)-1])
@@ -728,12 +894,15 @@ func dropIndex(db database.DB, idxKey []byte, idxName string, interrupt <-chan s
 		}
 	}
 
-	// Remove the index tip, index bucket, and in-progress drop flag now
-	// that all index entries have been removed.
+	// Remove the index tip, version, index bucket, and in-progress drop
+	// flag now that all index entries have been removed.
 	err = db.Update(func(dbTx database.Tx) error {
 		meta := dbTx.Metadata()
 		indexesBucket := meta.Bucket(indexTipsBucketName)
 		if err := indexesBucket.Delete(idxKey); err != nil {
+			return err
+		}
+		if err := indexesBucket.Delete(indexVersionKey(idxKey)); err != nil {
 			return err
 		}
 
