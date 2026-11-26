@@ -1,0 +1,38 @@
+# TEST ONLY: runs gcash/bchutil's own CI script on commits of the bchutil
+# fork, one job for each ref listed in bchutil-refs. Not for upstream.
+name: bchutil-ci-test-only
+on:
+  push:
+    branches:
+      - ci-bchutil
+permissions:
+  contents: read
+jobs:
+  refs:
+    runs-on: ubuntu-latest
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: refs
+        run: echo "refs=$(grep -v '^ *$' bchutil-refs | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+  build:
+    needs: refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJson(needs.refs.outputs.refs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchutil
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install golangci-lint
+        run: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.14.0
+      - name: Run goclean.sh
+        run: ./goclean.sh
