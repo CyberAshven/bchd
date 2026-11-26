@@ -1,5 +1,6 @@
-# TEST ONLY: runs gcash/neutrino's own CI script on a branch of the neutrino
-# fork, whose Actions are not enabled. Not for upstream.
+# TEST ONLY: runs gcash/neutrino's own CI script on trees of the neutrino PR
+# branches, copied into this throwaway branch, as the neutrino fork's
+# Actions are not enabled. Not for upstream.
 name: neutrino-ci-test-only
 on:
   push:
@@ -10,22 +11,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        tree: [n52, n53, n54, n56]
     steps:
       - uses: actions/checkout@v4
-      - name: Read the neutrino ref to test
-        id: ref
-        run: echo "ref=$(cat neutrino-ref)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          repository: CyberAshven/neutrino
-          ref: ${{ steps.ref.outputs.ref }}
-          path: neutrino
       - uses: actions/setup-go@v5
         with:
           go-version: stable
       - name: Install golangci-lint
         run: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.14.0
       - name: Run goclean.sh
-        working-directory: neutrino
-        run: ./goclean.sh
+        working-directory: ${{ matrix.tree }}
+        run: bash ./goclean.sh

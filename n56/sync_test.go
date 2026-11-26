@@ -1,0 +1,2047 @@
+package neutrino_test
+
+import (
+	"bytes"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gcash/neutrino/banman"
+
+	"github.com/gcash/bchd/bchec"
+	"github.com/gcash/bchd/btcjson"
+	"github.com/gcash/bchd/chaincfg"
+	"github.com/gcash/bchd/chaincfg/chainhash"
+	"github.com/gcash/bchd/integration/rpctest"
+	"github.com/gcash/bchd/rpcclient"
+	"github.com/gcash/bchd/txscript"
+	"github.com/gcash/bchd/wire"
+	"github.com/gcash/bchlog"
+	"github.com/gcash/bchutil"
+	"github.com/gcash/bchutil/gcs"
+	"github.com/gcash/bchutil/gcs/builder"
+	"github.com/gcash/bchwallet/waddrmgr"
+	"github.com/gcash/bchwallet/wallet/txauthor"
+	"github.com/gcash/bchwallet/walletdb"
+	_ "github.com/gcash/bchwallet/walletdb/bdb"
+	"github.com/gcash/neutrino"
+	"github.com/gcash/neutrino/filterdb"
+	"github.com/gcash/neutrino/headerfs"
+)
+
+var (
+	// Try bchlog.LevelInfo for output like you'd see in normal operation,
+	// or bchlog.LevelTrace to help debug code. Anything but
+	// bchlog.LevelOff turns on log messages from the tests themselves as
+	// well. Keep in mind some log messages may not appear in order due to
+	// use of multiple query goroutines in the tests.
+	logLevel    = bchlog.LevelOff
+	syncTimeout = 60 * time.Second
+	syncUpdate  = time.Second
+
+	// Don't set this too high for your platform, or the tests will miss
+	// messages.
+	// TODO: Make this a benchmark instead.
+	// TODO: Implement load limiting for both outgoing and incoming
+	// messages.
+	numQueryThreads = 20
+	queryOptions    = []neutrino.QueryOption{}
+
+	// The logged sequence of events we want to see. The value of i
+	// represents the block for which a loop is generating a log entry,
+	// given for readability only.
+	// "fc" xx:	OnFilteredBlockConnected with xx (uint8) relevant TXs
+	// "fd":	OnFilteredBlockDisconnected
+	wantLog = func() (log []byte) {
+		for i := 1096; i <= 1100; i++ {
+			// FilteredBlockConnected
+			log = append(log, []byte("fc")...)
+			// 0 relevant TXs
+			log = append(log, 0x00)
+		}
+		// Block with one relevant (receive) transaction
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x01)
+		// 124 blocks with nothing
+		for i := 1102; i <= 1225; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x00)
+		}
+		// Block with 1 redeeming transaction
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x01)
+		// Block with nothing
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x00)
+		// Update with rewind - rewind back to 1095, add another address,
+		// and see more interesting transactions.
+		for i := 1227; i >= 1096; i-- {
+			// FilteredBlockDisconnected
+			log = append(log, []byte("fd")...)
+		}
+		// Forward to 1100
+		for i := 1096; i <= 1100; i++ {
+			// FilteredBlockConnected
+			log = append(log, []byte("fc")...)
+			// 0 relevant TXs
+			log = append(log, 0x00)
+		}
+		// Block with two relevant (receive) transactions
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x02)
+		// 124 blocks with nothing
+		for i := 1102; i <= 1225; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x00)
+		}
+		// 2 blocks with 1 redeeming transaction each
+		for i := 1226; i <= 1227; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x01)
+		}
+		// Block with nothing
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x00)
+		// 3 block rollback
+		for i := 1228; i >= 1226; i-- {
+			log = append(log, []byte("fd")...)
+		}
+		// 1 block reorg with 2 redeeming transactions
+		log = append(log, []byte("fc")...)
+		log = append(log, 0x02)
+		// 4 block empty reorg
+		for i := 1227; i <= 1230; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x00)
+		}
+		// 5 block rollback
+		for i := 1230; i >= 1226; i-- {
+			log = append(log, []byte("fd")...)
+		}
+		// 2 blocks with 1 redeeming transaction each
+		for i := 1226; i <= 1227; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x01)
+		}
+		// 8 block rest of reorg
+		for i := 1228; i <= 1235; i++ {
+			log = append(log, []byte("fc")...)
+			log = append(log, 0x00)
+		}
+		return log
+	}()
+
+	// rescanMtx locks all the variables to which the rescan goroutine's
+	// notifications write.
+	rescanMtx sync.RWMutex
+
+	// gotLog is where we accumulate the event log from the rescan. Then we
+	// compare it to wantLog to see if the series of events the rescan saw
+	// happened as expected.
+	gotLog []byte
+
+	// curFilteredBlockHeight lets the rescan goroutine track where it
+	// thinks the chain is based on OnFilteredBlockConnected and
+	// OnFilteredBlockDisconnected.
+	curFilteredBlockHeight int32
+
+	// ourKnownTxsByFilteredBlock lets the rescan goroutine keep track of
+	// transactions we're interested in that are in the blockchain we're
+	// following as signalled by OnFilteredBlockConnected and
+	// OnFilteredBlockDisconnected.
+	ourKnownTxsByFilteredBlock = make(map[chainhash.Hash][]*bchutil.Tx)
+)
+
+// secSource is an implementation of bchwallet/txauthor/SecretsSource that
+// stores WitnessPubKeyHash addresses.
+type secSource struct {
+	keys    map[string]*bchec.PrivateKey
+	scripts map[string]*[]byte
+	params  *chaincfg.Params
+}
+
+func (s *secSource) add(privKey *bchec.PrivateKey) (bchutil.Address, error) {
+	pubKeyHash := bchutil.Hash160(privKey.PubKey().SerializeCompressed())
+	addr, err := bchutil.NewAddressPubKeyHash(pubKeyHash, s.params)
+	if err != nil {
+		return nil, err
+	}
+	script, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		return nil, err
+	}
+	s.keys[addr.String()] = privKey
+	s.scripts[addr.String()] = &script
+	_, addrs, _, err := txscript.ExtractPkScriptAddrs(script, s.params)
+	if err != nil {
+		return nil, err
+	}
+	if addrs[0].String() != addr.String() {
+		return nil, fmt.Errorf("Encoded and decoded addresses don't "+
+			"match. Encoded: %s, decoded: %s", addr, addrs[0])
+	}
+	return addr, nil
+}
+
+// GetKey is required by the txscript.KeyDB interface
+func (s *secSource) GetKey(addr bchutil.Address) (*bchec.PrivateKey, bool,
+	error) {
+	privKey, ok := s.keys[addr.String()]
+	if !ok {
+		return nil, true, fmt.Errorf("No key for address %s", addr)
+	}
+	return privKey, true, nil
+}
+
+// GetScript is required by the txscript.ScriptDB interface
+func (s *secSource) GetScript(addr bchutil.Address) ([]byte, error) {
+	script, ok := s.scripts[addr.String()]
+	if !ok {
+		return nil, fmt.Errorf("No script for address %s", addr)
+	}
+	return *script, nil
+}
+
+// ChainParams is required by the SecretsSource interface
+func (s *secSource) ChainParams() *chaincfg.Params {
+	return s.params
+}
+
+func newSecSource(params *chaincfg.Params) *secSource {
+	return &secSource{
+		keys:    make(map[string]*bchec.PrivateKey),
+		scripts: make(map[string]*[]byte),
+		params:  params,
+	}
+}
+
+type neutrinoHarness struct {
+	h1, h2, h3 *rpctest.Harness
+	svc        *neutrino.ChainService
+}
+
+type syncTestCase struct {
+	name string
+	test func(harness *neutrinoHarness, t *testing.T)
+}
+
+var testCases = []*syncTestCase{
+	{
+		name: "one-shot rescan",
+		test: testRescan,
+	},
+	{
+		name: "start long-running rescan",
+		test: testStartRescan,
+	},
+	{
+		name: "test blocks and filters in random order",
+		test: testRandomBlocks,
+	},
+	{
+		name: "check long-running rescan results",
+		test: testRescanResults,
+	},
+	{
+		name: "initial sync",
+		test: testInitialSync,
+	},
+}
+
+// Make sure the client synchronizes with the correct node.
+func testInitialSync(harness *neutrinoHarness, t *testing.T) {
+	err := waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+}
+
+// Variables used to track state between multiple rescan tests.
+var (
+	quitRescan                chan struct{}
+	errChan                   <-chan error
+	rescan                    *neutrino.Rescan
+	startBlock                waddrmgr.BlockStamp
+	secSrc                    *secSource
+	addr1, addr2, addr3       bchutil.Address
+	script1, script2, script3 []byte
+	tx1, tx2                  *wire.MsgTx
+	ourOutPoint               wire.OutPoint
+)
+
+// testRescan tests several rescan modes. This should be broken up into
+// smaller tests.
+func testRescan(harness *neutrinoHarness, t *testing.T) {
+	// Generate an address and send it some coins on the h1 chain. We use
+	// this to test rescans and notifications.
+	modParams := harness.svc.ChainParams()
+	secSrc = newSecSource(&modParams)
+	privKey1, err := bchec.NewPrivateKey(bchec.S256())
+	if err != nil {
+		t.Fatalf("Couldn't generate private key: %s", err)
+	}
+	addr1, err = secSrc.add(privKey1)
+	if err != nil {
+		t.Fatalf("Couldn't create address from key: %s", err)
+	}
+	script1, err = secSrc.GetScript(addr1)
+	if err != nil {
+		t.Fatalf("Couldn't create script from address: %s", err)
+	}
+	out1 := wire.TxOut{
+		PkScript: script1,
+		Value:    1000000000,
+	}
+	// Fee rate is satoshis per byte
+	tx1, err = harness.h1.CreateTransaction(
+		[]*wire.TxOut{&out1}, 1000, true,
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create transaction from script: %s", err)
+	}
+	_, err = harness.h1.Node.SendRawTransaction(tx1, true)
+	if err != nil {
+		t.Fatalf("Unable to send raw transaction to node: %s", err)
+	}
+	privKey2, err := bchec.NewPrivateKey(bchec.S256())
+	if err != nil {
+		t.Fatalf("Couldn't generate private key: %s", err)
+	}
+	addr2, err = secSrc.add(privKey2)
+	if err != nil {
+		t.Fatalf("Couldn't create address from key: %s", err)
+	}
+	script2, err = secSrc.GetScript(addr2)
+	if err != nil {
+		t.Fatalf("Couldn't create script from address: %s", err)
+	}
+	out2 := wire.TxOut{
+		PkScript: script2,
+		Value:    1000000000,
+	}
+	// Fee rate is satoshis per byte
+	tx2, err = harness.h1.CreateTransaction(
+		[]*wire.TxOut{&out2}, 1000, true,
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create transaction from script: %s", err)
+	}
+	_, err = harness.h1.Node.SendRawTransaction(tx2, true)
+	if err != nil {
+		t.Fatalf("Unable to send raw transaction to node: %s", err)
+	}
+	_, err = harness.h1.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit block: %s", err)
+	}
+	// This first sync includes the initial one, which takes longer when
+	// h1 wins the race to connect: neutrino then never drops h2 and h3,
+	// and waits QueryTimeout whenever they leave a cfheaders query for
+	// h1's chain unanswered.
+	syncTimeout *= 2
+	err = waitForSync(t, harness.svc, harness.h1)
+	syncTimeout /= 2
+	if err != nil {
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+
+	// Call GetUtxo for our output in tx1 to see if it's spent.
+	ourIndex := 1 << 30 // Should work on 32-bit systems
+	for i, txo := range tx1.TxOut {
+		if bytes.Equal(txo.PkScript, script1) {
+			ourIndex = i
+		}
+	}
+	if ourIndex != 1<<30 {
+		ourOutPoint = wire.OutPoint{
+			Hash:  tx1.TxHash(),
+			Index: uint32(ourIndex),
+		}
+	} else {
+		t.Fatalf("Couldn't find the index of our output in transaction"+
+			" %s", tx1.TxHash())
+	}
+	spendReport, err := harness.svc.GetUtxo(
+		neutrino.WatchInputs(neutrino.InputWithScript{
+			PkScript: script1,
+			OutPoint: ourOutPoint,
+		}),
+		neutrino.StartBlock(&waddrmgr.BlockStamp{Height: 1101}),
+	)
+	if err != nil {
+		t.Fatalf("Couldn't get UTXO %s: %s", ourOutPoint, err)
+	}
+	if !bytes.Equal(spendReport.Output.PkScript, script1) {
+		t.Fatalf("UTXO's script doesn't match expected script for %s",
+			ourOutPoint)
+	}
+
+}
+
+func testStartRescan(harness *neutrinoHarness, t *testing.T) {
+	// Start a rescan with notifications in another goroutine. We'll kill
+	// it with a quit channel at the end and make sure we got the expected
+	// results.
+	quitRescan = make(chan struct{})
+	startBlock = waddrmgr.BlockStamp{Height: 1095}
+	rescan, errChan = startRescan(t, harness.svc, addr1, &startBlock,
+		quitRescan)
+	err := waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err := checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 1 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 1, got:"+
+			" %d", numTXs)
+	}
+
+	// Generate 124 blocks on h1 to make sure it reorgs the other nodes.
+	// Ensure the ChainService instance stays caught up.
+	_, _ = harness.h1.Node.Generate(124)
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+
+	// Connect/sync/disconnect h2 to make it reorg to the h1 chain.
+	err = csd([]*rpctest.Harness{harness.h1, harness.h2})
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync h2 to h1: %s", err)
+	}
+
+	// Spend the outputs we sent ourselves over two blocks.
+	inSrc := func(tx wire.MsgTx) func(target bchutil.Amount) (
+		total bchutil.Amount, inputs []*wire.TxIn,
+		inputValues []bchutil.Amount, scripts [][]byte, err error) {
+		ourIndex := 1 << 30 // Should work on 32-bit systems
+		for i, txo := range tx.TxOut {
+			if bytes.Equal(txo.PkScript, script1) ||
+				bytes.Equal(txo.PkScript, script2) {
+				ourIndex = i
+			}
+		}
+		return func(target bchutil.Amount) (total bchutil.Amount,
+			inputs []*wire.TxIn, inputValues []bchutil.Amount,
+			scripts [][]byte, err error) {
+			if ourIndex == 1<<30 {
+				err = fmt.Errorf("Couldn't find our address " +
+					"in the passed transaction's outputs.")
+				return
+			}
+			total = target
+			inputs = []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{
+						Hash:  tx.TxHash(),
+						Index: uint32(ourIndex),
+					},
+				},
+			}
+			inputValues = []bchutil.Amount{
+				bchutil.Amount(tx.TxOut[ourIndex].Value)}
+			scripts = [][]byte{tx.TxOut[ourIndex].PkScript}
+			err = nil
+			return
+		}
+	}
+
+	// waitTx will poll for a transaction to appear on given node for up to
+	// 5 seconds.
+	waitTx := func(node *rpcclient.Client, hash chainhash.Hash) {
+		t.Helper()
+		exitTimer := time.NewTimer(5 * time.Second)
+		defer exitTimer.Stop()
+		for {
+			<-time.After(200 * time.Millisecond)
+
+			select {
+			case <-exitTimer.C:
+				t.Fatalf("Timeout waiting to see transaction.")
+			default:
+			}
+
+			if _, err := node.GetRawTransaction(&hash); err != nil {
+				continue
+			}
+
+			return
+		}
+	}
+
+	// Create another address to send to so we don't trip the rescan with
+	// the old address and we can test monitoring both OutPoint usage and
+	// receipt by addresses.
+	privKey3, err := bchec.NewPrivateKey(bchec.S256())
+	if err != nil {
+		t.Fatalf("Couldn't generate private key: %s", err)
+	}
+	addr3, err = secSrc.add(privKey3)
+	if err != nil {
+		t.Fatalf("Couldn't create address from key: %s", err)
+	}
+	script3, err = secSrc.GetScript(addr3)
+	if err != nil {
+		t.Fatalf("Couldn't create script from address: %s", err)
+	}
+	out3 := wire.TxOut{
+		PkScript: script3,
+		Value:    500000000,
+	}
+	// Spend the first transaction and mine a block.
+	authTx1, err := txauthor.NewUnsignedTransaction(
+		[]*wire.TxOut{
+			&out3,
+		},
+		// Fee rate is satoshis per kilobyte
+		1024000,
+		inSrc(*tx1),
+		func() ([]byte, error) {
+			return script3, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create unsigned transaction: %s", err)
+	}
+	err = authTx1.AddAllInputScripts(secSrc)
+	if err != nil {
+		t.Fatalf("Couldn't sign transaction: %s", err)
+	}
+
+	banPeer(t, harness.svc, harness.h2)
+	err = harness.svc.SendTransaction(authTx1.Tx)
+	if err != nil && !strings.Contains(err.Error(), "already have") {
+		t.Fatalf("Unable to send transaction to network: %s", err)
+	}
+	// SendTransaction does not know when the MsgTx was actually sent, only
+	// that a getdata request was received and a MsgTx queued to send.
+	waitTx(harness.h1.Node, authTx1.Tx.TxHash())
+	_, err = harness.h1.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit block: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err = checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 2 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 2, got:"+
+			" %d", numTXs)
+	}
+	// Spend the second transaction and mine a block.
+	authTx2, err := txauthor.NewUnsignedTransaction(
+		[]*wire.TxOut{
+			&out3,
+		},
+		// Fee rate is satoshis per kilobyte
+		1024000,
+		inSrc(*tx2),
+		func() ([]byte, error) {
+			return script3, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create unsigned transaction: %s", err)
+	}
+	err = authTx2.AddAllInputScripts(secSrc)
+	if err != nil {
+		t.Fatalf("Couldn't sign transaction: %s", err)
+	}
+
+	banPeer(t, harness.svc, harness.h2)
+	err = harness.svc.SendTransaction(authTx2.Tx)
+	if err != nil && !strings.Contains(err.Error(), "already have") {
+		t.Fatalf("Unable to send transaction to network: %s", err)
+	}
+	waitTx(harness.h1.Node, authTx2.Tx.TxHash())
+	_, err = harness.h1.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit block: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err = checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 2 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 2, got:"+
+			" %d", numTXs)
+	}
+
+	// Update the filter with the second address, and we should have 2 more
+	// relevant transactions.
+	err = rescan.Update(neutrino.AddAddrs(addr2), neutrino.Rewind(1095))
+	if err != nil {
+		t.Fatalf("Couldn't update the rescan filter: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err = checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 4 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 4, got:"+
+			" %d", numTXs)
+	}
+
+	// Generate a block with a nonstandard coinbase to generate a basic
+	// filter with 0 entries.
+	_, err = harness.h1.GenerateAndSubmitBlockWithCustomCoinbaseOutputs(
+		[]*bchutil.Tx{}, rpctest.BlockVersion, time.Time{},
+		[]wire.TxOut{{
+			Value:    0,
+			PkScript: []byte{},
+		}})
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit block: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+
+	// Check and make sure the previous UTXO is now spent.
+	spendReport, err := harness.svc.GetUtxo(
+		neutrino.WatchInputs(neutrino.InputWithScript{
+			PkScript: script1,
+			OutPoint: ourOutPoint,
+		}),
+		neutrino.StartBlock(&waddrmgr.BlockStamp{Height: 801}),
+	)
+	if err != nil {
+		t.Fatalf("Couldn't get UTXO %s: %s", ourOutPoint, err)
+	}
+	if spendReport.SpendingTx == nil {
+		t.Fatalf("Unable to find initial transaction")
+	}
+	if spendReport.SpendingTx.TxHash() != authTx1.Tx.TxHash() {
+		t.Fatalf("Redeeming transaction doesn't match expected "+
+			"transaction: want %s, got %s", authTx1.Tx.TxHash(),
+			spendReport.SpendingTx.TxHash())
+	}
+}
+
+//nolint:unused // retained for future tests.
+func fetchPrevInputScripts(block *wire.MsgBlock, client *rpctest.Harness) ([][]byte, error) {
+	var inputScripts [][]byte
+	for i, tx := range block.Transactions {
+		if i == 0 {
+			continue
+		}
+
+		for _, txIn := range tx.TxIn {
+			prevTxHash := txIn.PreviousOutPoint.Hash
+
+			prevTx, err := client.Node.GetRawTransaction(&prevTxHash)
+			if err != nil {
+				return nil, err
+			}
+
+			prevIndex := txIn.PreviousOutPoint.Index
+			prevOutput := prevTx.MsgTx().TxOut[prevIndex]
+
+			inputScripts = append(inputScripts, prevOutput.PkScript)
+		}
+	}
+
+	return inputScripts, nil
+}
+
+func testRescanResults(harness *neutrinoHarness, t *testing.T) {
+	// Generate 5 blocks on h2 and wait for ChainService to sync to the
+	// newly-best chain on h2. This will reorg the chain, including the
+	// transactions broadcast earlier, so we'll have to check that the
+	// rescan status has updated for the correct number of transactions.
+	// However, with the addition of the reliable broadcaster, the
+	// transaction will confirm once again on the h2 chain so the rescan
+	// should still show the two received transactions in addition to the
+	// two other transactions spending them.
+	_, err := harness.h2.Node.Generate(5)
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit blocks: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h2)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err := checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 4 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 4, got:"+
+			" %d", numTXs)
+	}
+
+	// Generate 7 blocks on h1 and wait for ChainService to sync to the
+	// newly-best chain on h1.
+	_, err = harness.h1.Node.Generate(7)
+	if err != nil {
+		t.Fatalf("Couldn't generate/submit block: %s", err)
+	}
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+	numTXs, _, err = checkRescanStatus()
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Checking rescan status failed: %s", err)
+	}
+	if numTXs != 4 {
+		t.Fatalf("Wrong number of relevant transactions. Want: 4, got:"+
+			" %d", numTXs)
+	}
+
+	if !bytes.Equal(wantLog, gotLog) {
+		leastBytes := len(wantLog)
+		if len(gotLog) < leastBytes {
+			leastBytes = len(gotLog)
+		}
+		diffIndex := 0
+		for i := 0; i < leastBytes; i++ {
+			if wantLog[i] != gotLog[i] {
+				diffIndex = i
+				break
+			}
+		}
+		t.Fatalf("Rescan event logs differ starting at %d.\nWant: %v\n"+
+			"Got:  %v\nDifference - want: %v\nDifference -- got: "+
+			"%v", diffIndex, wantLog, gotLog, wantLog[diffIndex:],
+			gotLog[diffIndex:])
+	}
+
+	// Connect h1 and h2, wait for them to synchronize and check for the
+	// ChainService synchronization status.
+	err = rpctest.ConnectNode(harness.h1, harness.h2)
+	if err != nil {
+		t.Fatalf("Couldn't connect h1 to h2: %s", err)
+	}
+
+	err = rpctest.JoinNodes([]*rpctest.Harness{harness.h1, harness.h2},
+		rpctest.Blocks)
+	if err != nil {
+		t.Fatalf("Couldn't sync h1 and h2: %s", err)
+	}
+
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+
+	// Now generate a bunch of blocks on each while they're connected,
+	// triggering many tiny reorgs, and wait for sync again. The end result
+	// is somewhat random, depending on how quickly the nodes process each
+	// other's notifications vs finding new blocks, but the two nodes should
+	// remain fully synchronized with each other at the end.
+	go func() { _, _ = harness.h2.Node.Generate(75) }()
+	_, _ = harness.h1.Node.Generate(50)
+
+	err = rpctest.JoinNodes([]*rpctest.Harness{harness.h1, harness.h2},
+		rpctest.Blocks)
+	if err != nil {
+		t.Fatalf("Couldn't sync h1 and h2: %s", err)
+	}
+
+	// We increase the timeout because running on Travis with race
+	// detection enabled can make this pretty slow.
+	syncTimeout *= 2
+	err = waitForSync(t, harness.svc, harness.h1)
+	if err != nil {
+		checkErrChan(t, errChan)
+		t.Fatalf("Couldn't sync ChainService: %s", err)
+	}
+
+	close(quitRescan)
+	err = <-errChan
+	quitRescan = nil
+	if err != neutrino.ErrRescanExit {
+		t.Fatalf("Rescan ended with error: %s", err)
+	}
+
+	// Immediately try to add a new update to to the rescan that was just
+	// shut down. This should fail as it is no longer running.
+	rescan.WaitForShutdown()
+	err = rescan.Update(neutrino.AddAddrs(addr2), neutrino.Rewind(1095))
+	if err == nil {
+		t.Fatalf("Expected update call to fail, it did not")
+	}
+}
+
+// testRandomBlocks goes through all blocks in random order and ensures we can
+// correctly get cfilters from them. It uses numQueryThreads goroutines running
+// at the same time to go through this. 50 is comfortable on my somewhat dated
+// laptop with default query optimization settings.
+// TODO: Make this a benchmark instead.
+func testRandomBlocks(harness *neutrinoHarness, t *testing.T) {
+	var haveBest *waddrmgr.BlockStamp
+	haveBest, err := harness.svc.BestBlock()
+	if err != nil {
+		t.Fatalf("Couldn't get best snapshot from ChainService: %s", err)
+	}
+	// Keep track of an error channel with enough buffer space to track one
+	// error per block.
+	errChan := make(chan error, haveBest.Height)
+	// Test getting all of the blocks and filters.
+	var wg sync.WaitGroup
+	workerQueue := make(chan struct{}, numQueryThreads)
+	for i := int32(1); i <= haveBest.Height; i++ {
+		wg.Add(1)
+		height := uint32(i)
+		// Wait until there's room in the worker queue.
+		workerQueue <- struct{}{}
+		go func() {
+			// On exit, open a spot in workerQueue and tell the
+			// wait group we're done.
+			defer func() {
+				<-workerQueue
+			}()
+			defer wg.Done()
+			// Get block header from database.
+			blockHeader, err := harness.svc.BlockHeaders.
+				FetchHeaderByHeight(height)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get block "+
+					"header by height %d: %s", height, err)
+				return
+			}
+			blockHash := blockHeader.BlockHash()
+			// Get block via RPC.
+			wantBlock, err := harness.h1.Node.GetBlock(&blockHash)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get block %d "+
+					"(%s) by RPC", height, blockHash)
+				return
+			}
+			// Get block from network.
+			haveBlock, err := harness.svc.GetBlock(
+				blockHash, queryOptions...,
+			)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if haveBlock == nil {
+				errChan <- fmt.Errorf("Couldn't get block %d "+
+					"(%s) from network", height, blockHash)
+				return
+			}
+			// Check that network and RPC blocks match.
+			if !reflect.DeepEqual(*haveBlock.MsgBlock(),
+				*wantBlock) {
+				errChan <- fmt.Errorf("Block from network "+
+					"doesn't match block from RPC. Want: "+
+					"%s, RPC: %s, network: %s", blockHash,
+					wantBlock.BlockHash(),
+					haveBlock.MsgBlock().BlockHash())
+				return
+			}
+			// Check that block height matches what we have.
+			if height != uint32(haveBlock.Height()) {
+				errChan <- fmt.Errorf("Block height from "+
+					"network doesn't match expected "+
+					"height. Want: %v, network: %v",
+					height, haveBlock.Height())
+				return
+			}
+			// Get basic cfilter from network.
+			haveFilter, err := harness.svc.GetCFilter(blockHash,
+				wire.GCSFilterRegular, queryOptions...)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			// Get basic cfilter from RPC.
+			wantFilter, err := harness.h1.Node.GetCFilter(
+				&blockHash, wire.GCSFilterRegular)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get basic "+
+					"filter for block %d (%s) via RPC: %s",
+					height, blockHash, err)
+				return
+			}
+			// Check that network and RPC cfilters match.
+			var haveBytes []byte
+			if haveFilter != nil {
+				haveBytes, err = haveFilter.NBytes()
+				if err != nil {
+					errChan <- fmt.Errorf("Couldn't get "+
+						"basic filter for block %d "+
+						"(%s) via P2P: %s", height,
+						blockHash, err)
+					return
+				}
+			}
+			if !bytes.Equal(haveBytes, wantFilter.Data) {
+				errChan <- fmt.Errorf("Basic filter from P2P "+
+					"network/DB doesn't match RPC value "+
+					"for block %d (%s):\nRPC: %s\nNet: %s",
+					height, blockHash,
+					hex.EncodeToString(wantFilter.Data),
+					hex.EncodeToString(haveBytes))
+				return
+			}
+
+			// Calculate basic filter from block.
+			calcFilter, err := builder.BuildBasicFilter(haveBlock.MsgBlock())
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't build basic "+
+					"filter for block %d (%s): %s", height,
+					blockHash, err)
+				return
+			}
+			calcBytes, err := calcFilter.NBytes()
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get bytes from"+
+					" calculated basic filter for block "+
+					"%d (%s): %s", height, blockHash, err)
+			}
+			// Check that the network value matches the calculated
+			// value from the block.
+			if !bytes.Equal(haveBytes, calcBytes) {
+				errChan <- fmt.Errorf("Basic filter from P2P "+
+					"network/DB doesn't match calculated "+
+					"value for block %d (%s)", height,
+					blockHash)
+				return
+			}
+			// Get previous basic filter header from the database.
+			prevHeader, err := harness.svc.RegFilterHeaders.
+				FetchHeader(&blockHeader.PrevBlock)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get basic "+
+					"filter header for block %d (%s) from "+
+					"DB: %s", height-1,
+					blockHeader.PrevBlock, err)
+				return
+			}
+			// Get current basic filter header from the database.
+			curHeader, err := harness.svc.RegFilterHeaders.
+				FetchHeader(&blockHash)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't get basic "+
+					"filter header for block %d (%s) from "+
+					"DB: %s", height, blockHash, err)
+				return
+			}
+			// Check that the filter and header line up.
+			calcHeader, err := builder.MakeHeaderForFilter(
+				calcFilter, *prevHeader)
+			if err != nil {
+				errChan <- fmt.Errorf("Couldn't calculate "+
+					"header for basic filter for block "+
+					"%d (%s): %s", height, blockHash, err)
+				return
+			}
+			if !bytes.Equal(curHeader[:], calcHeader[:]) {
+				errChan <- fmt.Errorf("Filter header doesn't "+
+					"match. Want: %s, got: %s", curHeader,
+					calcHeader)
+				return
+			}
+		}()
+	}
+	// Wait for all queries to finish.
+	wg.Wait()
+	// Close the error channel to make the error monitoring goroutine
+	// finish.
+	close(errChan)
+	var lastErr error
+	for err := range errChan {
+		if err != nil {
+			t.Errorf("%s", err)
+			lastErr = fmt.Errorf("Couldn't validate all " +
+				"blocks, filters, and filter headers.")
+		}
+	}
+	if logLevel != bchlog.LevelOff {
+		t.Logf("Finished checking %d blocks and their cfilters",
+			haveBest.Height)
+	}
+	if lastErr != nil {
+		t.Fatal(lastErr)
+	}
+}
+
+func TestNeutrinoSync(t *testing.T) {
+	// Set up logging.
+	logger := bchlog.NewBackend(os.Stdout)
+	chainLogger := logger.Logger("CHAIN")
+	chainLogger.SetLevel(logLevel)
+	neutrino.UseLogger(chainLogger)
+	rpcLogger := logger.Logger("RPCC")
+	rpcLogger.SetLevel(logLevel)
+	rpcclient.UseLogger(rpcLogger)
+
+	// Create a bchd SimNet node and generate 800 blocks
+	h1, err := rpctest.New(
+		&chaincfg.SimNetParams, nil, []string{"--txindex"},
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create harness: %s", err)
+	}
+	defer func() { _ = h1.TearDown() }()
+	err = h1.SetUp(false, 0)
+	if err != nil {
+		t.Fatalf("Couldn't set up harness: %s", err)
+	}
+	_, err = h1.Node.Generate(800)
+	if err != nil {
+		t.Fatalf("Couldn't generate blocks: %s", err)
+	}
+
+	// Create a second bchd SimNet node
+	h2, err := rpctest.New(
+		&chaincfg.SimNetParams, nil, []string{"--txindex"},
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create harness: %s", err)
+	}
+	defer func() { _ = h2.TearDown() }()
+	err = h2.SetUp(false, 0)
+	if err != nil {
+		t.Fatalf("Couldn't set up harness: %s", err)
+	}
+
+	// Create a third bchd SimNet node and generate 1200 blocks
+	h3, err := rpctest.New(
+		&chaincfg.SimNetParams, nil, []string{"--txindex"},
+	)
+	if err != nil {
+		t.Fatalf("Couldn't create harness: %s", err)
+	}
+	defer func() { _ = h3.TearDown() }()
+	err = h3.SetUp(false, 0)
+	if err != nil {
+		t.Fatalf("Couldn't set up harness: %s", err)
+	}
+	_, err = h3.Node.Generate(1200)
+	if err != nil {
+		t.Fatalf("Couldn't generate blocks: %s", err)
+	}
+
+	// Connect, sync, and disconnect h1 and h2
+	err = csd([]*rpctest.Harness{h1, h2})
+	if err != nil {
+		t.Fatalf("Couldn't connect/sync/disconnect h1 and h2: %s", err)
+	}
+
+	// Generate 300 blocks on the first node and 350 on the second
+	_, err = h1.Node.Generate(300)
+	if err != nil {
+		t.Fatalf("Couldn't generate blocks: %s", err)
+	}
+	_, err = h2.Node.Generate(350)
+	if err != nil {
+		t.Fatalf("Couldn't generate blocks: %s", err)
+	}
+
+	// Now we have a node with 1100 blocks (h1), 1150 blocks (h2), and
+	// 1200 blocks (h3). The chains of nodes h1 and h2 match up to block
+	// 800. By default, a synchronizing wallet connected to all three
+	// should synchronize to h3. However, we're going to take checkpoints
+	// from h1 at 111, 333, 555, 777, and 999, and add those to the
+	// synchronizing wallet's chain parameters so that it should
+	// disconnect from h3 at block 111, and from h2 at block 555, and
+	// then synchronize to block 800 from h1. Order of connection is
+	// unfortunately not guaranteed, so the reorg may not happen with every
+	// test.
+
+	// Copy parameters and insert checkpoints
+	modParams := chaincfg.SimNetParams
+	for _, height := range []int64{111, 333, 555, 777, 999} {
+		hash, err := h1.Node.GetBlockHash(height)
+		if err != nil {
+			t.Fatalf("Couldn't get block hash for height %d: %s",
+				height, err)
+		}
+		modParams.Checkpoints = append(modParams.Checkpoints,
+			chaincfg.Checkpoint{
+				Hash:   hash,
+				Height: int32(height),
+			})
+	}
+
+	// Create a temporary directory, initialize an empty walletdb with an
+	// SPV chain namespace, and create a configuration for the ChainService.
+	tempDir, err := os.MkdirTemp("", "neutrino")
+	if err != nil {
+		t.Fatalf("Failed to create temporary directory: %s", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+	db, err := walletdb.Create("bdb", tempDir+"/weks.db", true)
+	if err != nil {
+		t.Fatal("Failed to create wallet")
+	}
+	defer func() { _ = db.Close() }()
+	if err != nil {
+		t.Fatalf("Error opening DB: %s\n", err)
+	}
+	config := neutrino.Config{
+		DataDir:     tempDir,
+		Database:    db,
+		ChainParams: modParams,
+		AddPeers: []string{
+			h3.P2PAddress(),
+			h2.P2PAddress(),
+			h1.P2PAddress(),
+		},
+	}
+
+	neutrino.MaxPeers = 3
+	neutrino.BanDuration = 5 * time.Second
+	neutrino.QueryPeerConnectTimeout = 10 * time.Second
+	// A peer that times out on the initial cfheaders batch sits out the
+	// rest of it, so the batch reaches h1 rather than bouncing between h2
+	// and h3, which can't answer it.
+	neutrino.QueryPeerCooldown = time.Minute
+	svc, err := neutrino.NewChainService(config)
+	if err != nil {
+		t.Fatalf("Error creating ChainService: %s", err)
+	}
+	_ = svc.Start()
+	defer func() { _ = svc.Stop() }()
+
+	// Create a test harness with the three nodes and the neutrino instance.
+	testHarness := &neutrinoHarness{h1, h2, h3, svc}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			test.test(testHarness, t)
+		})
+	}
+}
+
+// csd does a connect-sync-disconnect between nodes in order to support
+// reorg testing. It brings up and tears down a temporary node, otherwise the
+// nodes try to reconnect to each other which results in unintended reorgs.
+func csd(harnesses []*rpctest.Harness) error {
+	hTemp, err := rpctest.New(&chaincfg.SimNetParams, nil, nil)
+	if err != nil {
+		return err
+	}
+	// Tear down node at the end of the function.
+	defer func() { _ = hTemp.TearDown() }()
+	err = hTemp.SetUp(false, 0)
+	if err != nil {
+		return err
+	}
+	for _, harness := range harnesses {
+		err = rpctest.ConnectNode(hTemp, harness)
+		if err != nil {
+			return err
+		}
+	}
+	return rpctest.JoinNodes(harnesses, rpctest.Blocks)
+}
+
+// checkErrChan tries to read the passed error channel if possible and logs the
+// error it found, if any. This is useful to help troubleshoot any timeouts
+// during a rescan.
+func checkErrChan(t *testing.T, errChan <-chan error) {
+	select {
+	case err := <-errChan:
+		t.Logf("Got error from rescan: %s", err)
+	default:
+	}
+}
+
+// waitForSync waits for the ChainService to sync to the current chain state.
+func waitForSync(t *testing.T, svc *neutrino.ChainService,
+	correctSyncNode *rpctest.Harness) error {
+	knownBestHash, knownBestHeight, err :=
+		correctSyncNode.Node.GetBestBlock()
+	if err != nil {
+		return err
+	}
+	if logLevel != bchlog.LevelOff {
+		t.Logf("Syncing to %d (%s)", knownBestHeight, knownBestHash)
+	}
+	var haveBest *waddrmgr.BlockStamp
+	haveBest, err = svc.BestBlock()
+	if err != nil {
+		return fmt.Errorf("Couldn't get best snapshot from "+
+			"ChainService: %s", err)
+	}
+	var total time.Duration
+	for haveBest.Hash != *knownBestHash {
+		if total > syncTimeout {
+			return fmt.Errorf("Timed out after %v waiting for "+
+				"header synchronization.\n%s", syncTimeout,
+				goroutineDump())
+		}
+		if haveBest.Height > knownBestHeight {
+			return fmt.Errorf("synchronized to the wrong chain")
+		}
+		time.Sleep(syncUpdate)
+		total += syncUpdate
+		haveBest, err = svc.BestBlock()
+		if err != nil {
+			return fmt.Errorf("Couldn't get best snapshot from "+
+				"ChainService: %s", err)
+		}
+	}
+
+	// Check if we're current.
+	if !svc.IsCurrent() {
+		return fmt.Errorf("the ChainService doesn't see itself as " +
+			"current")
+	}
+
+	// Check if we have all of the cfheaders.
+	knownBasicHeader, err := correctSyncNode.Node.GetCFilterHeader(
+		knownBestHash, wire.GCSFilterRegular)
+	if err != nil {
+		return fmt.Errorf("Couldn't get latest basic header from "+
+			"%s: %s", correctSyncNode.P2PAddress(), err)
+	}
+	haveBasicHeader := &chainhash.Hash{}
+
+	for knownBasicHeader.PrevFilterHeader != *haveBasicHeader {
+		if total > syncTimeout {
+			return fmt.Errorf("Timed out after %v waiting for "+
+				"cfheaders synchronization.\n%s", syncTimeout,
+				goroutineDump())
+		}
+		haveBasicHeader, err = svc.RegFilterHeaders.FetchHeader(knownBestHash)
+		if err != nil {
+			if err == io.EOF {
+				haveBasicHeader = &chainhash.Hash{}
+				time.Sleep(syncUpdate)
+				total += syncUpdate
+				continue
+			}
+			return fmt.Errorf("Couldn't get regular filter header"+
+				" for %s: %s", knownBestHash, err)
+		}
+		time.Sleep(syncUpdate)
+		total += syncUpdate
+	}
+
+	if logLevel != bchlog.LevelOff {
+		t.Logf("Synced cfheaders to %d (%s)", haveBest.Height,
+			haveBest.Hash)
+	}
+
+	// At this point, we know we have good cfheaders. Now we wait for the
+	// rescan, if one is going, to catch up.
+	for {
+		if total > syncTimeout {
+			return fmt.Errorf("Timed out after %v waiting for "+
+				"rescan to catch up.\n%s", syncTimeout,
+				goroutineDump())
+		}
+		time.Sleep(syncUpdate)
+		total += syncUpdate
+		rescanMtx.RLock()
+		// We don't want to do this if we haven't started a rescan
+		// yet.
+		if len(gotLog) == 0 {
+			rescanMtx.RUnlock()
+			break
+		}
+		_, rescanHeight, err := checkRescanStatus()
+		if err != nil {
+			// If there's an error, that means the
+			// FilteredBlockConnected notifications are still
+			// catching up to the BlockConnected notifications.
+			rescanMtx.RUnlock()
+			continue
+		}
+		if logLevel != bchlog.LevelOff {
+			t.Logf("Rescan caught up to block %d", rescanHeight)
+		}
+		if rescanHeight == haveBest.Height {
+			rescanMtx.RUnlock()
+			break
+		}
+		rescanMtx.RUnlock()
+	}
+
+	// At this point, we know the latest cfheader is stored in the
+	// ChainService database. We now compare each cfheader the
+	// harness knows about to what's stored in the ChainService
+	// database to see if we've missed anything or messed anything
+	// up.
+	for i := int32(0); i <= haveBest.Height; i++ {
+		if total > syncTimeout {
+			return fmt.Errorf("Timed out after %v waiting for "+
+				"cfheaders DB to catch up.\n%s", syncTimeout,
+				goroutineDump())
+		}
+		head, err := svc.BlockHeaders.FetchHeaderByHeight(uint32(i))
+		if err != nil {
+			return fmt.Errorf("Couldn't read block by "+
+				"height: %s", err)
+		}
+
+		hash := head.BlockHash()
+		haveBasicHeader, err = svc.RegFilterHeaders.FetchHeader(&hash)
+		if err == io.EOF {
+			// This sometimes happens due to reorgs after the
+			// service decides it's current. Just wait for the
+			// DB to catch up and try again.
+			time.Sleep(syncUpdate)
+			total += syncUpdate
+			i--
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("Couldn't get basic header "+
+				"for %d (%s) from DB: %v\n%s", i, hash,
+				err, goroutineDump())
+		}
+		knownBasicHeader, err = correctSyncNode.Node.GetCFilterHeader(
+			&hash, wire.GCSFilterRegular,
+		)
+		if err != nil {
+			return fmt.Errorf("Couldn't get basic header "+
+				"for %d (%s) from node %s", i, hash,
+				correctSyncNode.P2PAddress())
+		}
+
+		if *haveBasicHeader != knownBasicHeader.PrevFilterHeader {
+			return fmt.Errorf("Basic header for %d (%s) "+
+				"doesn't match node %s. DB: %s, node: %s", i,
+				hash, correctSyncNode.P2PAddress(),
+				haveBasicHeader,
+				knownBasicHeader.PrevFilterHeader)
+		}
+	}
+	return nil
+}
+
+// startRescan starts a rescan in another goroutine, and logs all notifications
+// from the rescan. At the end, the log should match one we precomputed based
+// on the flow of the test. The rescan starts at the genesis block and the
+// notifications continue until the `quit` channel is closed.
+func startRescan(t *testing.T, svc *neutrino.ChainService, addr bchutil.Address,
+	startBlock *waddrmgr.BlockStamp, quit <-chan struct{}) (
+	*neutrino.Rescan, <-chan error) {
+	rescan := neutrino.NewRescan(
+		&neutrino.RescanChainSource{ChainService: svc},
+		neutrino.QuitChan(quit),
+		neutrino.WatchAddrs(addr),
+		neutrino.StartBlock(startBlock),
+		neutrino.NotificationHandlers(
+			rpcclient.NotificationHandlers{
+				OnFilteredBlockConnected: func(
+					height int32,
+					header *wire.BlockHeader,
+					relevantTxs []*bchutil.Tx) {
+					rescanMtx.Lock()
+					ourKnownTxsByFilteredBlock[header.BlockHash()] =
+						relevantTxs
+					gotLog = append(gotLog,
+						[]byte("fc")...)
+					gotLog = append(gotLog,
+						uint8(len(relevantTxs)))
+					curFilteredBlockHeight = height
+					rescanMtx.Unlock()
+				},
+				OnFilteredBlockDisconnected: func(
+					height int32,
+					header *wire.BlockHeader) {
+					rescanMtx.Lock()
+					delete(ourKnownTxsByFilteredBlock,
+						header.BlockHash())
+					gotLog = append(gotLog,
+						[]byte("fd")...)
+					curFilteredBlockHeight =
+						height - 1
+					rescanMtx.Unlock()
+				},
+			}),
+	)
+
+	errChan := rescan.Start()
+
+	return rescan, errChan
+}
+
+// checkRescanStatus returns the number of relevant transactions we currently
+// know about and the currently known height.
+func checkRescanStatus() (int, int32, error) {
+	var txCount int
+	rescanMtx.RLock()
+	defer rescanMtx.RUnlock()
+	for _, list := range ourKnownTxsByFilteredBlock {
+		txCount += len(list)
+	}
+	return txCount, curFilteredBlockHeight, nil
+}
+
+// banPeer bans and disconnects the requested harness from the ChainService
+// instance for BanDuration seconds.
+func banPeer(t *testing.T, svc *neutrino.ChainService, harness *rpctest.Harness) {
+	t.Helper()
+
+	peers := svc.Peers()
+	for _, peer := range peers {
+		peerAddr := peer.Addr()
+		if peerAddr != harness.P2PAddress() {
+			continue
+		}
+
+		err := svc.BanPeer(peerAddr, banman.ExceededBanThreshold)
+		if err != nil {
+			if logLevel != bchlog.LevelOff {
+				t.Fatalf("unable to ban peer %v: %v", peerAddr,
+					err)
+			}
+		}
+
+		peer.Disconnect()
+	}
+}
+
+// goroutineDump returns a string with the current goroutine dump in order to
+// show what's going on in case of timeout.
+func goroutineDump() string {
+	buf := make([]byte, 1<<18)
+	runtime.Stack(buf, true)
+	return string(buf)
+}
+
+// repairTimeout is how long the end to end test of repairing the filter
+// headers waits for each step, which takes seconds, but longer on slow CI
+// runners.
+const repairTimeout = 3 * time.Minute
+
+// recordingRescan is a rescan for an address that records the blocks it
+// notifies as connected, with the transactions relevant to the address, and
+// those it notifies as disconnected.
+type recordingRescan struct {
+	quit    chan struct{}
+	errChan <-chan error
+
+	mtx          sync.Mutex
+	relevant     map[int32][]*bchutil.Tx
+	disconnected map[int32]bool
+	height       int32
+}
+
+// startRecordingRescan starts a rescan for the given address from the given
+// block.
+func startRecordingRescan(svc *neutrino.ChainService, addr bchutil.Address,
+	start *waddrmgr.BlockStamp) *recordingRescan {
+
+	r := &recordingRescan{
+		quit:         make(chan struct{}),
+		relevant:     make(map[int32][]*bchutil.Tx),
+		disconnected: make(map[int32]bool),
+	}
+	rescan := neutrino.NewRescan(
+		&neutrino.RescanChainSource{ChainService: svc},
+		neutrino.QuitChan(r.quit),
+		neutrino.WatchAddrs(addr),
+		neutrino.StartBlock(start),
+		neutrino.QueryOptions(
+			neutrino.Timeout(2*time.Second), neutrino.NumRetries(0),
+		),
+		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+			OnFilteredBlockConnected: func(height int32,
+				_ *wire.BlockHeader, txs []*bchutil.Tx) {
+
+				r.mtx.Lock()
+				r.relevant[height] = txs
+				r.height = height
+				r.mtx.Unlock()
+			},
+			OnFilteredBlockDisconnected: func(height int32,
+				_ *wire.BlockHeader) {
+
+				r.mtx.Lock()
+				delete(r.relevant, height)
+				r.disconnected[height] = true
+				r.height = height - 1
+				r.mtx.Unlock()
+			},
+		}),
+	)
+	r.errChan = rescan.Start()
+
+	return r
+}
+
+// waitFor waits for the given condition on what the rescan recorded to hold,
+// failing the test if the rescan ends first.
+func (r *recordingRescan) waitFor(t *testing.T, what string,
+	cond func() bool) {
+
+	t.Helper()
+
+	deadline := time.After(repairTimeout)
+	for {
+		r.mtx.Lock()
+		done := cond()
+		r.mtx.Unlock()
+		if done {
+			return
+		}
+
+		select {
+		case err := <-r.errChan:
+			t.Fatalf("rescan ended waiting for %v: %v", what, err)
+		case <-deadline:
+			t.Fatalf("timed out waiting for the rescan to %v", what)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// waitForHeight waits for the rescan to reach the given height.
+func (r *recordingRescan) waitForHeight(t *testing.T, height int32) {
+	t.Helper()
+
+	r.waitFor(t, "reach the tip", func() bool {
+		return r.height == height
+	})
+}
+
+// waitForPayment waits for the rescan to find the given transaction in the
+// block at the given height.
+func (r *recordingRescan) waitForPayment(t *testing.T, height int32,
+	txid chainhash.Hash) {
+
+	t.Helper()
+
+	r.waitFor(t, "find the payment", func() bool {
+		return r.found(height, txid)
+	})
+}
+
+// found returns whether the rescan found the given transaction in the block at
+// the given height.
+//
+// NOTE: The mutex must be held.
+func (r *recordingRescan) found(height int32, txid chainhash.Hash) bool {
+	for _, tx := range r.relevant[height] {
+		if *tx.Hash() == txid {
+			return true
+		}
+	}
+
+	return false
+}
+
+// rewoundPast returns whether the rescan notified the block at the given
+// height as disconnected.
+func (r *recordingRescan) rewoundPast(height int32) bool {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	return r.disconnected[height]
+}
+
+// stop stops the rescan and waits for it to end.
+func (r *recordingRescan) stop(t *testing.T) {
+	t.Helper()
+
+	close(r.quit)
+	select {
+	case err := <-r.errChan:
+		if !errors.Is(err, neutrino.ErrRescanExit) {
+			t.Fatalf("expected the rescan to exit, got %v", err)
+		}
+	case <-time.After(repairTimeout):
+		t.Fatal("timed out waiting for the rescan to exit")
+	}
+}
+
+// startChainService starts a ChainService on the given database that only
+// connects to the given node, and waits for it to connect.
+func startChainService(t *testing.T, dataDir string, db walletdb.DB,
+	node *rpctest.Harness) *neutrino.ChainService {
+
+	t.Helper()
+
+	svc, err := neutrino.NewChainService(neutrino.Config{
+		DataDir:      dataDir,
+		Database:     db,
+		ChainParams:  chaincfg.SimNetParams,
+		ConnectPeers: []string{node.P2PAddress()},
+	})
+	if err != nil {
+		t.Fatalf("unable to create ChainService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("unable to start ChainService: %v", err)
+	}
+
+	deadline := time.Now().Add(repairTimeout)
+	for svc.ConnectedCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the ChainService to " +
+				"connect to the node")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return svc
+}
+
+// waitForFilterHeaders waits for the ChainService to sync the node's block and
+// filter headers, which, as each filter header commits to the ones before it,
+// are then all right.
+func waitForFilterHeaders(t *testing.T, svc *neutrino.ChainService,
+	node *rpctest.Harness) {
+
+	t.Helper()
+
+	bestHash, _, err := node.Node.GetBestBlock()
+	if err != nil {
+		t.Fatalf("unable to get best block: %v", err)
+	}
+	want, err := node.Node.GetCFilterHeader(
+		bestHash, wire.GCSFilterRegular,
+	)
+	if err != nil {
+		t.Fatalf("unable to get filter header: %v", err)
+	}
+
+	deadline := time.Now().Add(repairTimeout)
+	for {
+		best, err := svc.BestBlock()
+		if err == nil && best.Hash == *bestHash {
+			have, err := svc.RegFilterHeaders.FetchHeader(bestHash)
+			if err == nil && *have == want.PrevFilterHeader {
+				return
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the filter headers of "+
+				"block %v", bestHash)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// corruptFilterHeaders replaces the filter headers stored for the blocks from
+// the given height to the tip with ones that commit to empty filters, as
+// though peers had served them. If withFilters is set, it stores those filters
+// too, as a ChainService that persists the filters it fetches would have.
+func corruptFilterHeaders(t *testing.T, dataDir string, db walletdb.DB,
+	node *rpctest.Harness, from int32, withFilters bool) {
+
+	t.Helper()
+
+	store, err := headerfs.NewFilterHeaderStore(
+		dataDir, db, headerfs.RegularFilter, &chaincfg.SimNetParams,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("unable to open filter header store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	_, tip, err := store.ChainTip()
+	if err != nil {
+		t.Fatalf("unable to get filter tip: %v", err)
+	}
+	prevHash, err := node.Node.GetBlockHash(int64(from - 1))
+	if err != nil {
+		t.Fatalf("unable to get block hash: %v", err)
+	}
+	if _, err := store.RollbackToHeight(uint32(from-1), prevHash); err != nil {
+		t.Fatalf("unable to roll back filter headers: %v", err)
+	}
+	prev, err := store.FetchHeaderByHeight(uint32(from - 1))
+	if err != nil {
+		t.Fatalf("unable to get filter header: %v", err)
+	}
+
+	filterDB, err := filterdb.New(db, chaincfg.SimNetParams)
+	if err != nil {
+		t.Fatalf("unable to open filter db: %v", err)
+	}
+	empty, err := gcs.FromBytes(0, builder.DefaultP, builder.DefaultM, nil)
+	if err != nil {
+		t.Fatalf("unable to create filter: %v", err)
+	}
+
+	headers := make([]headerfs.FilterHeader, 0, tip-uint32(from)+1)
+	for height := uint32(from); height <= tip; height++ {
+		hash, err := node.Node.GetBlockHash(int64(height))
+		if err != nil {
+			t.Fatalf("unable to get block hash: %v", err)
+		}
+		header, err := builder.MakeHeaderForFilter(empty, *prev)
+		if err != nil {
+			t.Fatalf("unable to make filter header: %v", err)
+		}
+		headers = append(headers, headerfs.FilterHeader{
+			HeaderHash: *hash,
+			FilterHash: header,
+			Height:     height,
+		})
+		prev = &header
+
+		if !withFilters {
+			continue
+		}
+		err = filterDB.PutFilter(hash, empty, filterdb.RegularFilter)
+		if err != nil {
+			t.Fatalf("unable to store filter: %v", err)
+		}
+	}
+	if err := store.WriteHeaders(headers...); err != nil {
+		t.Fatalf("unable to write filter headers: %v", err)
+	}
+}
+
+// TestFilterHeaderRepair checks end to end that a ChainService whose filter
+// headers are wrong from a block below a payment repairs them, syncs them
+// again, and drops the filters checked against them, and that a rescan then
+// finds the payment. That's whether the rescan already went past the payment
+// with the wrong filters, started after the repair from above the payment, as
+// a wallet's does from where it got to before, or couldn't get past the wrong
+// filter headers until the repair.
+func TestFilterHeaderRepair(t *testing.T) {
+	node, err := rpctest.New(
+		&chaincfg.SimNetParams, nil, []string{"--txindex"},
+	)
+	if err != nil {
+		t.Fatalf("unable to create harness: %v", err)
+	}
+	defer func() { _ = node.TearDown() }()
+	if err := node.SetUp(true, 10); err != nil {
+		t.Fatalf("unable to set up harness: %v", err)
+	}
+
+	// The node mines a payment to an address we watch, and a few blocks
+	// after it.
+	privKey, err := bchec.NewPrivateKey(bchec.S256())
+	if err != nil {
+		t.Fatalf("unable to generate key: %v", err)
+	}
+	addr, err := bchutil.NewAddressPubKeyHash(
+		bchutil.Hash160(privKey.PubKey().SerializeCompressed()),
+		&chaincfg.SimNetParams,
+	)
+	if err != nil {
+		t.Fatalf("unable to create address: %v", err)
+	}
+	script, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		t.Fatalf("unable to create script: %v", err)
+	}
+	payment, err := node.CreateTransaction(
+		[]*wire.TxOut{{Value: 100000000, PkScript: script}}, 10, true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create payment: %v", err)
+	}
+	if _, err := node.Node.SendRawTransaction(payment, true); err != nil {
+		t.Fatalf("unable to send payment: %v", err)
+	}
+	if _, err := node.Node.Generate(1); err != nil {
+		t.Fatalf("unable to mine payment: %v", err)
+	}
+	_, payHeight, err := node.Node.GetBestBlock()
+	if err != nil {
+		t.Fatalf("unable to get best block: %v", err)
+	}
+	if _, err := node.Node.Generate(10); err != nil {
+		t.Fatalf("unable to mine blocks: %v", err)
+	}
+	payTxid := payment.TxHash()
+
+	// The filter headers we'll make wrong start a few blocks below the
+	// payment.
+	divergence := payHeight - 5
+
+	dataDir := t.TempDir()
+	db, err := walletdb.Create(
+		"bdb", filepath.Join(dataDir, "neutrino.db"), true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	svc := startChainService(t, dataDir, db, node)
+	waitForFilterHeaders(t, svc, node)
+	_ = svc.Stop()
+
+	tip := func() int32 {
+		t.Helper()
+
+		_, height, err := node.Node.GetBestBlock()
+		if err != nil {
+			t.Fatalf("unable to get best block: %v", err)
+		}
+		return height
+	}
+	assertNotBanned := func(svc *neutrino.ChainService) {
+		t.Helper()
+
+		if svc.IsBanned(node.P2PAddress()) {
+			t.Fatal("the node, which serves the right filter " +
+				"headers, was banned")
+		}
+	}
+
+	// A rescan goes past the payment with filters checked against wrong
+	// filter headers, which match nothing, so it misses the payment. The
+	// next block shows the filter headers are wrong, as the node's don't
+	// follow them, and once they're repaired, the rescan rewinds below the
+	// payment and finds it.
+	corruptFilterHeaders(t, dataDir, db, node, divergence, true)
+	svc = startChainService(t, dataDir, db, node)
+	rescan := startRecordingRescan(
+		svc, addr, &waddrmgr.BlockStamp{Height: divergence - 2},
+	)
+	rescan.waitForHeight(t, tip())
+	rescan.mtx.Lock()
+	missed := !rescan.found(payHeight, payTxid)
+	rescan.mtx.Unlock()
+	if !missed {
+		t.Fatal("expected the rescan to miss the payment with the " +
+			"wrong filters")
+	}
+
+	if _, err := node.Node.Generate(1); err != nil {
+		t.Fatalf("unable to mine block: %v", err)
+	}
+	rescan.waitForPayment(t, payHeight, payTxid)
+	waitForFilterHeaders(t, svc, node)
+	rescan.waitForHeight(t, tip())
+	if !rescan.rewoundPast(payHeight) {
+		t.Fatal("expected the rescan to rewind below the payment")
+	}
+	rescan.stop(t)
+	assertNotBanned(svc)
+	_ = svc.Stop()
+
+	// The filter headers are wrong again, and a block shows it before any
+	// rescan starts. A rescan that starts from the tip once they're
+	// repaired, as a wallet's does from where it got to with the wrong
+	// filters, rewinds below where it started and finds the payment.
+	corruptFilterHeaders(t, dataDir, db, node, divergence, true)
+	svc = startChainService(t, dataDir, db, node)
+	if _, err := node.Node.Generate(1); err != nil {
+		t.Fatalf("unable to mine block: %v", err)
+	}
+	waitForFilterHeaders(t, svc, node)
+	best, err := svc.BestBlock()
+	if err != nil {
+		t.Fatalf("unable to get best block: %v", err)
+	}
+	rescan = startRecordingRescan(svc, addr, best)
+	rescan.waitForPayment(t, payHeight, payTxid)
+	rescan.waitForHeight(t, best.Height)
+	if !rescan.rewoundPast(payHeight) {
+		t.Fatal("expected the rescan to rewind below the payment")
+	}
+	rescan.stop(t)
+	assertNotBanned(svc)
+	_ = svc.Stop()
+
+	// The filter headers are wrong again, but without filters stored for
+	// them, so a rescan from below them can't fetch filters that match
+	// them, which shows they're wrong. Once they're repaired, the rescan
+	// finds the payment.
+	corruptFilterHeaders(t, dataDir, db, node, divergence, false)
+	svc = startChainService(t, dataDir, db, node)
+	rescan = startRecordingRescan(
+		svc, addr, &waddrmgr.BlockStamp{Height: divergence - 2},
+	)
+	rescan.waitForPayment(t, payHeight, payTxid)
+	waitForFilterHeaders(t, svc, node)
+	rescan.waitForHeight(t, tip())
+	rescan.stop(t)
+	assertNotBanned(svc)
+	_ = svc.Stop()
+}
+
+// TestSearchSpends checks end to end that a ChainService finds a spend against
+// a real node's blocks and filters, scanning up and down, from any height.
+func TestSearchSpends(t *testing.T) {
+	node, err := rpctest.New(&chaincfg.SimNetParams, nil, nil)
+	if err != nil {
+		t.Fatalf("unable to create harness: %v", err)
+	}
+	defer func() { _ = node.TearDown() }()
+	if err := node.SetUp(true, 10); err != nil {
+		t.Fatalf("unable to set up harness: %v", err)
+	}
+
+	script := []byte{txscript.OP_TRUE}
+	payment, err := node.CreateTransaction(
+		[]*wire.TxOut{{Value: 100000000, PkScript: script}}, 10, true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create payment: %v", err)
+	}
+	if _, err := node.Node.SendRawTransaction(payment, true); err != nil {
+		t.Fatalf("unable to send payment: %v", err)
+	}
+	hashes, err := node.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("unable to mine: %v", err)
+	}
+	_, spendHeight, err := node.Node.GetBestBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := node.Node.Generate(5); err != nil {
+		t.Fatalf("unable to mine: %v", err)
+	}
+	_, tip, err := node.Node.GetBestBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	db, err := walletdb.Create(
+		"bdb", filepath.Join(dataDir, "neutrino.db"), true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	svc := startChainService(t, dataDir, db, node)
+	defer func() { _ = svc.Stop() }()
+	waitForFilterHeaders(t, svc, node)
+
+	outpoint := payment.TxIn[0].PreviousOutPoint
+	for _, r := range [][2]int32{{1, tip}, {tip, 1}, {spendHeight, tip}, {tip, spendHeight}} {
+		var spends []neutrino.FoundSpend
+		reached, err := svc.SearchSpends([]wire.OutPoint{outpoint}, r[0], r[1],
+			func(spend neutrino.FoundSpend) []wire.OutPoint {
+				spends = append(spends, spend)
+				return nil
+			}, nil, nil)
+		if err != nil {
+			t.Fatalf("searching %v: %v", r, err)
+		}
+		if len(spends) != 1 || reached != spendHeight {
+			t.Fatalf("searching %v: found %+v, reached %d", r, spends, reached)
+		}
+		spend := spends[0]
+		if spend.SpendingTx.TxHash() != payment.TxHash() || spend.Height != spendHeight ||
+			spend.BlockHash != *hashes[0] {
+
+			t.Fatalf("searching %v: found %+v", r, spend)
+		}
+	}
+
+	// Past the spend, it's unspent for the range.
+	reached, err := svc.SearchSpends([]wire.OutPoint{outpoint}, spendHeight+1, tip,
+		func(spend neutrino.FoundSpend) []wire.OutPoint {
+			t.Errorf("found %+v", spend)
+			return nil
+		}, nil, nil)
+	if err != nil || reached != tip {
+		t.Fatalf("reached %d, %v", reached, err)
+	}
+}
+
+// TestMempoolRequest checks end to end that a ChainService that starts while
+// a payment to an address it watches waits in a node's mempool, which the node
+// doesn't announce to peers that connect later, asks the node for its mempool
+// once its block headers are synced, and reports the payment.
+func TestMempoolRequest(t *testing.T) {
+	node, err := rpctest.New(&chaincfg.SimNetParams, nil, nil)
+	if err != nil {
+		t.Fatalf("unable to create harness: %v", err)
+	}
+	defer func() { _ = node.TearDown() }()
+	if err := node.SetUp(true, 10); err != nil {
+		t.Fatalf("unable to set up harness: %v", err)
+	}
+
+	privKey, err := bchec.NewPrivateKey(bchec.S256())
+	if err != nil {
+		t.Fatalf("unable to generate key: %v", err)
+	}
+	addr, err := bchutil.NewAddressPubKeyHash(
+		bchutil.Hash160(privKey.PubKey().SerializeCompressed()),
+		&chaincfg.SimNetParams,
+	)
+	if err != nil {
+		t.Fatalf("unable to create address: %v", err)
+	}
+	script, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		t.Fatalf("unable to create script: %v", err)
+	}
+	payment, err := node.CreateTransaction(
+		[]*wire.TxOut{{Value: 100000000, PkScript: script}}, 10, true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create payment: %v", err)
+	}
+	if _, err := node.Node.SendRawTransaction(payment, true); err != nil {
+		t.Fatalf("unable to send payment: %v", err)
+	}
+
+	dataDir := t.TempDir()
+	db, err := walletdb.Create(
+		"bdb", filepath.Join(dataDir, "neutrino.db"), true,
+	)
+	if err != nil {
+		t.Fatalf("unable to create db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	svc := startChainService(t, dataDir, db, node)
+	defer func() { _ = svc.Stop() }()
+	reported := make(chan *bchutil.Tx, 1)
+	svc.RegisterMempoolCallback(func(tx *bchutil.Tx, _ *btcjson.BlockDetails) {
+		select {
+		case reported <- tx:
+		default:
+		}
+	})
+	svc.NotifyMempoolReceived([]bchutil.Address{addr})
+	svc.RequestMempoolFilter([]bchutil.Address{addr}, nil)
+
+	select {
+	case tx := <-reported:
+		if *tx.Hash() != payment.TxHash() {
+			t.Fatalf("reported %v, want the payment %v", tx.Hash(),
+				payment.TxHash())
+		}
+	case <-time.After(repairTimeout):
+		t.Fatal("the payment in the node's mempool wasn't reported")
+	}
+}
