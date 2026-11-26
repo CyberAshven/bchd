@@ -1,0 +1,56 @@
+# TEST ONLY: runs the bchrpc/proxy tests of gcash/bchd master (before) and of
+# fix/proxy-node-answer (after) against the remote node, an address that
+# refuses connections, and a silent one that takes connections and answers
+# nothing. Not for upstream.
+name: proxy-modes-test-only
+on:
+  push:
+    branches:
+      - ci-bchd
+permissions:
+  contents: read
+jobs:
+  proxy:
+    name: ${{ matrix.side }} ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.side == 'before' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [before, after]
+        mode: [node, refused, silent]
+        include:
+          - side: before
+            ref: 38d11412c3d29626c8343b897ec66919132ad86b
+          - side: after
+            ref: efd181fb6740b6f90ef16a7327f08e726e7d8bce
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchd
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Silent node on 127.0.0.1:18335 (takes connections, answers nothing)
+        if: matrix.mode == 'silent'
+        run: |
+          python3 -c 'import socket; s = socket.create_server(("127.0.0.1", 18335)); held = []; exec("while True: held.append(s.accept())")' &
+          sleep 1
+      - name: bchrpc/proxy tests
+        run: |
+          case "${{ matrix.mode }}" in
+            node) args="" ;;
+            refused) args="-args -bchd-grpc-url=127.0.0.1:1" ;;
+            silent) args="-args -bchd-grpc-url=127.0.0.1:18335" ;;
+          esac
+          set -o pipefail
+          go test -tags rpctest -v -count=1 ./bchrpc/proxy $args 2>&1 | tee proxy.log
+      - name: Summary
+        if: always()
+        run: |
+          echo "commit ${{ matrix.ref }} (${{ matrix.side }}), node ${{ matrix.mode }}"
+          echo "PASS $(grep -c -- '--- PASS' proxy.log)  SKIP $(grep -c -- '--- SKIP' proxy.log)  FAIL $(grep -c -- '--- FAIL' proxy.log)"
+          echo "what goclean.sh of the fix shows:"
+          grep -E "BCHD node .* doesn't answer, skipping|^ *--- (SKIP|FAIL)|^(ok|FAIL)" proxy.log || true
