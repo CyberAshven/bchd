@@ -1,0 +1,77 @@
+# TEST ONLY: runs gcash/bchd's own CI jobs on commits of the bchd fork, one set
+# for each ref listed in bchd-refs. Not for upstream.
+name: bchd-ci-test-only
+on:
+  push:
+    branches:
+      - ci-bchd
+permissions:
+  contents: read
+jobs:
+  refs:
+    runs-on: ubuntu-latest
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: refs
+        run: echo "refs=$(grep -v '^ *$' bchd-refs | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+  build:
+    needs: refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJson(needs.refs.outputs.refs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchd
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install golangci-lint
+        run: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.14.0
+      - name: Run goclean.sh
+        run: ./goclean.sh
+      - name: Go Build/Install
+        run: go build && go install . ./cmd/...
+  test-race:
+    needs: refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJson(needs.refs.outputs.refs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchd
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Test with the race detector
+        run: go test -race -timeout 100m ./...
+  test-386:
+    needs: refs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJson(needs.refs.outputs.refs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberAshven/bchd
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Test the consensus packages on 32-bit
+        run: go test ./txscript/... ./blockchain/... ./wire/... ./mempool/...
+        env:
+          GOARCH: "386"
