@@ -25,7 +25,7 @@ jobs:
           - side: before
             ref: 38d11412c3d29626c8343b897ec66919132ad86b
           - side: after
-            ref: 658c2b56a7becdd70086330dc34ca7ce523cf6ee
+            ref: 72e2ee70ffefae4cdd6102656eb83c4a444d3ea8
     steps:
       - uses: actions/checkout@v4
         with:
