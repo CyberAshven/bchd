@@ -5,7 +5,10 @@
 package blockchain
 
 import (
+	"bytes"
+	"cmp"
 	"math/big"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -74,6 +77,10 @@ type blockNode struct {
 	// parent is the parent block for this node.
 	parent *blockNode
 
+	// skip is an earlier ancestor, at skipHeight(height), so Ancestor
+	// takes O(log n) steps.
+	skip *blockNode
+
 	// hash is the double sha 256 of the block.
 	hash chainhash.Hash
 
@@ -99,6 +106,10 @@ type blockNode struct {
 	// only be accessed using the concurrent-safe NodeStatus method on
 	// blockIndex once the node has been added to the global index.
 	status blockStatus
+
+	// received is when the block was received, in unix seconds, or zero
+	// for blocks loaded from the database.  It fits in the padding.
+	received uint32
 }
 
 // initBlockNode initializes a block node from the given header and parent node,
@@ -119,6 +130,7 @@ func initBlockNode(node *blockNode, blockHeader *wire.BlockHeader, parent *block
 		node.parent = parent
 		node.height = parent.height + 1
 		node.workSum = node.workSum.Add(parent.workSum, node.workSum)
+		node.skip = parent.Ancestor(skipHeight(node.height))
 	}
 }
 
@@ -163,10 +175,42 @@ func (node *blockNode) Ancestor(height int32) *blockNode {
 
 	n := node
 	for n != nil && n.height != height {
-		n = n.parent
+		n = n.ancestorStep(height)
 	}
 
 	return n
+}
+
+// ancestorStep returns the next node on the walk from node towards its
+// ancestor at the given height.  It takes the skip unless that overshoots,
+// or the parent's skip lands closer to the target without overshooting.
+func (node *blockNode) ancestorStep(height int32) *blockNode {
+	h := skipHeight(node.height)
+	hPrev := skipHeight(node.height - 1)
+	if node.skip != nil && (h == height || (h > height &&
+		!(hPrev < h-2 && hPrev >= height))) {
+		return node.skip
+	}
+	return node.parent
+}
+
+// invertLowestOne clears the lowest set bit of n.
+func invertLowestOne(n int32) int32 {
+	return n & (n - 1)
+}
+
+// skipHeight returns the height of the skip ancestor of a node at the given
+// height, as in Bitcoin Core.
+func skipHeight(height int32) int32 {
+	if height < 2 {
+		return 0
+	}
+	// Odd heights skip a little less far, so that every node is reached
+	// in O(log n) steps.
+	if height&1 != 0 {
+		return invertLowestOne(invertLowestOne(height-1)) + 1
+	}
+	return invertLowestOne(height)
 }
 
 // RelativeAncestor returns the ancestor block node a relative 'distance' blocks
@@ -251,8 +295,8 @@ func newBlockIndex(db database.DB, chainParams *chaincfg.Params) *blockIndex {
 // This function is safe for concurrent access.
 func (bi *blockIndex) HaveBlock(hash *chainhash.Hash) bool {
 	bi.RLock()
+	defer bi.RUnlock()
 	_, hasBlock := bi.index[*hash]
-	bi.RUnlock()
 	return hasBlock
 }
 
@@ -262,8 +306,8 @@ func (bi *blockIndex) HaveBlock(hash *chainhash.Hash) bool {
 // This function is safe for concurrent access.
 func (bi *blockIndex) LookupNode(hash *chainhash.Hash) *blockNode {
 	bi.RLock()
+	defer bi.RUnlock()
 	node := bi.index[*hash]
-	bi.RUnlock()
 	return node
 }
 
@@ -273,9 +317,9 @@ func (bi *blockIndex) LookupNode(hash *chainhash.Hash) *blockNode {
 // This function is safe for concurrent access.
 func (bi *blockIndex) AddNode(node *blockNode) {
 	bi.Lock()
+	defer bi.Unlock()
 	bi.addNode(node)
 	bi.dirty[node] = struct{}{}
-	bi.Unlock()
 }
 
 // addNode adds the provided node to the block index, but does not mark it as
@@ -286,13 +330,45 @@ func (bi *blockIndex) addNode(node *blockNode) {
 	bi.index[node.hash] = node
 }
 
+// descendants returns the nodes of the index that build on node, lowest first
+// and, at a height, in the order they were received.  It reads every node of
+// the index.
+//
+// This function is safe for concurrent access.
+func (bi *blockIndex) descendants(node *blockNode) []*blockNode {
+	bi.RLock()
+	defer bi.RUnlock()
+
+	var above []*blockNode
+	for _, n := range bi.index {
+		if n.height > node.height {
+			above = append(above, n)
+		}
+	}
+	slices.SortFunc(above, func(a, b *blockNode) int {
+		return cmp.Or(cmp.Compare(a.height, b.height),
+			cmp.Compare(a.received, b.received),
+			bytes.Compare(a.hash[:], b.hash[:]))
+	})
+
+	found := map[*blockNode]struct{}{node: {}}
+	var descendants []*blockNode
+	for _, n := range above {
+		if _, ok := found[n.parent]; ok {
+			found[n] = struct{}{}
+			descendants = append(descendants, n)
+		}
+	}
+	return descendants
+}
+
 // NodeStatus provides concurrent-safe access to the status field of a node.
 //
 // This function is safe for concurrent access.
 func (bi *blockIndex) NodeStatus(node *blockNode) blockStatus {
 	bi.RLock()
+	defer bi.RUnlock()
 	status := node.status
-	bi.RUnlock()
 	return status
 }
 
@@ -303,9 +379,9 @@ func (bi *blockIndex) NodeStatus(node *blockNode) blockStatus {
 // This function is safe for concurrent access.
 func (bi *blockIndex) SetStatusFlags(node *blockNode, flags blockStatus) {
 	bi.Lock()
+	defer bi.Unlock()
 	node.status |= flags
 	bi.dirty[node] = struct{}{}
-	bi.Unlock()
 }
 
 // UnsetStatusFlags flips the provided status flags on the block node to off,
@@ -314,17 +390,17 @@ func (bi *blockIndex) SetStatusFlags(node *blockNode, flags blockStatus) {
 // This function is safe for concurrent access.
 func (bi *blockIndex) UnsetStatusFlags(node *blockNode, flags blockStatus) {
 	bi.Lock()
+	defer bi.Unlock()
 	node.status &^= flags
 	bi.dirty[node] = struct{}{}
-	bi.Unlock()
 }
 
 // flushToDB writes all dirty block nodes to the database. If all writes
 // succeed, this clears the dirty set.
 func (bi *blockIndex) flushToDB() error {
 	bi.Lock()
+	defer bi.Unlock()
 	if len(bi.dirty) == 0 {
-		bi.Unlock()
 		return nil
 	}
 
@@ -343,6 +419,5 @@ func (bi *blockIndex) flushToDB() error {
 		bi.dirty = make(map[*blockNode]struct{})
 	}
 
-	bi.Unlock()
 	return err
 }

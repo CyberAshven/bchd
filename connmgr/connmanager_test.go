@@ -186,15 +186,19 @@ func TestConnectMode(t *testing.T) {
 func TestTargetOutbound(t *testing.T) {
 	targetOutbound := uint32(10)
 	connected := make(chan *ConnReq)
-	port := 18555
+	// GetNewAddress is called concurrently from each of the connection
+	// manager's request goroutines, so the port counter must be atomic.
+	// Handing out a duplicate port would also trip the duplicate address
+	// check and stall the test.
+	var port atomic.Int64
+	port.Store(18555)
 	cmgr, err := New(&Config{
 		TargetOutbound: targetOutbound,
 		Dial:           mockDialer,
 		GetNewAddress: func() (net.Addr, error) {
-			port++
 			return &net.TCPAddr{
 				IP:   net.ParseIP("127.0.0.1"),
-				Port: port,
+				Port: int(port.Add(1)),
 			}, nil
 		},
 		OnConnection: func(c *ConnReq, _ net.Conn) {
@@ -205,7 +209,7 @@ func TestTargetOutbound(t *testing.T) {
 		t.Fatalf("New error: %v", err)
 	}
 	cmgr.Start()
-	for i := uint32(0); i < targetOutbound; i++ {
+	for range targetOutbound {
 		<-connected
 	}
 
@@ -297,6 +301,47 @@ func TestRetryPermanent(t *testing.T) {
 	wantState = ConnDisconnected
 	if gotState != wantState {
 		t.Fatalf("retry: %v - want state %v, got state %v", cr.Addr, wantState, gotState)
+	}
+	cmgr.Stop()
+}
+
+// TestReconnectAfterDisconnect tests that a connection request that isn't
+// permanent is replaced by one that can connect to the same address again once
+// its connection is disconnected, as a client that knows a single peer needs.
+//
+// We let GetNewAddress always return the same address, disconnect the first
+// connection using Disconnect and wait for a new connection to the address.
+func TestReconnectAfterDisconnect(t *testing.T) {
+	connected := make(chan *ConnReq)
+	cmgr, err := New(&Config{
+		RetryDuration:  time.Millisecond,
+		TargetOutbound: 1,
+		Dial:           mockDialer,
+		GetNewAddress: func() (net.Addr, error) {
+			return &net.TCPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: 18555,
+			}, nil
+		},
+		OnConnection: func(c *ConnReq, _ net.Conn) {
+			connected <- c
+		},
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	cmgr.Start()
+	first := <-connected
+
+	cmgr.Disconnect(first.ID())
+	select {
+	case c := <-connected:
+		if c.Addr.String() != first.Addr.String() {
+			t.Fatalf("reconnect: got %v, want %v", c.Addr, first.Addr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("reconnect: no new connection to %v after disconnecting "+
+			"from it", first.Addr)
 	}
 	cmgr.Stop()
 }
@@ -666,4 +711,43 @@ out:
 
 	cmgr.Stop()
 	cmgr.Wait()
+}
+
+// TestStopDuringNewConnReq ensures that stopping the connection manager while
+// new connection requests are being made does not leave the connection
+// handler blocked, which would make Wait hang.
+func TestStopDuringNewConnReq(t *testing.T) {
+	errDialer := func(_ net.Addr) (net.Conn, error) {
+		return nil, errors.New("network down")
+	}
+	for i := 0; i < 200; i++ {
+		cmgr, err := New(&Config{
+			TargetOutbound: 5,
+			RetryDuration:  time.Millisecond,
+			Dial:           errDialer,
+			GetNewAddress: func() (net.Addr, error) {
+				return &net.TCPAddr{
+					IP:   net.ParseIP("127.0.0.1"),
+					Port: 18555,
+				}, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("New error: %v", err)
+		}
+		cmgr.Start()
+		time.Sleep(time.Duration(i%5) * time.Millisecond)
+		cmgr.Stop()
+
+		waited := make(chan struct{})
+		go func() {
+			cmgr.Wait()
+			close(waited)
+		}()
+		select {
+		case <-waited:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Wait did not return after Stop", i)
+		}
+	}
 }

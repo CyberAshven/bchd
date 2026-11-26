@@ -27,6 +27,11 @@ const (
 	// version bits scheme.
 	vbNumBits = 29
 
+	// vbVersionRollingMask holds the bits 13 to 28 that BIP320 leaves to
+	// miners for version rolling, as ASICBoost does.  Most blocks set some
+	// of them, so they say nothing about new rules.
+	vbVersionRollingMask = 0x1fffe000
+
 	// unknownVerNumToCheck is the number of previous blocks to consider
 	// when checking for a threshold of unknown block versions for the
 	// purposes of warning the user.
@@ -202,7 +207,7 @@ func (b *BlockChain) calcNextBlockVersion(prevNode *blockNode) (int32, error) {
 	// that is either in the process of being voted on, or locked in for the
 	// activation at the next threshold window change.
 	expectedVersion := uint32(vbTopBits)
-	for id := 0; id < len(b.chainParams.Deployments); id++ {
+	for id := range len(b.chainParams.Deployments) {
 		deployment := &b.chainParams.Deployments[id]
 		cache := &b.deploymentCaches[id]
 		checker := deploymentChecker{deployment: deployment, chain: b}
@@ -224,8 +229,8 @@ func (b *BlockChain) calcNextBlockVersion(prevNode *blockNode) (int32, error) {
 // This function is safe for concurrent access.
 func (b *BlockChain) CalcNextBlockVersion() (int32, error) {
 	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
 	version, err := b.calcNextBlockVersion(b.bestChain.Tip())
-	b.chainLock.Unlock()
 	return version, err
 }
 
@@ -237,8 +242,12 @@ func (b *BlockChain) CalcNextBlockVersion() (int32, error) {
 // This function MUST be called with the chain state lock held (for writes)
 func (b *BlockChain) warnUnknownRuleActivations(node *blockNode) error {
 	// Warn if any unknown new rules are either about to activate or have
-	// already been activated.
-	for bit := uint32(0); bit < vbNumBits; bit++ {
+	// already been activated.  The bits left to version rolling say
+	// nothing about new rules.
+	for bit := range uint32(vbNumBits) {
+		if vbVersionRollingMask&(1<<bit) != 0 {
+			continue
+		}
 		checker := bitConditionChecker{bit: bit, chain: b}
 		cache := &b.warningCaches[bit]
 		state, err := b.thresholdState(node.parent, checker, cache)
@@ -283,7 +292,7 @@ func (b *BlockChain) warnUnknownVersions(node *blockNode) error {
 			return err
 		}
 		if expectedVersion > vbLegacyBlockVersion &&
-			(node.version & ^expectedVersion) != 0 {
+			node.version&^expectedVersion&^vbVersionRollingMask != 0 {
 
 			numUpgraded++
 		}

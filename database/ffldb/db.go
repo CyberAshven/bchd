@@ -14,18 +14,18 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/btcsuite/goleveldb/leveldb"
-	"github.com/btcsuite/goleveldb/leveldb/comparer"
-	ldberrors "github.com/btcsuite/goleveldb/leveldb/errors"
-	"github.com/btcsuite/goleveldb/leveldb/filter"
-	"github.com/btcsuite/goleveldb/leveldb/iterator"
-	"github.com/btcsuite/goleveldb/leveldb/opt"
-	"github.com/btcsuite/goleveldb/leveldb/util"
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/database"
 	"github.com/gcash/bchd/database/internal/treap"
 	"github.com/gcash/bchd/wire"
 	"github.com/gcash/bchutil"
+	"github.com/gcash/goleveldb/leveldb"
+	"github.com/gcash/goleveldb/leveldb/comparer"
+	ldberrors "github.com/gcash/goleveldb/leveldb/errors"
+	"github.com/gcash/goleveldb/leveldb/filter"
+	"github.com/gcash/goleveldb/leveldb/iterator"
+	"github.com/gcash/goleveldb/leveldb/opt"
+	"github.com/gcash/goleveldb/leveldb/util"
 )
 
 const (
@@ -1185,6 +1185,24 @@ func (tx *transaction) StoreBlock(block *bchutil.Block) error {
 		return makeDbErr(database.ErrDriverSpecific, str, err)
 	}
 
+	// Store the block as its own serialization, as Bitcoin Cash Node
+	// writes each block to disk (node/blockstorage.cpp:345-368, 593-595),
+	// so the stored length is the block's size.  The bytes a block was
+	// made from can hold more, as a block message's payload with data
+	// after the last transaction does.  Blocks decode only from their
+	// canonical encoding, so bytes a block was decoded from that have its
+	// serialized size are its serialization.
+	msgBlock := block.MsgBlock()
+	if size := msgBlock.SerializeSize(); len(blockBytes) != size {
+		w := bytes.NewBuffer(make([]byte, 0, size))
+		if err := msgBlock.Serialize(w); err != nil {
+			str := fmt.Sprintf("failed to serialize block %s",
+				blockHash)
+			return makeDbErr(database.ErrDriverSpecific, str, err)
+		}
+		blockBytes = w.Bytes()
+	}
+
 	blockHeight := block.Height()
 
 	// Add the block to be stored to the list of pending blocks to store
@@ -1421,6 +1439,48 @@ func (tx *transaction) FetchBlocks(hashes []chainhash.Hash) ([][]byte, error) {
 	return blocks, nil
 }
 
+// FetchBlockSize returns the size of the serialized block identified by the
+// given hash.  It is taken from the location of the block in the block index,
+// without reading the block files, so it is also known for a block whose file
+// was deleted by DeleteBlocks, which keeps the block index entries.
+//
+// Returns the following errors as required by the interface contract:
+//   - ErrBlockNotFound if the requested block hash does not exist
+//   - ErrTxClosed if the transaction has already been closed
+//   - ErrCorruption if the database has somehow become corrupted
+//
+// This function is part of the database.Tx interface implementation.
+func (tx *transaction) FetchBlockSize(hash *chainhash.Hash) (uint32, error) {
+	// Ensure transaction state is valid.
+	if err := tx.checkClosed(); err != nil {
+		return 0, err
+	}
+
+	// When the block is pending to be written on commit return the size
+	// of its bytes.
+	if idx, exists := tx.pendingBlocks[*hash]; exists {
+		return uint32(len(tx.pendingBlockData[idx].bytes)), nil
+	}
+
+	// Lookup the location of the block in the files from the block index.
+	blockRow, err := tx.fetchBlockRow(hash)
+	if err != nil {
+		return 0, err
+	}
+	location := deserializeBlockLoc(blockRow)
+
+	// The stored length also counts the network, the block length and the
+	// checksum, 12 bytes in all.  A block holds at least its header, so a
+	// shorter one means the block index is corrupt.  Bitcoin Cash Node
+	// checks the block sizes it reads the same way.
+	if location.blockLen < blockHdrSize+12 {
+		str := fmt.Sprintf("block %s has a stored length of %d bytes",
+			hash, location.blockLen)
+		return 0, makeDbErr(database.ErrCorruption, str, nil)
+	}
+	return location.blockLen - 12, nil
+}
+
 // fetchPendingRegion attempts to fetch the provided region from any block which
 // are pending to be written on commit.  It will return nil for the byte slice
 // when the region references a block which is not pending.  When the region
@@ -1501,11 +1561,12 @@ func (tx *transaction) FetchBlockRegion(region *database.BlockRegion) ([]byte, e
 	location := deserializeBlockLoc(blockRow)
 
 	// Ensure the region is within the bounds of the block.
+	blockSize := location.blockSize()
 	endOffset := region.Offset + region.Len
-	if endOffset < region.Offset || endOffset > location.blockLen {
+	if endOffset < region.Offset || endOffset > blockSize {
 		str := fmt.Sprintf("block %s region offset %d, length %d "+
 			"exceeds block length of %d", region.Hash,
-			region.Offset, region.Len, location.blockLen)
+			region.Offset, region.Len, blockSize)
 		return nil, makeDbErr(database.ErrBlockRegionInvalid, str, nil)
 
 	}
@@ -1599,11 +1660,12 @@ func (tx *transaction) FetchBlockRegions(regions []database.BlockRegion) ([][]by
 		location := deserializeBlockLoc(blockRow)
 
 		// Ensure the region is within the bounds of the block.
+		blockSize := location.blockSize()
 		endOffset := region.Offset + region.Len
-		if endOffset < region.Offset || endOffset > location.blockLen {
+		if endOffset < region.Offset || endOffset > blockSize {
 			str := fmt.Sprintf("block %s region offset %d, length "+
 				"%d exceeds block length of %d", region.Hash,
-				region.Offset, region.Len, location.blockLen)
+				region.Offset, region.Len, blockSize)
 			return nil, makeDbErr(database.ErrBlockRegionInvalid, str, nil)
 		}
 
@@ -1626,6 +1688,19 @@ func (tx *transaction) FetchBlockRegions(regions []database.BlockRegion) ([][]by
 	}
 
 	return blockRegions, nil
+}
+
+// readError returns the first error the transaction had reading from the
+// database.  A read that failed returned nothing, as for a missing key, so
+// the transaction must fail with it rather than act on what it read.
+func (tx *transaction) readError() error {
+	if tx.snapshot == nil {
+		return nil
+	}
+	if err := tx.snapshot.readError(); err != nil {
+		return convertErr("failed to read from the database", err)
+	}
+	return nil
 }
 
 // close marks the transaction closed then releases any pending data, the
@@ -1723,7 +1798,23 @@ func (tx *transaction) writePendingAndCommit() error {
 
 	// Atomically update the database cache.  The cache automatically
 	// handles flushing to the underlying persistent storage database.
-	return tx.db.cache.commitTx(tx)
+	// When that fails, as it does once leveldb stopped taking writes, the
+	// locations of the blocks were not stored, so the blocks are removed
+	// from the block files again.  The exception is a failed leveldb
+	// commit of the transaction's own keys that may have stored them
+	// anyway: the next open keeps a MANIFEST record that reached the disk
+	// before its commit failed, so the blocks stay, as BCHN keeps the
+	// block data when its block index write fails.  If the record was
+	// lost, the next open's reconcileDB removes them, as after a crash.
+	// The write cursor stays after them, so a commit refused while
+	// leveldb takes no writes rolls back to there.
+	if mayBeStored, err := tx.db.cache.commitTx(tx); err != nil {
+		if !mayBeStored {
+			rollback()
+		}
+		return err
+	}
+	return nil
 }
 
 // Commit commits all changes that have been made to the root metadata bucket
@@ -1754,6 +1845,11 @@ func (tx *transaction) Commit() error {
 	if !tx.writable {
 		str := "Commit requires a writable database transaction"
 		return makeDbErr(database.ErrTxNotWritable, str, nil)
+	}
+
+	// Do not commit changes made after a read that failed.
+	if err := tx.readError(); err != nil {
+		return err
 	}
 
 	// Write pending data.  The function will rollback if any errors occur.
@@ -1908,7 +2004,8 @@ func rollbackOnPanic(tx *transaction) {
 
 // View invokes the passed function in the context of a managed read-only
 // transaction with the root bucket for the namespace.  Any errors returned from
-// the user-supplied function are returned from this function.
+// the user-supplied function are returned from this function, unless a read
+// from the database failed, whose error is returned instead.
 //
 // This function is part of the database.DB interface implementation.
 func (db *db) View(fn func(database.Tx) error) error {
@@ -1927,6 +2024,13 @@ func (db *db) View(fn func(database.Tx) error) error {
 	tx.managed = true
 	err = fn(tx)
 	tx.managed = false
+
+	// A read that failed returned nothing, as for a missing key, so the
+	// caller gets its error instead, also over an error the function
+	// returned for what it read, such as a block that was not found.
+	if readErr := tx.readError(); readErr != nil {
+		err = readErr
+	}
 	if err != nil {
 		// The error is ignored here because nothing was written yet
 		// and regardless of a rollback failure, the tx is closed now
@@ -1941,8 +2045,9 @@ func (db *db) View(fn func(database.Tx) error) error {
 // Update invokes the passed function in the context of a managed read-write
 // transaction with the root bucket for the namespace.  Any errors returned from
 // the user-supplied function will cause the transaction to be rolled back and
-// are returned from this function.  Otherwise, the transaction is committed
-// when the user-supplied function returns a nil error.
+// are returned from this function, unless a read from the database failed,
+// whose error is returned instead, as in View.  Otherwise, the transaction is
+// committed when the user-supplied function returns a nil error.
 //
 // This function is part of the database.DB interface implementation.
 func (db *db) Update(fn func(database.Tx) error) error {
@@ -1962,6 +2067,14 @@ func (db *db) Update(fn func(database.Tx) error) error {
 	err = fn(tx)
 	tx.managed = false
 	if err != nil {
+		// A read that failed returned nothing, as for a missing key,
+		// so its error is returned rather than the one the function
+		// made of what it read.  When the function succeeds, Commit
+		// refuses the transaction for the failed read instead.
+		if readErr := tx.readError(); readErr != nil {
+			err = readErr
+		}
+
 		// The error is ignored here because nothing was written yet
 		// and regardless of a rollback failure, the tx is closed now
 		// anyways.

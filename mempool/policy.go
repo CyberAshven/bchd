@@ -6,6 +6,7 @@ package mempool
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/gcash/bchd/blockchain"
@@ -34,12 +35,15 @@ const (
 	// (1 + 15*74 + 3) + (15*34 + 3) + 23 = 1650
 	maxStandardSigScriptSize = 1650
 
-	// DefaultMinRelayTxFee is the minimum fee in satoshi that is required
-	// for a transaction to be treated as free for relay and mining
-	// purposes.  It is also used to help determine if a transaction is
-	// considered dust and as a base for calculating minimum required fees
-	// for larger transactions.  This value is in Satoshi/1000 bytes.
+	// DefaultMinRelayTxFee is the minimum fee rate a transaction must pay
+	// to be relayed and mined.  This value is in Satoshi/1000 bytes.
 	DefaultMinRelayTxFee = bchutil.Amount(1000)
+
+	// DefaultDustRelayFee is the fee rate, in Satoshi/1000 bytes, that
+	// outputs are judged dust by: BCHN's default -dustrelayfee.  It does
+	// not follow the minimum relay fee, so raising that does not refuse
+	// outputs BCHN relays.
+	DefaultDustRelayFee = bchutil.Amount(1000)
 
 	// maxStandardMultiSigKeys is the maximum number of public keys allowed
 	// in a multi-signature transaction output script for it to be
@@ -52,6 +56,21 @@ const (
 	// maxStandardP2SScriptSize is the maximum length of currently
 	// standard bare multi-signature (BMS) outputs.
 	maxStandardP2SScriptSize = 201
+
+	// standardNotMandatoryFlags are the script flags of the pool that BCHN
+	// does not count as mandatory (STANDARD_NOT_MANDATORY_VERIFY_FLAGS):
+	// an input script that fails only these makes a transaction
+	// nonstandard rather than invalid, although blocks now enforce some of
+	// them.  BCHN's flag that disallows the recovery of coins sent to
+	// segwit scripts is here the absence of
+	// txscript.ScriptVerifyAllowSegwitRecovery.
+	standardNotMandatoryFlags = txscript.ScriptVerifyDERSignatures |
+		txscript.ScriptVerifySigPushOnly |
+		txscript.ScriptDiscourageUpgradableNops |
+		txscript.ScriptVerifyCleanStack |
+		txscript.ScriptVerifyCheckLockTimeVerify |
+		txscript.ScriptVerifyCheckSequenceVerify |
+		txscript.ScriptVerifyInputSigChecks
 )
 
 // calcMinRequiredTxRelayFee returns the minimum transaction fee required for a
@@ -60,13 +79,19 @@ const (
 func calcMinRequiredTxRelayFee(serializedSize int64, minRelayTxFee bchutil.Amount) int64 {
 	// Calculate the minimum fee for a transaction to be allowed into the
 	// mempool and relayed by scaling the base fee (which is the minimum
-	// free transaction relay fee).  minRelayTxFee is in Satoshi/kB so
+	// relay fee rate).  minRelayTxFee is in Satoshi/kB so
 	// multiply by serializedSize (which is in bytes) and divide by 1000 to
-	// get minimum Satoshis.
+	// get minimum Satoshis.  A product that overflows is far above the
+	// valid range.
+	if minRelayTxFee > 0 && serializedSize > math.MaxInt64/int64(minRelayTxFee) {
+		return bchutil.MaxSatoshi
+	}
 	minFee := (serializedSize * int64(minRelayTxFee)) / 1000
 
+	// A fee that rounds down to zero at a nonzero rate is one satoshi, as
+	// BCHN's GetFee makes it.
 	if minFee == 0 && minRelayTxFee > 0 {
-		minFee = int64(minRelayTxFee)
+		minFee = 1
 	}
 
 	// Set the minimum fee to the maximum possible value if the calculated
@@ -99,6 +124,14 @@ func checkInputsStandard(tx *bchutil.Tx, utxoView *blockchain.UtxoViewpoint, scr
 		entry := utxoView.LookupEntry(txIn.PreviousOutPoint)
 		originPkScript := entry.PkScript()
 		switch txscript.GetScriptClass(originPkScript) {
+		case txscript.ScriptHash32Ty:
+			// P2SH32 was enabled together with tokens.
+			if !scriptFlags.HasFlag(txscript.ScriptAllowCashTokens) {
+				str := fmt.Sprintf("transaction input #%d has a "+
+					"non-standard script form", i)
+				return txRuleError(wire.RejectNonstandard,
+					"bad-txns-nonstandard-inputs", str)
+			}
 		case txscript.NonStandardTy:
 			// After the May 2026 upgrade, any script that does not match any of the
 			// P2PK, P2PKH, P2SH20, P2SH32, OP_RETURN, or BMS types, is considered
@@ -106,7 +139,8 @@ func checkInputsStandard(tx *bchutil.Tx, utxoView *blockchain.UtxoViewpoint, scr
 			if !scriptFlags.HasFlag(txscript.ScriptAllowMay2026) || len(originPkScript) > maxStandardP2SScriptSize {
 				str := fmt.Sprintf("transaction input #%d has a "+
 					"non-standard script form", i)
-				return txRuleError(wire.RejectNonstandard, str)
+				return txRuleError(wire.RejectNonstandard,
+					"bad-txns-nonstandard-inputs", str)
 			}
 		}
 	}
@@ -126,20 +160,23 @@ func checkPkScriptStandard(pkScript []byte, scriptClass txscript.ScriptClass, up
 		if err != nil {
 			str := fmt.Sprintf("multi-signature script parse "+
 				"failure: %v", err)
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptpubkey", str)
 		}
 
 		// A standard multi-signature public key script must contain
 		// from 1 to maxStandardMultiSigKeys public keys.
 		if numPubKeys < 1 {
 			str := "multi-signature script with no pubkeys"
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptpubkey", str)
 		}
 		if numPubKeys > maxStandardMultiSigKeys {
 			str := fmt.Sprintf("multi-signature script with %d "+
 				"public keys which is more than the allowed "+
 				"max of %d", numPubKeys, maxStandardMultiSigKeys)
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptpubkey", str)
 		}
 
 		// A standard multi-signature public key script must have at
@@ -147,13 +184,15 @@ func checkPkScriptStandard(pkScript []byte, scriptClass txscript.ScriptClass, up
 		// public keys.
 		if numSigs < 1 {
 			return txRuleError(wire.RejectNonstandard,
+				"scriptpubkey",
 				"multi-signature script with no signatures")
 		}
 		if numSigs > numPubKeys {
 			str := fmt.Sprintf("multi-signature script with %d "+
 				"signatures which is more than the available "+
 				"%d public keys", numSigs, numPubKeys)
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptpubkey", str)
 		}
 
 	case txscript.NonStandardTy:
@@ -161,7 +200,14 @@ func checkPkScriptStandard(pkScript []byte, scriptClass txscript.ScriptClass, up
 		// P2PK, P2PKH, P2SH20, P2SH32, OP_RETURN, or BMS types, is considered
 		// standard if it has a length less or equal to maxStandardP2SScriptSize.
 		if !upgrade12Active || len(pkScript) > maxStandardP2SScriptSize {
-			return txRuleError(wire.RejectNonstandard,
+			// BCHN counts OP_RETURN followed by pushes as data
+			// carrier bytes whatever its length, so it refuses one
+			// too long to be null data as oversize-op-return.
+			reason := "scriptpubkey"
+			if txscript.ScriptTypeName(pkScript) == txscript.NullDataTy.String() {
+				reason = "oversize-op-return"
+			}
+			return txRuleError(wire.RejectNonstandard, reason,
 				"non-standard script form")
 		}
 	}
@@ -170,11 +216,10 @@ func checkPkScriptStandard(pkScript []byte, scriptClass txscript.ScriptClass, up
 }
 
 // isDust returns whether or not the passed transaction output amount is
-// considered dust or not based on the passed minimum transaction relay fee.
-// Dust is defined in terms of the minimum transaction relay fee.  In
-// particular, if the cost to the network to spend coins is more than 1/3 of the
-// minimum transaction relay fee, it is considered dust.
-func isDust(txOut *wire.TxOut, minRelayTxFee bchutil.Amount) bool {
+// considered dust or not based on the passed dust relay fee.  In particular,
+// if the cost to the network to spend coins is more than 1/3 of the dust
+// relay fee, it is considered dust.
+func isDust(txOut *wire.TxOut, dustRelayFee bchutil.Amount) bool {
 	// The total serialized size consists of the output and the associated
 	// input script to redeem it.  Since there is no input script
 	// to redeem it yet, use the minimum size of a typical input script.
@@ -224,18 +269,16 @@ func isDust(txOut *wire.TxOut, minRelayTxFee bchutil.Amount) bool {
 	totalSize := txOut.SerializeSize() + 41 + 107
 
 	// The output is considered dust if the cost to the network to spend the
-	// coins is more than 1/3 of the minimum free transaction relay fee.
-	// minFreeTxRelayFee is in Satoshi/KB, so multiply by 1000 to
-	// convert to bytes.
+	// coins is more than 1/3 of the dust relay fee.  dustRelayFee is in
+	// Satoshi/KB, so multiply by 1000 to convert to bytes.
 	//
 	// Using the typical values for a pay-to-pubkey-hash transaction from
-	// the breakdown above and the default minimum free transaction relay
-	// fee of 1000, this equates to values less than 546 satoshi being
-	// considered dust.
+	// the breakdown above and the default dust relay fee of 1000, this
+	// equates to values less than 546 satoshi being considered dust.
 	//
 	// The following is equivalent to (value/totalSize) * (1/3) * 1000
 	// without needing to do floating point math.
-	return txOut.Value*1000/(3*int64(totalSize)) < int64(minRelayTxFee)
+	return txOut.Value*1000/(3*int64(totalSize)) < int64(dustRelayFee)
 }
 
 // checkTransactionStandard performs a series of checks on a transaction to
@@ -244,9 +287,10 @@ func isDust(txOut *wire.TxOut, minRelayTxFee bchutil.Amount) bool {
 // "sane" transaction such as having a version in the supported range, being
 // finalized, conforming to more stringent size constraints, having scripts
 // of recognized forms, and not containing "dust" outputs (those that are
-// so small it costs more to process them than they are worth).
+// so small it costs more to process them than they are worth, judged at
+// dustRelayFee).
 func checkTransactionStandard(tx *bchutil.Tx, height int32,
-	medianTimePast time.Time, minRelayTxFee bchutil.Amount,
+	medianTimePast time.Time, dustRelayFee bchutil.Amount,
 	maxTxVersion int32, upgrade9Active bool, upgrade12Active bool) error {
 
 	// The transaction must be a currently supported version.
@@ -255,14 +299,14 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 		str := fmt.Sprintf("transaction version %d is not in the "+
 			"valid range of %d-%d", msgTx.Version, 1,
 			maxTxVersion)
-		return txRuleError(wire.RejectNonstandard, str)
+		return txRuleError(wire.RejectNonstandard, "version", str)
 	}
 
 	// The transaction must be finalized to be standard and therefore
 	// considered for inclusion in a block.
 	if !blockchain.IsFinalizedTransaction(tx, height, medianTimePast) {
-		return txRuleError(wire.RejectNonstandard,
-			"transaction is not finalized")
+		return txRuleError(wire.RejectNonstandard, "bad-txns-nonfinal",
+			"transaction is not finalized (bad-txns-nonfinal)")
 	}
 
 	// Since extremely large transactions with a lot of inputs can cost
@@ -273,7 +317,7 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 	if txSize > maxStandardTxSize {
 		str := fmt.Sprintf("size of transaction %v is larger than max "+
 			"allowed size of %v", txSize, maxStandardTxSize)
-		return txRuleError(wire.RejectNonstandard, str)
+		return txRuleError(wire.RejectNonstandard, "tx-size", str)
 	}
 
 	for i, txIn := range msgTx.TxIn {
@@ -295,7 +339,8 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 				"script size of %d bytes is large than max "+
 				"allowed size of %d bytes", i, sigScriptLen,
 				maxStandardSizeAllowed)
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptsig-size", str)
 		}
 
 		// Each transaction input signature script must only contain
@@ -303,7 +348,8 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 		if !txscript.IsPushOnlyScript(txIn.SignatureScript) {
 			str := fmt.Sprintf("transaction input %d: signature "+
 				"script is not push only", i)
-			return txRuleError(wire.RejectNonstandard, str)
+			return txRuleError(wire.RejectNonstandard,
+				"scriptsig-not-pushonly", str)
 		}
 	}
 
@@ -315,7 +361,7 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 		if !upgrade9Active && !txOut.TokenData.IsEmpty() {
 			rejectCode := wire.RejectNonstandard
 			str := "txn-tokens-before-activation"
-			return txRuleError(rejectCode, str)
+			return txRuleError(rejectCode, str, str)
 		}
 
 		scriptClass := txscript.GetScriptClass(txOut.PkScript)
@@ -329,33 +375,36 @@ func checkTransactionStandard(tx *bchutil.Tx, height int32,
 				rejectCode = rejCode
 			}
 			str := fmt.Sprintf("transaction output %d: %v", i, err)
-			return txRuleError(rejectCode, str)
+			return txRuleError(rejectCode, RejectReason(err), str)
 		}
 
 		// Accumulate the script size of outputs which only carry data.  For
 		// all other script types, ensure the output value is not
-		// "dust".
+		// "dust".  An unspendable output, such as a pay to script output
+		// starting with OP_RETURN, is never dust, as in BCHN, which
+		// refuses dust as nonstandard rather than with REJECT_DUST.
 		if scriptClass == txscript.NullDataTy {
 			dataCarrierSize += len(txOut.PkScript)
-		} else if txscript.IsUnspendable(txOut.PkScript) || isDust(txOut, minRelayTxFee) {
+		} else if !txscript.IsUnspendable(txOut.PkScript) && isDust(txOut, dustRelayFee) {
 			str := fmt.Sprintf("transaction output %d: payment "+
 				"of %d is dust", i, txOut.Value)
-			return txRuleError(wire.RejectDust, str)
+			return txRuleError(wire.RejectNonstandard, "dust", str)
 		}
 	}
 
 	// A standard transaction cannot have null data exceeding txscript.MaxDataCarrierSize
 	if dataCarrierSize > txscript.MaxDataCarrierSize {
 		str := fmt.Sprintf("transaction nulldata exceeds %d bytes", txscript.MaxDataCarrierSize)
-		return txRuleError(wire.RejectNonstandard, str)
+		return txRuleError(wire.RejectNonstandard, "oversize-op-return",
+			str)
 	}
 
 	return nil
 }
 
-func CheckTransactionStandard(tx *bchutil.Tx, height int32, medianTimePast time.Time, minRelayTxFee bchutil.Amount,
+func CheckTransactionStandard(tx *bchutil.Tx, height int32, medianTimePast time.Time, dustRelayFee bchutil.Amount,
 	maxTxVersion int32, upgrade9Active bool, upgrade12Active bool) error {
-	return checkTransactionStandard(tx, height, medianTimePast, minRelayTxFee, maxTxVersion, upgrade9Active, upgrade12Active)
+	return checkTransactionStandard(tx, height, medianTimePast, dustRelayFee, maxTxVersion, upgrade9Active, upgrade12Active)
 }
 
 func CheckInputsStandard(tx *bchutil.Tx, utxoView *blockchain.UtxoViewpoint, scriptFlags txscript.ScriptFlags) error {

@@ -9,10 +9,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
-	"reflect"
 	"testing"
+
+	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
 type signatureTest struct {
@@ -517,7 +519,7 @@ func testSignCompact(t *testing.T, tag string, curve *KoblitzCurve,
 }
 
 func TestSignCompact(t *testing.T) {
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		name := fmt.Sprintf("test %d", i)
 		data := make([]byte, 32)
 		_, err := rand.Read(data)
@@ -548,7 +550,7 @@ var recoveryTests = []struct {
 		// Invalid curve point recovered.
 		msg: "00c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c",
 		sig: "0100b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f00b940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549",
-		err: fmt.Errorf("invalid square root"),
+		err: ErrInvalidSquareRoot,
 	},
 	{
 		// Low R and S values.
@@ -569,7 +571,7 @@ func TestRecoverCompact(t *testing.T) {
 		pub, _, err := RecoverCompact(S256(), sig, msg)
 
 		// Verify that returned error matches as expected.
-		if !reflect.DeepEqual(test.err, err) {
+		if !errors.Is(err, test.err) {
 			t.Errorf("unexpected error returned from pubkey "+
 				"recovery #%d: wanted %v, got %v",
 				i, test.err, err)
@@ -587,6 +589,70 @@ func TestRecoverCompact(t *testing.T) {
 		if !exPub.IsEqual(pub) {
 			t.Errorf("unexpected recovered public key #%d: "+
 				"want %v, got %v", i, exPub, pub)
+		}
+	}
+}
+
+// TestRecoverCompactRange ensures RecoverCompact rejects R and S values that
+// are zero or not below the curve order.
+func TestRecoverCompactRange(t *testing.T) {
+	curve := S256()
+	key, _ := PrivKeyFromBytes(curve, []byte{0x01})
+	hash := sha256.Sum256([]byte("compact range"))
+	valid, err := SignCompact(curve, key, hash[:], true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RecoverCompact(curve, valid, hash[:]); err != nil {
+		t.Fatalf("valid signature: %v", err)
+	}
+
+	n := curve.Params().N
+	tests := []struct {
+		name string
+		r, s *big.Int
+	}{
+		{"r zero", big.NewInt(0), big.NewInt(1)},
+		{"r is n", n, big.NewInt(1)},
+		{"r is n+1", new(big.Int).Add(n, big.NewInt(1)), big.NewInt(1)},
+		{"r is n+2", new(big.Int).Add(n, big.NewInt(2)), big.NewInt(1)},
+		{"s zero", big.NewInt(44), big.NewInt(0)},
+		{"s is n", big.NewInt(44), n},
+		{"s is n+4", big.NewInt(44), new(big.Int).Add(n, big.NewInt(4))},
+	}
+	for _, test := range tests {
+		sig := make([]byte, 65)
+		sig[0] = 27
+		test.r.FillBytes(sig[1:33])
+		test.s.FillBytes(sig[33:])
+		if _, _, err := RecoverCompact(curve, sig, hash[:]); err == nil {
+			t.Errorf("%s: recovered a key", test.name)
+		}
+	}
+}
+
+// TestRecoverCompactHeader ensures RecoverCompact only uses the low three bits
+// of the header byte, as libsecp256k1 users do.
+func TestRecoverCompactHeader(t *testing.T) {
+	curve := S256()
+	key, _ := PrivKeyFromBytes(curve, []byte{0x01})
+	hash := sha256.Sum256([]byte("compact header"))
+	for _, compressed := range []bool{false, true} {
+		sig, err := SignCompact(curve, key, hash[:], compressed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, delta := range []int{0, 8, -8, 16, -24, 224} {
+			variant := append([]byte(nil), sig...)
+			variant[0] = byte(int(sig[0]) + delta)
+			pub, comp, err := RecoverCompact(curve, variant, hash[:])
+			if err != nil {
+				t.Errorf("header %d: %v", variant[0], err)
+				continue
+			}
+			if !pub.IsEqual(key.PubKey()) || comp != compressed {
+				t.Errorf("header %d: recovered the wrong key", variant[0])
+			}
 		}
 	}
 }
@@ -824,5 +890,56 @@ func TestDeterministicSchnorrSignatureGen(t *testing.T) {
 	if !bytes.Equal(sig.R.Bytes(), decodeHex("2c56731ac2f7a7e7f11518fc7722a166b02438924ca9d8b4d111347b81d07175")) ||
 		!bytes.Equal(sig.S.Bytes(), decodeHex("71846de67ad3d913a8fdf9d8f3f73161a4c48ae81cb183b214765feb86e255ce")) {
 		t.Error("Failed to generated deterministic schnorr signature")
+	}
+}
+
+// TestQuadraticResidue compares the residue check used by Schnorr
+// verification with big.Jacobi.
+func TestQuadraticResidue(t *testing.T) {
+	p := S256().P
+	vals := []*big.Int{new(big.Int).Sub(p, big.NewInt(1)),
+		new(big.Int).Sub(p, big.NewInt(2)), new(big.Int).Sub(p, big.NewInt(7))}
+	for i := range int64(256) {
+		vals = append(vals, big.NewInt(i))
+	}
+	b := make([]byte, 32)
+	for range 20000 {
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+		vals = append(vals, new(big.Int).Mod(new(big.Int).SetBytes(b), p))
+	}
+	for _, v := range vals {
+		var f secp.FieldVal
+		f.SetByteSlice(v.Bytes())
+		if got, want := isQuadraticResidue(&f), big.Jacobi(v, p) == 1; got != want {
+			t.Fatalf("isQuadraticResidue(%x) = %v, want %v", v, got, want)
+		}
+	}
+}
+
+// TestRecoverCompactInfinity ensures a signature from which the point at
+// infinity would be recovered is refused, as libsecp256k1 refuses it, rather
+// than giving a key with zero coordinates.  With s = e/k for R = kG, sR is eG,
+// so r^-1(sR - eG) is the point at infinity.
+func TestRecoverCompactInfinity(t *testing.T) {
+	curve := S256()
+	hash := sha256.Sum256([]byte("message"))
+	k := big.NewInt(12345)
+	Rx, Ry := curve.ScalarBaseMult(k.Bytes())
+	if Rx.Cmp(curve.N) >= 0 {
+		t.Fatal("R needs another k")
+	}
+	e := hashToInt(hash[:], curve)
+	s := new(big.Int).Mul(e, new(big.Int).ModInverse(k, curve.N))
+	s.Mod(s, curve.N)
+
+	sig := make([]byte, 65)
+	sig[0] = 27 + byte(Ry.Bit(0))
+	Rx.FillBytes(sig[1:33])
+	s.FillBytes(sig[33:65])
+	if key, _, err := RecoverCompact(curve, sig, hash[:]); err == nil {
+		t.Fatalf("recovered key %x for the point at infinity",
+			key.SerializeCompressed())
 	}
 }

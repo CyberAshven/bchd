@@ -7,7 +7,7 @@ mempool
 
 Package mempool provides a policy-enforced pool of unmined bitcoin transactions.
 
-A key responsbility of the bitcoin network is mining user-generated transactions
+A key responsibility of the bitcoin network is mining user-generated transactions
 into blocks.  In order to facilitate this, the mining process relies on having a
 readily-available source of transactions to include in a block that is being
 solved.
@@ -57,9 +57,7 @@ be an exhaustive list.
   - Individual orphan transaction query support
 - Configurable transaction acceptance policy
   - Option to accept or reject standard transactions
-  - Option to accept or reject transactions based on priority calculations
-  - Rate limiting of low-fee and free transactions
-  - Non-zero fee threshold
+  - Minimum relay fee required from every new transaction
   - Max signature operations per transaction
   - Max orphan transaction size
   - Max number of orphan transactions allowed
@@ -67,7 +65,6 @@ be an exhaustive list.
   - Timestamp when the transaction was added to the pool
   - Most recent block height when the transaction was added to the pool
   - The fee the transaction pays
-  - The starting priority for the transaction
 - Manual control of transaction removal
   - Recursive removal of all dependent transactions
 

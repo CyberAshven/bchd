@@ -143,14 +143,18 @@ type Params struct {
 	// block in compact form.
 	PowLimitBits uint32
 
+	// MinimumChainWork is the work the best chain is known to have.  The
+	// chain isn't considered current with less work.  Nil means none.
+	MinimumChainWork *big.Int
+
 	// These fields define the block heights at which the specified softfork
 	// BIP became active.
 	BIP0034Height int32
 	BIP0065Height int32
 	BIP0066Height int32
 
-	// Only testnet4 and chipnet uses CSV activation by height. All the others use the
-	// deployment schedule. If this value is set to anything other than zero
+	// Only testnet4, chipnet and regtest use CSV activation by height. All the others
+	// use the deployment schedule. If this value is set to anything other than zero
 	// then it will activate at this height.
 	CSVHeight int32
 
@@ -171,6 +175,11 @@ type Params struct {
 
 	// The ABLA algorithm constants
 	ABLAConfig ABLAConstants
+
+	// DefaultConsensusBlockSize is the network's default maximum block
+	// size: the limit before ABLA activates and the floor of the ABLA limit
+	// after.  It matches Bitcoin Cash Node's nDefaultConsensusBlockSize.
+	DefaultConsensusBlockSize uint32
 
 	// CoinbaseMaturity is the number of blocks required before newly mined
 	// coins (coinbase transactions) can be spent.
@@ -287,13 +296,14 @@ var MainNetParams = Params{
 	},
 
 	// Chain parameters
-	GenesisBlock:  &genesisBlock,
-	GenesisHash:   &genesisHash,
-	PowLimit:      mainPowLimit,
-	PowLimitBits:  0x1d00ffff,
-	BIP0034Height: 227931, // 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
-	BIP0065Height: 388381, // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
-	BIP0066Height: 363725, // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
+	GenesisBlock:     &genesisBlock,
+	GenesisHash:      &genesisHash,
+	PowLimit:         mainPowLimit,
+	PowLimitBits:     0x1d00ffff,
+	MinimumChainWork: hexToBig("030fd678912166474fe93f14"),
+	BIP0034Height:    227931, // 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
+	BIP0065Height:    388381, // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
+	BIP0066Height:    363725, // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
 
 	UahfForkHeight:              478558, // 0000000000000000011865af4122fe3b144e2cbeea86142e8ff2fb4107352d43
 	DaaForkHeight:               504031, // 0000000000000000011ebf65b60d0a3de80b8175be709d653b4c1a1beeb6ab9c
@@ -322,6 +332,7 @@ var MainNetParams = Params{
 		Delta:           10,
 		FixedSize:       false,
 	},
+	DefaultConsensusBlockSize: 32000000,
 
 	CoinbaseMaturity:                     100,
 	SubsidyReductionInterval:             210000,
@@ -352,6 +363,7 @@ var MainNetParams = Params{
 		{Height: 250000, Hash: newHashFromStr("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214")},
 		{Height: 267300, Hash: newHashFromStr("000000000000000a83fbd660e918f218bf37edd92b748ad940483c7c116179ac")},
 		{Height: 279000, Hash: newHashFromStr("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40")},
+		{Height: 295000, Hash: newHashFromStr("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")},
 		{Height: 300255, Hash: newHashFromStr("0000000000000000162804527c6e9b9f0563a280525f9d08c12041def0a0f3b2")},
 		{Height: 319400, Hash: newHashFromStr("000000000000000021c6052e9becade189495d1c539aa37c58917305fd15f13b")},
 		{Height: 343185, Hash: newHashFromStr("0000000000000000072b8bf361d01a6ba7d445dd024203fafc78768ed4368554")},
@@ -360,7 +372,10 @@ var MainNetParams = Params{
 		{Height: 400000, Hash: newHashFromStr("000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f")},
 		{Height: 430000, Hash: newHashFromStr("000000000000000001868b2bb3a285f3cc6b33ea234eb70facf4dcdf22186b87")},
 		{Height: 470000, Hash: newHashFromStr("0000000000000000006c539c722e280a0769abd510af0073430159d71e6d7589")},
+		{Height: 478559, Hash: newHashFromStr("000000000000000000651ef99cb9fcbe0dadde1d424bd9f15ff20136191a5eec")},
+		{Height: 504032, Hash: newHashFromStr("00000000000000000343e9875012f2062554c8752929892c82a0c0743ac7dcfd")},
 		{Height: 510000, Hash: newHashFromStr("00000000000000000367922b6457e21d591ef86b360d78a598b14c2f1f6b0e04")},
+		{Height: 530359, Hash: newHashFromStr("0000000000000000011ada8bd08f46074f44a8f155396f43e38acf9501c49103")},
 		{Height: 552979, Hash: newHashFromStr("0000000000000000015648768ac1b788a83187d706f858919fcc5c096b76fbf2")},
 		{
 			Height:      556767,
@@ -417,6 +432,24 @@ var MainNetParams = Params{
 				"https://ipfs.io/ipfs/QmY9Anst9NB42RVSGZehNCF52B2DxAzAYXEPrLrar75VMT",
 			},
 		},
+		{Height: 682900, Hash: newHashFromStr("0000000000000000018b0a60a00ca53b69b213a8515e5eedbf8a207f0355fe42")},
+		{Height: 699484, Hash: newHashFromStr("0000000000000000030192242425926218184a609a63efee615b7586d7f3972b")},
+		{Height: 714881, Hash: newHashFromStr("000000000000000004cd628ee64c058183e780bc31143ff00680ea8af51fa0ff")},
+		{Height: 740238, Hash: newHashFromStr("000000000000000002afc6fbd302f01f8cf4533f4b45207abc61d9f4297bf969")},
+		{Height: 741245, Hash: newHashFromStr("000000000000000001c46d1d0f35df726bfb3e84cdc396d9edd9e2f8414191cd")},
+		{Height: 768220, Hash: newHashFromStr("0000000000000000012f9d67fc9304253bdf204b65782816cbbc64913398e25b")},
+		{Height: 773784, Hash: newHashFromStr("0000000000000000045cc0dbdd5cbbb86f7f63596e699ac5a11b2d41c65c6993")},
+		{Height: 792773, Hash: newHashFromStr("000000000000000002fc0cdadaef1857bbd2936d37ea94f80ba3db4a5e8353e8")},
+		{Height: 845891, Hash: newHashFromStr("0000000000000000017012058e7b67032926f1f20f96d1a2cd66abff9aaf8244")},
+		{Height: 853417, Hash: newHashFromStr("000000000000000001c97a4c91c7a85d5f56a7ecd119f21abffdc6987a1be792")},
+		{Height: 873239, Hash: newHashFromStr("000000000000000000e28c75f4b398b3ac410755d18ef9314b770c3d08cb130e")},
+		{Height: 878660, Hash: newHashFromStr("000000000000000000c166d5661c13195722ae6fbee90f0ab2407ae60b71c2e6")},
+		{Height: 898374, Hash: newHashFromStr("00000000000000000157a0a3dcdc80f1acd809648d238c1e893b26247091b3b4")},
+		{Height: 901000, Hash: newHashFromStr("000000000000000001eda4b93cfe9bc790906f2358fc5643ff335da5e7bbae5d")},
+		{Height: 932228, Hash: newHashFromStr("0000000000000000005a48a20e13f038be389952014373478b6a6a90d40e4680")},
+		{Height: 951145, Hash: newHashFromStr("000000000000000000f64dbed68370486f945097ba90b17e30d7bf5c43df7a60")},
+		{Height: 960710, Hash: newHashFromStr("00000000000000000275ee55c04aa109347c9ee0b5bb4617837df3044f7e1be5")},
+		{Height: 970892, Hash: newHashFromStr("000000000000000000e76270e57f4ebbd2b282db46a1695984935126c0a68cd8")},
 	},
 
 	// Consensus rule change deployments.
@@ -481,30 +514,32 @@ var RegressionNetParams = Params{
 	BIP0034Height:    100000000, // Not active - Permit ver 1 blocks
 	BIP0065Height:    1351,      // Used by regression tests
 	BIP0066Height:    1251,      // Used by regression tests
+	CSVHeight:        576,       // Used by regression tests
 
 	UahfForkHeight:              0, // Always active on regtest
 	DaaForkHeight:               0, // Always active on regtest
-	MagneticAnonomalyForkHeight: 1000,
-	PhononForkHeight:            1000,
+	MagneticAnonomalyForkHeight: 0, // Always active on regtest
+	PhononForkHeight:            0, // Always active on regtest
 	AxionActivationHeight:       0, // Always active on regtest
 
-	CosmicInflationActivationTime: 1652616000,
+	CosmicInflationActivationTime: 0, // Always active on regtest
 
-	Upgrade9ForkHeight:      100000000,
-	ABLAForkHeight:          100000000,
+	Upgrade9ForkHeight:      0, // Always active on regtest
+	ABLAForkHeight:          0, // Always active on regtest
 	Upgrade11ActivationTime: 0, // Always active on regtest
 	Upgrade12ActivationTime: 0,
 
 	ABLAConfig: ABLAConstants{
-		Epsilon0:        500000,
-		Beta0:           500000,
-		N0:              845890,
+		Epsilon0:        16000000,
+		Beta0:           16000000,
+		N0:              0,
 		GammaReciprocal: 37938,
 		ZetaXB7:         192,
 		ThetaReciprocal: 37938,
 		Delta:           10,
-		FixedSize:       true,
+		FixedSize:       false,
 	},
+	DefaultConsensusBlockSize: 32000000,
 
 	SubsidyReductionInterval:             150,
 	TargetTimespan:                       time.Hour * 24 * 14, // 14 days
@@ -536,8 +571,8 @@ var RegressionNetParams = Params{
 		},
 		DeploymentCSV: {
 			BitNumber:  0,
-			StartTime:  0,             // Always available for vote
-			ExpireTime: math.MaxInt64, // Never expires
+			StartTime:  0,
+			ExpireTime: 0, // Activated by CSVHeight instead
 		},
 	},
 
@@ -580,13 +615,14 @@ var TestNet3Params = Params{
 	},
 
 	// Chain parameters
-	GenesisBlock:  &testNet3GenesisBlock,
-	GenesisHash:   &testNet3GenesisHash,
-	PowLimit:      testNet3PowLimit,
-	PowLimitBits:  0x1d00ffff,
-	BIP0034Height: 21111,  // 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8
-	BIP0065Height: 581885, // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
-	BIP0066Height: 330776, // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
+	GenesisBlock:     &testNet3GenesisBlock,
+	GenesisHash:      &testNet3GenesisHash,
+	PowLimit:         testNet3PowLimit,
+	PowLimitBits:     0x1d00ffff,
+	MinimumChainWork: hexToBig("11fdbbe582349040762"),
+	BIP0034Height:    21111,  // 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8
+	BIP0065Height:    581885, // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
+	BIP0066Height:    330776, // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
 
 	UahfForkHeight:              1155875, // 00000000f17c850672894b9a75b63a1e72830bbd5f4c8889b5c1a80e7faef138
 	DaaForkHeight:               1188697, // 0000000000170ed0918077bde7b4d36cc4c91be69fa09211f748240dabe047fb
@@ -614,6 +650,7 @@ var TestNet3Params = Params{
 		Delta:           10,
 		FixedSize:       true,
 	},
+	DefaultConsensusBlockSize: 32000000,
 
 	CoinbaseMaturity:                     100,
 	SubsidyReductionInterval:             210000,
@@ -642,9 +679,29 @@ var TestNet3Params = Params{
 		{Height: 800010, Hash: newHashFromStr("000000000017ed35296433190b6829db01e657d80631d43f5983fa403bfdb4c1")},
 		{Height: 900000, Hash: newHashFromStr("0000000000356f8d8924556e765b7a94aaebc6b5c8685dcfa2b1ee8b41acd89b")},
 		{Height: 1000007, Hash: newHashFromStr("00000000001ccb893d8a1f25b70ad173ce955e5f50124261bbbc50379a612ddf")},
+		{Height: 1155876, Hash: newHashFromStr("00000000000e38fef93ed9582a7df43815d5c2ba9fd37ef70c9a0ea4a285b8f5")},
+		{Height: 1188698, Hash: newHashFromStr("0000000000051b450faa75bb8e1ea30bc18c4b9736e765d2794259a53bc83f99")},
+		{Height: 1303885, Hash: newHashFromStr("00000000000000479138892ef0e4fa478ccc938fb94df862ef5bde7e8dee23d3")},
 		{Height: 1341712, Hash: newHashFromStr("00000000fffc44ea2e202bd905a9fbbb9491ef9e9d5a9eed4039079229afa35b")},
 		{Height: 1378461, Hash: newHashFromStr("0000000099f5509b5f36b1926bcf82b21d936ebeadee811030dfbbb7fae915d7")},
 		{Height: 1421482, Hash: newHashFromStr("0000000023e0680a8a062b3cc289a4a341124ce7fcb6340ede207e194d73b60a")},
+		{Height: 1442860, Hash: newHashFromStr("000000000004f42ffcf218d285cbd8d8d93e1c5a4262bdd1fdfd1991cfdb5027")},
+		{Height: 1459354, Hash: newHashFromStr("00000000499a0384fe7f46f4e5470271804df474b19229aee839ea898d5d07e2")},
+		{Height: 1472870, Hash: newHashFromStr("00000000000000b013f75c2cf5e357b5f95af715c2829b0686ee53663101a6e0")},
+		{Height: 1500206, Hash: newHashFromStr("000000000000360769353e933530c40d3f00565a4e7731ff56027e23fa74a8ef")},
+		{Height: 1526155, Hash: newHashFromStr("0000000057fa336560212f0ff351ca6b2008c6c48032bc305e5b4663e837953f")},
+		{Height: 1532821, Hash: newHashFromStr("00000000000000e2e476a806171758c75e6fd4c28d1435a56701df87874ddd2f")},
+		{Height: 1552788, Hash: newHashFromStr("000000007bc92323648b95ea8401a2247e977b653b13adb9e40748ce06b30a5e")},
+		{Height: 1582896, Hash: newHashFromStr("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")},
+		{Height: 1605521, Hash: newHashFromStr("000000000000007d4c561056e9bcb3ab7591d024b18fff4bc27cca4d51d4780e")},
+		{Height: 1610899, Hash: newHashFromStr("00000000e2f5dde96179ea278285118ad69e5d94b9269fef63c604b3d551a5d0")},
+		{Height: 1630783, Hash: newHashFromStr("000000002e0058b88b1857bbf2ca3edaaade318e54bbb9226ca53b3ae5528f90")},
+		{Height: 1636000, Hash: newHashFromStr("0000000000001af6a0fb0ec4f079858b6add6d070381f94157be80fdb4809c65")},
+		{Height: 1658050, Hash: newHashFromStr("0000000015d90bbd6deeb63cf86dc1f794d76c697d2ea86a42158c8003da8c5e")},
+		{Height: 1689348, Hash: newHashFromStr("000000001935f758281aa60414a1218dcd09b4dc6b7ad0be2a3cddbcd38ff265")},
+		{Height: 1710483, Hash: newHashFromStr("00000000078fe0c74ffa0c5221081c34774aa7d17a3c14c36f952f829463f120")},
+		{Height: 1718198, Hash: newHashFromStr("00000000fb70d93bc600b9189f2bb13383b0e44d96a4547615b3c194680e6308")},
+		{Height: 1730264, Hash: newHashFromStr("000000000001ce982fa29717a4ed233b0e5a7a8b9936a17fdeeccc5c1d0af795")},
 	},
 
 	// Consensus rule change deployments.
@@ -696,24 +753,26 @@ var ChipNetParams = Params{
 	Net:         wire.ChipNet,
 	DefaultPort: "48333",
 	DNSSeeds: []DNSSeed{
+		{"chipnet-seed.bchd.cash", true},
 		{"chipnet.bitjson.com", true},
 	},
 
 	// Chain parameters
-	GenesisBlock:  &testNet4GenesisBlock, // Same value as testnet4
-	GenesisHash:   &testNet4GenesisHash,  // Same value as testnet4
-	PowLimit:      testNet3PowLimit,      // Same value as testnet3
-	PowLimitBits:  0x1d00ffff,
-	BIP0034Height: 2,
-	BIP0065Height: 3,
-	BIP0066Height: 4,
-	CSVHeight:     5,
+	GenesisBlock:     &testNet4GenesisBlock, // Same value as testnet4
+	GenesisHash:      &testNet4GenesisHash,  // Same value as testnet4
+	PowLimit:         testNet3PowLimit,      // Same value as testnet3
+	PowLimitBits:     0x1d00ffff,
+	MinimumChainWork: hexToBig("7a3195391c4408f2"),
+	BIP0034Height:    2,
+	BIP0065Height:    3,
+	BIP0066Height:    4,
+	CSVHeight:        5,
 
-	UahfForkHeight:              5,
+	UahfForkHeight:              6,
 	DaaForkHeight:               3000,
-	MagneticAnonomalyForkHeight: 3999,
+	MagneticAnonomalyForkHeight: 4000,
 	GreatWallForkHeight:         0,
-	GravitonForkHeight:          4999,
+	GravitonForkHeight:          5000,
 	PhononForkHeight:            0,
 	AxionActivationHeight:       16844,
 
@@ -736,6 +795,7 @@ var ChipNetParams = Params{
 		Delta:           10,
 		FixedSize:       false,
 	},
+	DefaultConsensusBlockSize: 2000000,
 
 	CoinbaseMaturity:                     100,
 	SubsidyReductionInterval:             210000,
@@ -752,7 +812,28 @@ var ChipNetParams = Params{
 	GenerateSupported:                    false,
 
 	// Checkpoints ordered from oldest to newest.
-	Checkpoints: []Checkpoint{},
+	Checkpoints: []Checkpoint{
+		{Height: 5000, Hash: newHashFromStr("000000009f092d074574a216faec682040a853c4f079c33dfd2c3ef1fd8108c4")},
+		{Height: 16845, Hash: newHashFromStr("00000000fb325b8f34fe80c96a5f708a08699a68bbab82dba4474d86bd743077")},
+		{Height: 38000, Hash: newHashFromStr("000000000015197537e59f339e3b1bbf81a66f691bd3d7aa08560fc7bf5113fb")},
+		{Height: 54700, Hash: newHashFromStr("00000000009af4379d87f17d0f172ee4769b48839a5a3a3e81d69da4322518b8")},
+		{Height: 68117, Hash: newHashFromStr("0000000000a2c2fc11a3b72adbd10a3f02a1f8745da55a85321523043639829a")},
+		{Height: 95465, Hash: newHashFromStr("00000000a77206a2265cabc47cc2c34706ba1c5e5a5743ac6681b83d43c91a01")},
+		{Height: 115252, Hash: newHashFromStr("00000000040ba9641ba98a37b2e5ceead38e4e2930ac8f145c8094f94c708727")},
+		{Height: 115510, Hash: newHashFromStr("000000006ad16ee5ee579bc3712b6f15cdf0a7f25a694e1979616794b73c5122")},
+		{Height: 121957, Hash: newHashFromStr("0000000056087dee73fb66178ca70da89dfd0be098b1a63cf6fe93934cd04c78")},
+		{Height: 122396, Hash: newHashFromStr("000000000363cd56e49a46684cec1d99854c4aae662a6faee0df4c9a49dc8a33")},
+		{Height: 128042, Hash: newHashFromStr("0000000010e506eeb528dd8238947c6fcdf8d752ece66517eea778650600edae")},
+		{Height: 148000, Hash: newHashFromStr("000000009788ecce39b046caab3cf0f72e8c5409df23454679dbdcae2bd4dded")},
+		{Height: 178140, Hash: newHashFromStr("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")},
+		{Height: 206364, Hash: newHashFromStr("00000000146a073b9d4e172adbee5252014a8b4d75c56cce36858311565ae251")},
+		{Height: 228000, Hash: newHashFromStr("00000000144b00db5736b33bd572b3a3a52aa9b4c26ba59fc212aeb68a9b7a20")},
+		{Height: 232000, Hash: newHashFromStr("0000000017d92f88ed2c81885c57f999184860a042250510be06b3edd12e0dc5")},
+		{Height: 255000, Hash: newHashFromStr("000000008654e310c090d6846459500c3a6531044fa9339865865575375db624")},
+		{Height: 284827, Hash: newHashFromStr("000000007af65a6e8853f858b3f2a8e7edabe41e6264410276705b324267d7d8")},
+		{Height: 313653, Hash: newHashFromStr("0000000046cfd2f762f82a2dd2594e84e824789c43c3f7f1d12050cde3f8b8e7")},
+		{Height: 325627, Hash: newHashFromStr("000000002bb8a32bd6b1022e5370b10e7dc139770d626e1a0911e6b596cf3069")},
+	},
 
 	// Consensus rule change deployments.
 	//
@@ -814,20 +895,21 @@ var TestNet4Params = Params{
 	},
 
 	// Chain parameters
-	GenesisBlock:  &testNet4GenesisBlock,
-	GenesisHash:   &testNet4GenesisHash,
-	PowLimit:      testNet3PowLimit,
-	PowLimitBits:  0x1d00ffff,
-	BIP0034Height: 2,
-	BIP0065Height: 3,
-	BIP0066Height: 4,
-	CSVHeight:     5,
+	GenesisBlock:     &testNet4GenesisBlock,
+	GenesisHash:      &testNet4GenesisHash,
+	PowLimit:         testNet3PowLimit,
+	PowLimitBits:     0x1d00ffff,
+	MinimumChainWork: hexToBig("bd5a1b5bda45b5da"),
+	BIP0034Height:    2,
+	BIP0065Height:    3,
+	BIP0066Height:    4,
+	CSVHeight:        5,
 
-	UahfForkHeight:              5,
+	UahfForkHeight:              6,
 	DaaForkHeight:               3000,
-	MagneticAnonomalyForkHeight: 3999,
+	MagneticAnonomalyForkHeight: 4000,
 	GreatWallForkHeight:         0,
-	GravitonForkHeight:          4999,
+	GravitonForkHeight:          5000,
 	PhononForkHeight:            0,
 	AxionActivationHeight:       16844,
 
@@ -849,6 +931,7 @@ var TestNet4Params = Params{
 		Delta:           10,
 		FixedSize:       true,
 	},
+	DefaultConsensusBlockSize: 2000000,
 
 	CoinbaseMaturity:                     100,
 	SubsidyReductionInterval:             210000,
@@ -865,7 +948,27 @@ var TestNet4Params = Params{
 	GenerateSupported:                    false,
 
 	// Checkpoints ordered from oldest to newest.
-	Checkpoints: []Checkpoint{},
+	Checkpoints: []Checkpoint{
+		{Height: 5000, Hash: newHashFromStr("000000009f092d074574a216faec682040a853c4f079c33dfd2c3ef1fd8108c4")},
+		{Height: 16845, Hash: newHashFromStr("00000000fb325b8f34fe80c96a5f708a08699a68bbab82dba4474d86bd743077")},
+		{Height: 38000, Hash: newHashFromStr("000000000015197537e59f339e3b1bbf81a66f691bd3d7aa08560fc7bf5113fb")},
+		{Height: 54700, Hash: newHashFromStr("00000000009af4379d87f17d0f172ee4769b48839a5a3a3e81d69da4322518b8")},
+		{Height: 68117, Hash: newHashFromStr("0000000000a2c2fc11a3b72adbd10a3f02a1f8745da55a85321523043639829a")},
+		{Height: 95465, Hash: newHashFromStr("00000000a77206a2265cabc47cc2c34706ba1c5e5a5743ac6681b83d43c91a01")},
+		{Height: 115252, Hash: newHashFromStr("00000000ae25e85d9e22cd6c8d72c2f5d4b0222289d801b7f633aeae3f8c6367")},
+		{Height: 121428, Hash: newHashFromStr("00000000002cf277337c504f7ce708cce851d5d20cad2936fedf3be95a9ca5eb")},
+		{Height: 128070, Hash: newHashFromStr("00000000044f34642fa3d91e34678737cc10a821a4696f50c187091c3df480c2")},
+		{Height: 148044, Hash: newHashFromStr("0000000008d96c4423ac92aa200af82819339435251736b08babde1ecaf8a5b6")},
+		{Height: 200741, Hash: newHashFromStr("0000000007d8ccbb767c269551dd81c520463066bec8654a18f4106aa53dc816")},
+		{Height: 206379, Hash: newHashFromStr("000000001d44ca6c351af579f81703c0a175d1d4554db70ae7b7f7df2919eaf9")},
+		{Height: 226116, Hash: newHashFromStr("000000008416a726dd957835add86d7166ef331b74f2f2ca38928dcd56484f8e")},
+		{Height: 232000, Hash: newHashFromStr("0000000018ef632fc8a77dd4ff6a6e29ad2c7af405af63247c6f28a051b1b817")},
+		{Height: 253319, Hash: newHashFromStr("00000000004605937a919cf6f636b68e8137b5cb0226ddbc9e00f386ef02999b")},
+		{Height: 277407, Hash: newHashFromStr("00000000fd6af07e5c4618de0cc36796f9470620eb4610584d9011b9f41d3400")},
+		{Height: 305848, Hash: newHashFromStr("00000000601bf68f9927154cf55557b1c08245b4d415658d1cbcd1eb4502dabc")},
+		{Height: 313651, Hash: newHashFromStr("000000005c58d20403191a778c51206eca7552629c1e390313e786d2c388d0fb")},
+		{Height: 325709, Hash: newHashFromStr("00000000000097a6ca206aa88b45a2158eea1a9ab8a49aed8f4b193d558e74b4")},
+	},
 
 	// Consensus rule change deployments.
 	//
@@ -967,6 +1070,7 @@ var SimNetParams = Params{
 		Delta:           10,
 		FixedSize:       true,
 	},
+	DefaultConsensusBlockSize: 32000000,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
@@ -1113,6 +1217,17 @@ func HDPrivateKeyToPublicKeyID(id []byte) ([]byte, error) {
 	}
 
 	return pubBytes, nil
+}
+
+// hexToBig converts the passed hex string into a big integer.  It only
+// differs from big.Int's SetString in that it panics on an error, so it must
+// only be called with hard-coded values.
+func hexToBig(hexStr string) *big.Int {
+	n, ok := new(big.Int).SetString(hexStr, 16)
+	if !ok {
+		panic("invalid hex in source file: " + hexStr)
+	}
+	return n
 }
 
 // newHashFromStr converts the passed big-endian hex string into a

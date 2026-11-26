@@ -21,29 +21,40 @@ func TestChance(t *testing.T) {
 	}{
 		{
 			//Test normal case
-			addrmgr.TstNewKnownAddress(&wire.NetAddress{Timestamp: now.Add(-35 * time.Second)},
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
 				0, time.Now().Add(-30*time.Minute), time.Now(), false, 0),
 			1.0,
 		}, {
 			//Test case in which lastseen < 0
-			addrmgr.TstNewKnownAddress(&wire.NetAddress{Timestamp: now.Add(20 * time.Second)},
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(20 * time.Second)},
 				0, time.Now().Add(-30*time.Minute), time.Now(), false, 0),
 			1.0,
 		}, {
 			//Test case in which lastattempt < 0
-			addrmgr.TstNewKnownAddress(&wire.NetAddress{Timestamp: now.Add(-35 * time.Second)},
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
 				0, time.Now().Add(30*time.Minute), time.Now(), false, 0),
 			1.0 * .01,
 		}, {
 			//Test case in which lastattempt < ten minutes
-			addrmgr.TstNewKnownAddress(&wire.NetAddress{Timestamp: now.Add(-35 * time.Second)},
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
 				0, time.Now().Add(-5*time.Minute), time.Now(), false, 0),
 			1.0 * .01,
 		}, {
 			//Test case with several failed attempts.
-			addrmgr.TstNewKnownAddress(&wire.NetAddress{Timestamp: now.Add(-35 * time.Second)},
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
 				2, time.Now().Add(-30*time.Minute), time.Now(), false, 0),
 			1 / 1.5 / 1.5,
+		}, {
+			//Test case in which only the first eight failed attempts count.
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
+				9, time.Now().Add(-30*time.Minute), time.Now(), false, 0),
+			math.Pow(1/1.5, 8),
+		}, {
+			//Test case with enough failed attempts to make the chance zero
+			//if they all counted.
+			addrmgr.TstNewKnownAddress(&wire.NetAddressV2{Timestamp: now.Add(-35 * time.Second)},
+				5000, time.Now().Add(-30*time.Minute), time.Now(), false, 0),
+			math.Pow(1/1.5, 8),
 		},
 	}
 
@@ -56,6 +67,33 @@ func TestChance(t *testing.T) {
 	}
 }
 
+// TestLastSuccess checks that LastSuccess is zero for an address never
+// connected to, before LastAttempt after an attempt, and equal to it once the
+// connection is marked good.
+func TestLastSuccess(t *testing.T) {
+	n := addrmgr.New("testlastsuccess", lookupFunc)
+	if err := n.AddAddressByIP(someIP + ":8333"); err != nil {
+		t.Fatalf("Adding address failed: %v", err)
+	}
+	ka := n.GetAddress()
+	if ka == nil {
+		t.Fatal("Did not get an address where there is one in the pool")
+	}
+	if !ka.LastSuccess().IsZero() {
+		t.Errorf("new address: got LastSuccess %v, want zero", ka.LastSuccess())
+	}
+	n.Attempt(ka.NetAddress())
+	if !ka.LastSuccess().Before(ka.LastAttempt()) {
+		t.Errorf("after an attempt: got LastSuccess %v, want before LastAttempt %v",
+			ka.LastSuccess(), ka.LastAttempt())
+	}
+	n.Good(ka.NetAddress())
+	if ka.LastSuccess().IsZero() || !ka.LastSuccess().Equal(ka.LastAttempt()) {
+		t.Errorf("after Good: got LastSuccess %v, want LastAttempt %v",
+			ka.LastSuccess(), ka.LastAttempt())
+	}
+}
+
 func TestIsBad(t *testing.T) {
 	now := time.Unix(time.Now().Unix(), 0)
 	future := now.Add(35 * time.Minute)
@@ -65,10 +103,10 @@ func TestIsBad(t *testing.T) {
 	hoursOld := now.Add(-5 * time.Hour)
 	zeroTime := time.Time{}
 
-	futureNa := &wire.NetAddress{Timestamp: future}
-	minutesOldNa := &wire.NetAddress{Timestamp: minutesOld}
-	monthOldNa := &wire.NetAddress{Timestamp: monthOld}
-	currentNa := &wire.NetAddress{Timestamp: secondsOld}
+	futureNa := &wire.NetAddressV2{Timestamp: future}
+	minutesOldNa := &wire.NetAddressV2{Timestamp: minutesOld}
+	monthOldNa := &wire.NetAddressV2{Timestamp: monthOld}
+	currentNa := &wire.NetAddressV2{Timestamp: secondsOld}
 
 	//Test addresses that have been tried in the last minute.
 	if addrmgr.TstKnownAddressIsBad(addrmgr.TstNewKnownAddress(futureNa, 3, secondsOld, zeroTime, false, 0)) {
