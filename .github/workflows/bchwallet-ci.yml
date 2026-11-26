@@ -1,5 +1,6 @@
-# TEST ONLY: runs gcash/bchwallet's own CI script on a branch of the bchwallet
-# fork, whose Actions are not enabled. Not for upstream.
+# TEST ONLY: runs gcash/bchwallet's own CI script on commits of the bchwallet
+# fork, whose Actions are not enabled, one job for each ref listed in
+# bchwallet-ref. Not for upstream.
 name: bchwallet-ci-test-only
 on:
   push:
@@ -8,18 +9,27 @@ on:
 permissions:
   contents: read
 jobs:
-  build:
+  refs:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
     steps:
       - uses: actions/checkout@v4
-      - name: Read the bchwallet ref to test
-        id: ref
-        run: echo "ref=$(cat bchwallet-ref)" >> "$GITHUB_OUTPUT"
+      - id: refs
+        run: echo "refs=$(grep -v '^ *$' bchwallet-ref | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+  build:
+    needs: refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJson(needs.refs.outputs.refs) }}
+    steps:
       - uses: actions/checkout@v4
         with:
           repository: CyberAshven/bchwallet
-          ref: ${{ steps.ref.outputs.ref }}
+          ref: ${{ matrix.ref }}
           path: bchwallet
       - uses: actions/setup-go@v5
         with:
