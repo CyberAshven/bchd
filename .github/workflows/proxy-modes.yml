@@ -1,7 +1,8 @@
 # TEST ONLY: runs the bchrpc/proxy tests of gcash/bchd master (before) and of
 # fix/proxy-node-answer (after) against the remote node, an address that
-# refuses connections, and a silent one that takes connections and answers
-# nothing. Not for upstream.
+# refuses connections, a silent one that takes connections and answers
+# nothing, and a local simnet bchd behind a relay that forwards only the first
+# connection (a node that answers one call and then stalls). Not for upstream.
 name: proxy-modes-test-only
 on:
   push:
@@ -19,12 +20,12 @@ jobs:
       fail-fast: false
       matrix:
         side: [before, after]
-        mode: [node, refused, silent]
+        mode: [node, refused, silent, stall]
         include:
           - side: before
             ref: 38d11412c3d29626c8343b897ec66919132ad86b
           - side: after
-            ref: efd181fb6740b6f90ef16a7327f08e726e7d8bce
+            ref: 658c2b56a7becdd70086330dc34ca7ce523cf6ee
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,12 +39,33 @@ jobs:
         run: |
           python3 -c 'import socket; s = socket.create_server(("127.0.0.1", 18335)); held = []; exec("while True: held.append(s.accept())")' &
           sleep 1
+      - name: Relay script of ci-bchd
+        if: matrix.mode == 'stall'
+        uses: actions/checkout@v4
+        with:
+          ref: ci-bchd
+          path: cibchd
+      - name: Simnet bchd on 127.0.0.1:18335 behind a relay on 127.0.0.1:18336 that forwards only the first connection
+        if: matrix.mode == 'stall'
+        run: |
+          go build -o /tmp/bchd-bin .
+          d=$(mktemp -d)
+          echo "BCHD_DIR=$d" >> "$GITHUB_ENV"
+          /tmp/bchd-bin --simnet --datadir="$d/data" --logdir="$d/logs"             --rpccert="$d/rpc.cert" --rpckey="$d/rpc.key"             --rpcuser="$(openssl rand -hex 8)" --rpcpass="$(openssl rand -hex 16)"             --rpclisten=127.0.0.1:18556 --grpclisten=127.0.0.1:18335             --listen=127.0.0.1:18555 > "$d/bchd.out" 2>&1 &
+          for i in $(seq 1 60); do
+            if [ -f "$d/rpc.cert" ] && (exec 3<>/dev/tcp/127.0.0.1/18335) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/127.0.0.1/18335) || { cat "$d/bchd.out"; exit 1; }
+          python3 cibchd/ci/relay.py 18336 18335 > "$d/relay.out" 2>&1 &
+          sleep 1
       - name: bchrpc/proxy tests
         run: |
           case "${{ matrix.mode }}" in
             node) args="" ;;
             refused) args="-args -bchd-grpc-url=127.0.0.1:1" ;;
             silent) args="-args -bchd-grpc-url=127.0.0.1:18335" ;;
+            stall) args="-args -bchd-grpc-url=localhost:18336 -bchd-grpc-certpath=$BCHD_DIR/rpc.cert" ;;
           esac
           set -o pipefail
           go test -tags rpctest -v -count=1 ./bchrpc/proxy $args 2>&1 | tee proxy.log
@@ -53,4 +75,5 @@ jobs:
           echo "commit ${{ matrix.ref }} (${{ matrix.side }}), node ${{ matrix.mode }}"
           echo "PASS $(grep -c -- '--- PASS' proxy.log)  SKIP $(grep -c -- '--- SKIP' proxy.log)  FAIL $(grep -c -- '--- FAIL' proxy.log)"
           echo "what goclean.sh of the fix shows:"
-          grep -E "BCHD node .* doesn't answer, skipping|^ *--- (SKIP|FAIL)|^(ok|FAIL)" proxy.log || true
+          grep -E "BCHD node .* doesn't answer|can't be reached|^ *--- (SKIP|FAIL)|^(ok|FAIL)" proxy.log || true
+          if [ -n "$BCHD_DIR" ]; then echo "relay:"; cat "$BCHD_DIR/relay.out"; fi
